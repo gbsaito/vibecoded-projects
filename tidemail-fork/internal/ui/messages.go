@@ -1,0 +1,738 @@
+package ui
+
+import (
+	"context"
+	"fmt"
+	"github.com/allisonhere/tidemail/internal/config"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/allisonhere/tidemail/internal/db"
+	imapClient "github.com/allisonhere/tidemail/internal/imap"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+type remoteDeleteAction int
+
+const (
+	remoteDeleteExpunge remoteDeleteAction = iota
+	remoteDeleteMoveToTrash
+)
+
+func (m *Model) renderMessagesPane() string {
+	w := m.messagesPaneContentWidth()
+	h := m.articlesPaneContentHeight()
+	msgUnread, msgRead, msgSelected, headerActive, borderColor, borderFocus := m.messageRowStyles()
+
+	rows := []string{}
+	if m.selectedDraftsMailbox() {
+		end := min(m.listOffset+m.articleRowsVisible(), len(m.drafts))
+		for i := m.listOffset; i < end; i++ {
+			draft := m.drafts[i]
+			age := m.formatTime(draft.UpdatedAt)
+			style := msgRead
+			prefix := "✎ "
+			if !m.iconsEnabled() {
+				prefix = "d "
+			}
+			if i == m.messageCursor {
+				style = msgSelected
+				prefix = "→ "
+			}
+			rows = append(rows, style.Width(w).Render(renderArticleRow(prefix, m.messageRowStar(false), unescapeDisplayText(draftSubject(draft)), age, w)))
+		}
+		if len(m.drafts) == 0 {
+			rows = append(rows, msgRead.Render("  no drafts"))
+		}
+	} else {
+		rowCount := m.activeMessageRowCount()
+		end := min(m.listOffset+m.articleRowsVisible(), rowCount)
+		mixedAccounts := m.selectedUnifiedInbox() || m.selectedNeedsYou() || m.selectedWaiting() || m.selectedSnoozed()
+		for i := m.listOffset; i < end; i++ {
+			msg2 := *m.rowMessage(i)
+			threadUnread := 0
+			var thread messageThread
+			chevron, tree := "", ""
+			if m.threadedMessagesEnabled() {
+				row := m.messageRows[i]
+				if row.MessageIndex == 0 {
+					thread = m.messageThreads[row.ThreadIndex]
+					threadUnread = thread.UnreadCount
+					if m.threadExpanded(thread) {
+						threadUnread = 0
+						if !msg2.Read {
+							threadUnread = 1
+						}
+					}
+					if thread.Count > 1 {
+						chevron = "▸"
+						if m.threadExpanded(thread) {
+							chevron = "▾"
+						}
+					}
+				} else {
+					tree = "├─ "
+					if row.MessageIndex == len(m.messageThreads[row.ThreadIndex].Messages)-1 {
+						tree = "└─ "
+					}
+					if !msg2.Read {
+						threadUnread = 1
+					}
+				}
+			} else if !msg2.Read {
+				threadUnread = 1
+			}
+			// Threaded rows show the representative message's badges, except
+			// in Needs You, where they combine every message of the thread.
+			timeText := m.formatTime(msg2.Date)
+			if wake, ok := m.snoozedRowTime(msg2); ok {
+				timeText = wake
+			}
+			age := timeText
+			tags := m.annotationTags(m.rowBadgeIDs(msg2, thread)...)
+			tags = m.mergeMessageTags(tags, msg2)
+			style := msgRead
+			if threadUnread > 0 {
+				style = msgUnread
+			}
+			// Mixed-account views (Unified Inbox, Needs You, Waiting on Them,
+			// Snoozed) have no single account to accent the whole pane with, so
+			// tint each row with its own message's account color instead. Both
+			// read and unread rows are tinted (unlike the single-mailbox pane
+			// accent, which only tints unread) so the account stays identifiable
+			// after a message is read.
+			if mixedAccounts {
+				if rowAccent := m.messageAccountColor(msg2); rowAccent != "" {
+					bg := terminalColorAsColor(style.GetBackground())
+					if bg == "" {
+						bg = m.styles.Theme.Bg
+					}
+					style = style.Foreground(accentReadableOn(rowAccent, bg, 3))
+				}
+			}
+			cursor := i == m.messageCursor
+			dot := m.messageRowPrefix(threadUnread == 0)
+			if m.messageRowSelected(msg2, thread) {
+				dot = "✓ "
+				// When selected but not the cursor, tint the row with the theme's
+				// accent (kept readable on the pane background) rather than a fixed
+				// green that clashes on light themes.
+				if i != m.messageCursor {
+					selFg := accentReadableOn(m.styles.Theme.Unread, m.styles.Theme.Bg, 4.5)
+					style = style.Foreground(selFg)
+				}
+			}
+			if cursor {
+				dot = "→ "
+			}
+			// Pending feedback replaces the unread/cursor marker in place so the
+			// prefix keeps its two-cell width; the row highlight marks the cursor.
+			pendingThread := thread
+			if m.threadExpanded(thread) {
+				pendingThread = messageThread{}
+			}
+			if m.rowReadPending(msg2, pendingThread) {
+				dot = m.pendingReadIndicator() + " "
+			}
+			subject := m.messageRowTitle(msg2)
+			style = applyMessageRowState(style, msgSelected, msg2.Starred, cursor, m.styles.Theme)
+			star := m.messageRowStar(msg2.Starred)
+			if chevron != "" {
+				// Use the existing spacer after the star, not a new status gutter.
+				star = strings.TrimSuffix(star, " ") + chevron
+			}
+			var sender string
+			senderW := 0
+			if m.cfg.Display.ShowSender {
+				senderW = min(22, max(0, w/3))
+				sender = senderDisplay(msg2.From)
+				if waitingFor, ok := m.waitingSender(msg2); ok {
+					sender = waitingFor
+				} else if waitingFor, ok := m.snoozedSender(msg2); ok {
+					sender = waitingFor
+				}
+			}
+			rows = append(rows, m.renderMessageRow(style, dot, star, sender, m.cfg.Display.ShowSender, senderW, subject, tags, age, w, tree))
+		}
+
+		if len(m.filteredMessages) == 0 {
+			switch {
+			case m.initialLoading:
+				rows = append(rows, msgRead.Render("  "+m.spinner.View()+" Loading messages…"))
+			case m.searchMode:
+				rows = append(rows, msgRead.Render("  no results"))
+			case m.selectedNeedsYou():
+				rows = append(rows, msgRead.Render("  Nothing needs your attention."))
+			case m.selectedWaiting():
+				rows = append(rows, msgRead.Render("  You're not waiting on any replies."))
+			case m.selectedSnoozed():
+				rows = append(rows, msgRead.Render("  Nothing is snoozed."))
+			case m.selectedOutboxRow():
+				// The Outbox row is a doorway, not a folder — its entries are
+				// not db.Message rows and this pane cannot act on them. Saying
+				// "no messages" next to a badge reading (1) reads as a bug, so
+				// show what is in there and where to go.
+				rows = append(rows, m.outboxPreviewRows(w, msgRead)...)
+			default:
+				rows = append(rows, msgRead.Render("  no messages"))
+			}
+		}
+	}
+
+	focused := m.focused == paneMessages
+	contentRows := []string{}
+	if m.cfg.Display.ShowPaneHeaders {
+		contentRows = append(contentRows, m.renderPaneHeaderWithAccent(paneMessages, m.messagesPaneTitle(), focused, w, headerActive))
+	}
+	if m.searchMode {
+		contentRows = append(contentRows, m.renderMessageSearchRow(w))
+	}
+	contentRows = append(contentRows, rows...)
+	for viewLineCount(contentRows) < h {
+		contentRows = append(contentRows, msgRead.Width(w).Render(""))
+	}
+
+	bg := m.styles.Theme.Bg
+	content := clampView(strings.Join(contentRows, "\n"), w, h, bg)
+	return lipgloss.NewStyle().
+		Background(bg).
+		Border(paneFrameBorder(m.styles.PlainUI, m.styles.RoundedCorners)).
+		BorderForeground(lipgloss.Color(func() string {
+			if focused || m.searchMode {
+				return string(borderFocus)
+			}
+			return string(borderColor)
+		}())).
+		BorderBackground(bg).
+		Width(w).Height(h).
+		Render(content)
+}
+
+// outboxPreviewRows summarizes the Outbox for the message pane: what is in it
+// and how to get at it. Read-only on purpose — retrying and editing live in
+// the overlay, and offering half of that here would be worse than pointing at
+// the whole of it.
+func (m Model) outboxPreviewRows(width int, style lipgloss.Style) []string {
+	rows := []string{}
+	for _, item := range m.outboxItems {
+		label := ""
+		switch {
+		case item.State == db.OutboxFailed:
+			label = "failed"
+		case item.State == db.OutboxUncertain:
+			label = "unconfirmed"
+		case item.State == db.OutboxQueued && item.Attempts > 0:
+			label = "retrying"
+		default:
+			continue
+		}
+		subject := item.Subject
+		if subject == "" {
+			subject = "(no subject)"
+		}
+		rows = append(rows, style.Render(truncate(fmt.Sprintf("  %-12s %s", label, subject), width)))
+	}
+	if len(rows) == 0 {
+		rows = append(rows, style.Render("  nothing waiting to go out"))
+	}
+	rows = append(rows, style.Render(""))
+	rows = append(rows, style.Render(truncate("  "+m.keys.Enter.Help().Key+" opens the Outbox to retry or edit", width)))
+	return rows
+}
+
+func (m *Model) messagesPaneTitle() string {
+	title := "Messages"
+	if m.selectedUnifiedInbox() {
+		title = "Unified Inbox"
+	}
+	if m.selectedNeedsYou() {
+		title = "Needs You"
+	}
+	if m.selectedWaiting() {
+		title = "Waiting on Them"
+	}
+	if m.selectedSnoozed() {
+		title = "Snoozed"
+	}
+	if m.selectedOutboxRow() {
+		title = "Outbox"
+	}
+	if m.showUnreadOnly {
+		title += " (unread)"
+	}
+	if m.starredFirst {
+		title += " (starred first)"
+	}
+	if n := len(m.selectedMessages); n > 0 {
+		title += fmt.Sprintf("  ✓ %d selected", n)
+	}
+	return title
+}
+
+func (m Model) renderMessageSearchRow(width int) string {
+	input := m.searchInput
+	if input.Value() == "" && m.searchQuery != "" {
+		input.SetValue(m.searchQuery)
+		input.CursorEnd()
+	}
+	const prompt = "Search: "
+	input.Prompt = ""
+	input.Width = max(1, width-lipgloss.Width(prompt))
+	bg := m.styles.Theme.BorderFocus
+	fg := accentReadableOn(m.styles.Theme.Fg, bg, 4.5)
+	input.PromptStyle = lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true)
+	input.TextStyle = lipgloss.NewStyle().Background(bg).Foreground(fg)
+	input.PlaceholderStyle = lipgloss.NewStyle().Background(bg).Foreground(fg)
+	input.Cursor.Style = lipgloss.NewStyle().Background(fg).Foreground(bg)
+	view := input.PromptStyle.Render(prompt) + inputViewWithCursor(input, m.searchEditing)
+	return lipgloss.NewStyle().Background(bg).Foreground(fg).Width(width).Render(truncateStyled(view, width, bg))
+}
+
+func (m *Model) messageRowStyles() (lipgloss.Style, lipgloss.Style, lipgloss.Style, lipgloss.Style, lipgloss.Color, lipgloss.Color) {
+	accent := m.selectedMailboxAccountColor()
+	unread := m.styles.ArticleUnread
+	read := m.styles.ArticleRead
+	selected := m.styles.ArticleSelected
+	headerActive := m.styles.PaneHeaderActive
+	border := m.styles.Theme.Border
+	borderFocus := m.styles.Theme.BorderFocus
+	if accent != "" {
+		unreadBg := terminalColorAsColor(unread.GetBackground())
+		if unreadBg == "" {
+			unreadBg = m.styles.Theme.Bg
+		}
+		leg := accentReadableOn(accent, unreadBg, 3)
+		unread = unread.Foreground(leg)
+		headerActive = headerActive.
+			Background(accent).
+			Foreground(accentReadableOn(m.styles.Theme.Fg, accent, 4.5))
+		borderFocus = accent
+	}
+	borderFocus = accentReadableOn(borderFocus, m.styles.Theme.Bg, paneFocusMinContrast)
+	return unread, read, selected, headerActive, border, borderFocus
+}
+
+func (m *Model) clearSelection() {
+	m.invalidateComposePanes()
+	m.selectedMessages = make(map[int64]bool)
+}
+
+func (m Model) hasSelection() bool {
+	return len(m.selectedMessages) > 0
+}
+
+func (m *Model) applyFilter() {
+	m.applyFilterPreservingCollapsed(m.preserveCollapsedReadSelection(nil))
+}
+
+func (m *Model) applyFilterPreservingCollapsed(collapsed bool) {
+	m.invalidateComposePanes()
+	var selectedID int64
+	if msg := m.currentRowMessage(); msg != nil {
+		selectedID = msg.ID
+	}
+	view := m.conversationView()
+	if view != m.expansionView {
+		m.expandedMessages = nil
+		m.expansionView = view
+		selectedID = 0
+	}
+	visible := make([]db.Message, 0, len(m.messages))
+	for _, msg := range m.messages {
+		if !m.messageHiddenDestructive(msg.ID) && !m.gmailCopyPendingDelete(msg) {
+			visible = append(visible, msg)
+		}
+	}
+	// m.messages is already the match set when a search is running — the FTS
+	// index covers subject, sender, recipients, and body. Narrowing it again
+	// here would have to re-implement that matching locally, and the subject-only
+	// substring test this used to do silently dropped every message that matched
+	// on sender or body. The unread toggle is the only filter left to apply.
+	visible = m.keepHeldUnreadPosition(visible)
+	filtered := visible
+	if m.showUnreadOnly {
+		filtered = make([]db.Message, 0, len(visible))
+		for _, msg := range visible {
+			if !m.sortsAsRead(msg) {
+				filtered = append(filtered, msg)
+			}
+		}
+	}
+	m.filteredMessages = filtered
+	m.sortFilteredStarred()
+	m.rebuildMessageThreads()
+	if idx := m.indexOfMessageSelection(selectedID, collapsed); idx >= 0 {
+		m.messageCursor = idx
+	}
+	m.keepMessageCursorVisible()
+}
+
+// sortFilteredStarred stably floats starred messages to the top when the
+// starred-first sort (key `t`) is active. It copies before sorting so the
+// shared m.messages slice (which m.filteredMessages may alias) is never mutated.
+func (m *Model) sortFilteredStarred() {
+	if !m.starredFirst || len(m.filteredMessages) == 0 {
+		return
+	}
+	sorted := make([]db.Message, len(m.filteredMessages))
+	copy(sorted, m.filteredMessages)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Starred && !sorted[j].Starred
+	})
+	m.filteredMessages = sorted
+}
+
+func (m *Model) messageRowTitle(msg db.Message) string {
+	subject := messageListDisplayText(unescapeDisplayText(msg.Subject))
+	if !m.searchActive() {
+		return subject
+	}
+	context := strings.TrimSpace(msg.AccountName)
+	if name := strings.TrimSpace(msg.MailboxName); name != "" {
+		if context != "" {
+			context += " / " + name
+		} else {
+			context = name
+		}
+	}
+	if context == "" {
+		return subject
+	}
+	return subject + " [" + context + "]"
+}
+
+func (m *Model) setMessageReadCmd(msg db.Message, read, advance bool) tea.Cmd {
+	return m.acceptReadChanges([]db.Message{msg}, &read, advance)
+}
+
+func (m *Model) setSelectedMessagesReadCmd(messages []db.Message) tea.Cmd {
+	return m.acceptReadChanges(messages, nil, false)
+}
+
+func messageUIDs(messages []db.Message) []uint32 {
+	uids := make([]uint32, 0, len(messages))
+	for _, msg := range messages {
+		if msg.UID != 0 {
+			uids = append(uids, msg.UID)
+		}
+	}
+	return uids
+}
+
+func messageIDs(messages []db.Message) []int64 {
+	ids := make([]int64, len(messages))
+	for i, msg := range messages {
+		ids[i] = msg.ID
+	}
+	return ids
+}
+
+func (m *Model) setMessageStarredCmd(msg db.Message, starred bool) tea.Cmd {
+	database := m.db
+	sessions := m.sessions
+	mailbox := m.mailboxByID(msg.MailboxID)
+	acfg, cfgErr := m.accountCfgForMailbox(msg.MailboxID)
+	if cfgErr != nil {
+		return func() tea.Msg {
+			return MessageStarredUpdatedMsg{MessageID: msg.ID, MailboxID: msg.MailboxID, Starred: starred, Err: cfgErr}
+		}
+	}
+	return func() tea.Msg {
+		if mailbox != nil && acfg.IMAPHost != "" && msg.UID != 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			ctx = uidWriteContext(ctx, database, mailbox.ID, mailbox.Name)
+			if err := sessions.Do(ctx, acfg, func(client *imapClient.Client) error {
+				return client.MarkFlagged(ctx, mailbox.Name, msg.UID, starred)
+			}); err != nil {
+				return MessageStarredUpdatedMsg{MessageID: msg.ID, MailboxID: msg.MailboxID, Starred: starred, Err: err}
+			}
+		}
+		if err := database.MarkStarred(msg.ID, starred); err != nil {
+			return MessageStarredUpdatedMsg{MessageID: msg.ID, MailboxID: msg.MailboxID, Starred: starred, Err: err}
+		}
+		return MessageStarredUpdatedMsg{MessageID: msg.ID, MailboxID: msg.MailboxID, Starred: starred}
+	}
+}
+
+func remoteDeletePlan(source db.Mailbox, trash *db.Mailbox) (remoteDeleteAction, *db.Mailbox) {
+	if trash == nil || source.ID == trash.ID || source.Name == trash.Name {
+		return remoteDeleteExpunge, nil
+	}
+	return remoteDeleteMoveToTrash, trash
+}
+
+func (m *Model) openedMessageCmd(msg db.Message) tea.Cmd {
+	if !m.cfg.Display.MarkReadOnOpen || msg.Read {
+		return nil
+	}
+	cmd := m.setMessageReadCmd(msg, true, false)
+	if cmd != nil && (m.cfg.Display.UnreadFirst || m.showUnreadOnly) {
+		m.heldReadID = msg.ID
+	}
+	return cmd
+}
+
+// sortsAsRead reports whether msg orders and filters as read. The message
+// held by heldReadID still counts as unread, so reading it does not move it
+// out from under the user.
+func (m *Model) sortsAsRead(msg db.Message) bool {
+	return msg.Read && (m.heldReadID == 0 || msg.ID != m.heldReadID)
+}
+
+// readingHeldMessage reports whether the held message is still open in the
+// focused reader. A dialog opened over the reader (help, palette, reply)
+// keeps the hold.
+func (m *Model) readingHeldMessage() bool {
+	if m.contentMessageID != m.heldReadID {
+		return false
+	}
+	return m.focused == paneContent || m.overlay != overlayNone
+}
+
+// releaseHeldRead lets the held message move to its real place. If the
+// cursor was on it, the cursor keeps its row, which is now the next message
+// in the unread block, instead of following the message down.
+func (m *Model) releaseHeldRead() tea.Cmd {
+	heldID := m.heldReadID
+	m.heldReadID = 0
+	row, offset := m.messageCursor, m.listOffset
+	cur := m.currentRowMessage()
+	onHeld := cur != nil && cur.ID == heldID
+	m.applyFilter()
+	if !onHeld || m.activeMessageRowCount() == 0 {
+		return nil
+	}
+	m.messageCursor = clamp(row, 0, m.activeMessageRowCount()-1)
+	m.listOffset = clamp(offset, 0, m.messageCursor)
+	m.keepMessageCursorVisible()
+	m.setViewportForCurrentRow()
+	if m.focused == paneMessages {
+		if msg := m.currentRowMessage(); msg != nil {
+			return m.focusedMessageChangedCmd(*msg)
+		}
+	}
+	return nil
+}
+
+// keepHeldUnreadPosition puts the held message back where Unread first
+// ordering had it before it was read: in the unread block, by date.
+func (m *Model) keepHeldUnreadPosition(list []db.Message) []db.Message {
+	if m.heldReadID == 0 || !m.cfg.Display.UnreadFirst {
+		return list
+	}
+	h := -1
+	for i, msg := range list {
+		if msg.ID == m.heldReadID {
+			h = i
+			break
+		}
+	}
+	if h < 0 || !list[h].Read {
+		return list
+	}
+	held := list[h]
+	rest := make([]db.Message, 0, len(list))
+	rest = append(rest, list[:h]...)
+	rest = append(rest, list[h+1:]...)
+	at := len(rest)
+	for i, msg := range rest {
+		if m.sortsAsRead(msg) || held.Date.After(msg.Date) || held.Date.Equal(msg.Date) && held.ID > msg.ID {
+			at = i
+			break
+		}
+	}
+	out := make([]db.Message, 0, len(list))
+	out = append(out, rest[:at]...)
+	out = append(out, held)
+	return append(out, rest[at:]...)
+}
+
+func (m *Model) focusedMessageChangedCmd(msg db.Message) tea.Cmd {
+	if !m.cfg.Display.MarkReadOnFocus || msg.Read {
+		return nil
+	}
+	return m.setMessageReadCmd(msg, true, false)
+}
+
+func (m *Model) markMailboxReadCmd(mailboxID int64) tea.Cmd {
+	return m.markMailboxesReadCmd([]int64{mailboxID})
+}
+
+func (m *Model) markAccountReadCmd(accountID int64) tea.Cmd {
+	var ids []int64
+	for _, mb := range m.mailboxes {
+		if mb.AccountID == accountID {
+			ids = append(ids, mb.ID)
+		}
+	}
+	return m.markMailboxesReadCmd(ids)
+}
+
+// markMailboxesReadCmd marks whole mailboxes read on the server (and the cache).
+// It reserves every target before dispatch and rejects conflicts rather than
+// partially marking a busy mailbox; the reservation is released by the
+// MailboxReadUpdatedMsg carrying the same token.
+func (m *Model) markMailboxesReadCmd(ids []int64) tea.Cmd {
+	if len(ids) == 0 {
+		return nil
+	}
+	for _, id := range ids {
+		busy := m.pendingBulkReads[id] != 0
+		for _, pending := range m.pendingReads {
+			busy = busy || pending.MailboxID == id
+		}
+		for _, action := range m.pendingDestructiveActions {
+			for _, entry := range action.Entries {
+				busy = busy || entry.Message.MailboxID == id
+			}
+		}
+		if busy {
+			m.setStatus("mark all read blocked: message operation pending; try again when it finishes", true)
+			return m.clearStatusCmd()
+		}
+	}
+	type task struct {
+		mailbox db.Mailbox
+		account config.AccountConfig
+		err     error
+	}
+	tasks := make([]task, 0, len(ids))
+	for _, id := range ids {
+		mb := m.mailboxByID(id)
+		if mb == nil {
+			tasks = append(tasks, task{err: fmt.Errorf("mailbox not found")})
+			continue
+		}
+		cfg, err := m.accountCfgForMailbox(id)
+		tasks = append(tasks, task{*mb, cfg, err})
+	}
+	if m.pendingBulkReads == nil {
+		m.pendingBulkReads = make(map[int64]uint64)
+	}
+	m.nextReadOperation++
+	token := m.nextReadOperation
+	for _, id := range ids {
+		m.pendingBulkReads[id] = token
+	}
+	database, sessions := m.db, m.sessions
+	return func() tea.Msg {
+		result := MailboxReadUpdatedMsg{Token: token, ReservedMailboxIDs: ids}
+		for _, task := range tasks {
+			if task.err != nil {
+				result.Err = task.err
+				return result
+			}
+			if task.account.IMAPHost != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				err := sessions.Do(ctx, task.account, func(client *imapClient.Client) error {
+					if err := client.MarkAllSeen(ctx, task.mailbox.Name); err != nil {
+						return err
+					}
+					return database.MarkAllRead(task.mailbox.ID)
+				})
+				cancel()
+				if err != nil {
+					result.Err = err
+					return result
+				}
+			} else if err := database.MarkAllRead(task.mailbox.ID); err != nil {
+				result.Err = err
+				return result
+			}
+			result.MailboxIDs = append(result.MailboxIDs, task.mailbox.ID)
+		}
+		return result
+	}
+}
+
+func renderArticleRow(prefix, star, title, age string, width int) string {
+	prefixW := lipgloss.Width(prefix)
+	starW := lipgloss.Width(star)
+	ageW := lipgloss.Width(age)
+	gapW := 2
+	trailingW := 2
+	if age == "" {
+		gapW = 0
+		trailingW = 0
+	}
+	titleW := max(0, width-prefixW-starW-ageW-gapW-trailingW)
+	row := prefix + star + padRight(truncate(title, titleW), titleW) + strings.Repeat(" ", gapW) + age + strings.Repeat(" ", trailingW)
+	return padRight(row, width)
+}
+
+// renderArticleRowWithSender lays out a message row with a fixed-width sender
+// column before the subject, keeping subjects vertically aligned across rows.
+func renderArticleRowWithSender(prefix, star, sender, title, age string, width, senderW int) string {
+	prefixW := lipgloss.Width(prefix)
+	starW := lipgloss.Width(star)
+	ageW := lipgloss.Width(age)
+	gapW := 2
+	trailingW := 2
+	if age == "" {
+		gapW = 0
+		trailingW = 0
+	}
+	senderGap := 1
+	titleW := max(0, width-prefixW-starW-senderW-senderGap-ageW-gapW-trailingW)
+	row := prefix + star +
+		padRight(truncate(sender, senderW), senderW) + strings.Repeat(" ", senderGap) +
+		padRight(truncate(title, titleW), titleW) + strings.Repeat(" ", gapW) +
+		age + strings.Repeat(" ", trailingW)
+	return padRight(row, width)
+}
+
+// starColor is the warm accent used to derive the subtle starred-row tint: the
+// theme's warning color.
+func starColor(t Theme) lipgloss.Color {
+	return t.WarningColor()
+}
+
+func starredRowBackground(t Theme) lipgloss.Color {
+	return mixColors(t.Bg, starColor(t), 0.12)
+}
+
+func applyMessageRowState(style, selected lipgloss.Style, starred, cursor bool, t Theme) lipgloss.Style {
+	if starred {
+		style = style.Background(starredRowBackground(t))
+	}
+	if cursor {
+		return selected
+	}
+	return style
+}
+
+func (m *Model) messageRowPrefix(read bool) string {
+	if m.styles.PlainUI {
+		if read {
+			return "- "
+		}
+		return "* "
+	}
+	if !m.iconsEnabled() {
+		if read {
+			return "  "
+		}
+		return "o "
+	}
+	if read {
+		return "· "
+	}
+	return "⬤ "
+}
+
+// messageRowStar returns the fixed-width star column that precedes the sender.
+// It deliberately contains no ANSI styling: an inline reset would interrupt the
+// enclosing row background, leaving the star cells (and sometimes the remainder
+// of the row) with the terminal's default background.
+func (m *Model) messageRowStar(starred bool) string {
+	if !starred {
+		return "  "
+	}
+	if m.styles.PlainUI {
+		return "* " // vt52 ASCII fallback
+	}
+	return "★ "
+}

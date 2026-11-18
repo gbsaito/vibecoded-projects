@@ -1,0 +1,268 @@
+package ui
+
+import (
+	"strings"
+
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+)
+
+func formLabelWidth(width int) int {
+	if width < 34 {
+		return max(10, width/2)
+	}
+	return min(28, max(22, width/2+4))
+}
+
+func padStyled(s string, width int, bg lipgloss.Color) string {
+	s = truncateStyled(s, width, bg)
+	if gap := width - lipgloss.Width(s); gap > 0 {
+		s += lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", gap))
+	}
+	return s
+}
+
+func renderFormControlRow(control string, width int, chrome managerChrome, focused bool) string {
+	var markerCell string
+	if focused {
+		markerCell = lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.accent).
+			Bold(true).
+			Width(2).
+			Render(" >")
+	} else {
+		markerCell = lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Width(2).
+			Render(" ")
+	}
+	controlW := max(1, width-lipgloss.Width(markerCell))
+	control = truncateStyled(control, controlW, chrome.baseBg)
+	controlCell := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Width(controlW).
+		Render(control)
+	return markerCell + controlCell
+}
+
+func renderInsetControl(control string, width, inset int, chrome managerChrome) string {
+	if width <= 0 {
+		return ""
+	}
+	if inset < 0 {
+		inset = 0
+	}
+	maxInset := max(0, (width-1)/2)
+	if inset > maxInset {
+		inset = maxInset
+	}
+	left := lipgloss.NewStyle().Background(chrome.baseBg).Render(strings.Repeat(" ", inset))
+	rightW := inset
+	innerW := max(1, width-inset-rightW)
+	control = truncateStyled(control, innerW, chrome.baseBg)
+	controlCell := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Width(innerW).
+		Render(control)
+	right := lipgloss.NewStyle().Background(chrome.baseBg).Render(strings.Repeat(" ", rightW))
+	return left + controlCell + right
+}
+
+// inputViewWithCursor renders input.View() with a reliably visible block cursor.
+//
+// bubbles v1.0.0 draws the textinput cursor with reverse-video, which renders
+// inconsistently across terminal emulators, and on an *empty* field it routes through
+// placeholderView() which forces the cursor to the dim placeholder style so it vanishes
+// entirely. We render the cursor through its TextStyle (the non-reverse "blinked-off"
+// style) set to a solid block; on an empty field we keep the placeholder hint but
+// prepend our own block so the cursor is always visible. The result is one solid,
+// non-blinking block in every terminal. Callers set input.Cursor.Style to the desired
+// block colours first.
+func inputViewWithCursor(input textinput.Model, focused bool) string {
+	if !focused {
+		input.Cursor.SetMode(cursor.CursorHide)
+		input.Cursor.TextStyle = input.TextStyle
+		return input.View()
+	}
+	block := input.Cursor.Style
+	input.Cursor.TextStyle = block
+	input.Cursor.Blink = true // render the block via TextStyle instead of reverse-video
+	if input.Value() == "" {
+		return block.Render(" ") + input.View()
+	}
+	return input.View()
+}
+
+func renderTextInput(input textinput.Model, width int, focused, masked bool, chrome managerChrome) string {
+	if width <= 0 {
+		return ""
+	}
+	// View is Width cells plus one for the cursor when it sits at the end; leave
+	// that cell inside the field or truncateStyled clips the cursor.
+	input.Width = max(1, width-1)
+	bg := chrome.surfaceBg
+	if focused {
+		bg = chrome.fieldBg
+	}
+	// bubbles' textinput.View() only backgrounds the padding it adds past the
+	// cursor via TextStyle — left at its zero value, that padding (and the
+	// prompt) render with no SGR codes at all and fall back to the terminal's
+	// default background as soon as anything upstream (e.g. the cursor block)
+	// emits a reset.
+	input.PromptStyle = lipgloss.NewStyle().Background(bg).Foreground(chrome.accent)
+	input.TextStyle = lipgloss.NewStyle().Background(bg).Foreground(chrome.text)
+	input.PlaceholderStyle = lipgloss.NewStyle().Background(bg).Foreground(chrome.muted)
+	if focused {
+		input.Cursor.Style = lipgloss.NewStyle().Background(chrome.accent).Foreground(accentReadableOn(chrome.text, chrome.accent, 4.5))
+	}
+	if masked {
+		input.EchoMode = textinput.EchoPassword
+	}
+	if input.Value() == "" {
+		// bubbles' placeholderView pads to Width with unstyled spaces when Width
+		// is set, leaking the terminal's default background — the outer Width
+		// wrap can't fix it because lipgloss won't re-apply the background after
+		// bubbles' internal reset. Empty fields have nothing to scroll, so drop
+		// Width and let the Width(width) wrap below do the (styled) padding. This
+		// hits unfocused rows too: To/CC/BCC/Subject at rest with no value.
+		input.Width = 0
+	}
+	view := truncateStyled(inputViewWithCursor(input, focused), width, bg)
+	return lipgloss.NewStyle().
+		Background(bg).
+		Foreground(chrome.text).
+		Width(width).
+		Render(view)
+}
+
+func renderFormHintLines(text string, width int, chrome managerChrome) []string {
+	text = strings.TrimRight(text, " \t\r\n")
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return []string{lipgloss.NewStyle().Background(chrome.baseBg).Width(width).Render("")}
+	}
+	indent := text[:len(text)-len(strings.TrimLeft(text, " \t"))]
+	prefix := "  "
+	if !chrome.plainUI {
+		prefix = "  · "
+	}
+	firstPrefix := indent + prefix
+	contPrefix := strings.Repeat(" ", lipgloss.Width(firstPrefix))
+	textW := max(1, width-lipgloss.Width(firstPrefix))
+	lines := wrapShellCommand(trimmed, textW)
+	hintStyle := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.muted)
+	out := make([]string, 0, len(lines))
+	for i, line := range lines {
+		linePrefix := firstPrefix
+		if i > 0 {
+			linePrefix = contPrefix
+		}
+		rendered := hintStyle.Render(linePrefix + line)
+		out = append(out, padStyled(rendered, width, chrome.baseBg))
+	}
+	return out
+}
+
+// renderFormHintLinesColored renders a hint whose leading marker carries a
+// color, for status lines where the marker itself is the good/bad signal (for
+// example terminal image support). The body text stays muted; only the marker
+// is colored.
+func renderFormHintLinesColored(text string, width int, chrome managerChrome, marker string, markerFg lipgloss.Color) []string {
+	text = strings.TrimRight(text, " \t\r\n")
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return []string{lipgloss.NewStyle().Background(chrome.baseBg).Width(width).Render("")}
+	}
+	indent := text[:len(text)-len(strings.TrimLeft(text, " \t"))]
+	markerStyle := lipgloss.NewStyle().Background(chrome.baseBg)
+	if markerFg != "" {
+		markerStyle = markerStyle.Foreground(markerFg)
+	} else {
+		markerStyle = markerStyle.Foreground(chrome.muted)
+	}
+	firstPrefix := indent + "  " + markerStyle.Render(marker) + " "
+	contPrefix := strings.Repeat(" ", lipgloss.Width(firstPrefix))
+	textW := max(1, width-lipgloss.Width(firstPrefix))
+	lines := wrapShellCommand(trimmed, textW)
+	hintStyle := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.muted)
+	out := make([]string, 0, len(lines))
+	for i, line := range lines {
+		linePrefix := firstPrefix
+		if i > 0 {
+			linePrefix = contPrefix
+		}
+		rendered := hintStyle.Render(linePrefix + line)
+		out = append(out, padStyled(rendered, width, chrome.baseBg))
+	}
+	return out
+}
+
+func renderFormInlineStatus(text string, width int, chrome managerChrome) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return lipgloss.NewStyle().Background(chrome.baseBg).Width(width).Render("")
+	}
+	return lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.muted).
+		Width(width).
+		Render(truncate(text, width))
+}
+
+func renderFormBadge(text string, focused bool, chrome managerChrome) string {
+	text = strings.ToUpper(strings.TrimSpace(text))
+	badgeW := max(7, lipgloss.Width(text)+2)
+	if focused {
+		return renderFormBadgeStyled(text, badgeW, chrome.highlight, chrome.highlightFg, true)
+	}
+	return renderFormBadgeStyled(text, badgeW, chrome.accent, chrome.accentFg, false)
+}
+
+func renderFormBadgeStyled(text string, width int, bg, fg lipgloss.Color, bold bool) string {
+	return lipgloss.NewStyle().
+		Background(bg).
+		Foreground(fg).
+		Bold(bold).
+		Width(width).
+		Align(lipgloss.Center).
+		Render(text)
+}
+
+// fillLineBg clamps line to width, pads it, and paints it with style, re-applying
+// style after every SGR reset. Bubbles widgets end each styled segment with
+// \033[0m and pad with unstyled spaces, which otherwise show the terminal's own
+// background through the field.
+func fillLineBg(line string, width int, style lipgloss.Style) string {
+	line = ansi.Truncate(line, width, "")
+	if gap := width - ansi.StringWidth(line); gap > 0 {
+		line += strings.Repeat(" ", gap)
+	}
+	if !strings.Contains(line, "\033[0m") {
+		return style.Render(line)
+	}
+	segs := strings.Split(line, "\033[0m")
+	for j, seg := range segs {
+		segs[j] = style.Render(seg)
+		if j < len(segs)-1 {
+			segs[j] += "\033[0m"
+		}
+	}
+	return strings.Join(segs, "")
+}
+
+func truncateStyled(s string, width int, bg lipgloss.Color) string {
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	// ansi.Truncate is SGR-aware, so styled cells — notably the textinput block cursor,
+	// which bubbles renders one cell past the field width — survive the clamp. A plain
+	// strip-and-re-render here would flatten every colour and drop the cursor entirely.
+	return lipgloss.NewStyle().Background(bg).Render(ansi.Truncate(s, width, ""))
+}

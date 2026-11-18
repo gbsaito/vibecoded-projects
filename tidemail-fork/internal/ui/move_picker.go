@@ -1,0 +1,381 @@
+package ui
+
+import (
+	"sort"
+	"strings"
+
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+type movePicker struct {
+	entries     []moveEntry
+	cursor      int
+	accountID   int64
+	accountName string
+	currentPath string
+	messages    []db.Message
+	sources     map[int64]bool
+	creating    bool
+	nameInput   textinput.Model
+}
+
+type moveEntry struct {
+	label     string
+	path      string
+	mailboxID int64
+	isDir     bool
+	isConfirm bool
+}
+
+func (m *Model) openMovePicker(messages []db.Message) {
+	if len(messages) == 0 {
+		return
+	}
+	firstMailbox := m.mailboxByID(messages[0].MailboxID)
+	if firstMailbox == nil {
+		m.setStatus("move failed: mailbox not found", true)
+		return
+	}
+	accountID := firstMailbox.AccountID
+	for _, msg := range messages[1:] {
+		mb := m.mailboxByID(msg.MailboxID)
+		if mb == nil || mb.AccountID != accountID {
+			m.setStatus("move failed: select messages from one account", true)
+			return
+		}
+	}
+	sources := make(map[int64]bool, len(messages))
+	for _, msg := range messages {
+		sources[msg.MailboxID] = true
+	}
+	accountName := m.accountName(accountID)
+	m.movePicker = movePicker{
+		accountID:   accountID,
+		accountName: accountName,
+		messages:    append([]db.Message(nil), messages...),
+		sources:     sources,
+	}
+	m.refreshMovePickerEntries()
+	if len(m.movePicker.entries) == 0 {
+		m.setStatus("move failed: no folders available", true)
+		m.movePicker = movePicker{}
+		return
+	}
+	m.overlay = overlayMoveMessage
+}
+
+func (m *Model) movePickerMessages() []db.Message {
+	if m.hasSelection() {
+		return m.selectedActionMessages()
+	}
+	return m.currentRowMessages()
+}
+
+func (m *Model) refreshMovePickerEntries() {
+	m.movePicker.entries = buildMoveEntries(m.mailboxes, m.movePicker.accountID, m.movePicker.currentPath, m.movePicker.sources)
+	m.movePicker.cursor = clamp(m.movePicker.cursor, 0, max(0, len(m.movePicker.entries)-1))
+}
+
+func buildMoveEntries(mailboxes []db.Mailbox, accountID int64, currentPath string, sources map[int64]bool) []moveEntry {
+	delimiter := moveDelimiter(mailboxes, accountID, currentPath)
+	var entries []moveEntry
+	if currentPath != "" {
+		if mb, ok := exactMoveMailbox(mailboxes, accountID, currentPath); ok && !sources[mb.ID] && !hasFlag(mb.Flags, "\\Noselect") {
+			entries = append(entries, moveEntry{label: "move here", mailboxID: mb.ID, isConfirm: true})
+		}
+		entries = append(entries, moveEntry{label: "..", path: moveParentPath(currentPath, delimiter), isDir: true})
+	}
+
+	childByName := make(map[string]moveEntry)
+	childHasChildren := make(map[string]bool)
+	childSelectable := make(map[string]bool)
+	for _, mb := range mailboxes {
+		if mb.AccountID != accountID || mb.Name == "" {
+			continue
+		}
+		parts := splitMovePath(mb.Name, moveMailboxDelimiter(mb))
+		currentParts := splitMovePath(currentPath, delimiter)
+		if !sameMovePrefix(parts, currentParts) || len(parts) <= len(currentParts) {
+			continue
+		}
+		childName := parts[len(currentParts)]
+		childPath := strings.Join(parts[:len(currentParts)+1], moveMailboxDelimiter(mb))
+		key := strings.ToLower(childName)
+		entry := childByName[strings.ToLower(childName)]
+		entry.label = childName
+		entry.path = childPath
+		entry.isDir = true
+		if len(parts) == len(currentParts)+1 {
+			entry.mailboxID = mb.ID
+			if !sources[mb.ID] && !hasFlag(mb.Flags, "\\Noselect") {
+				childSelectable[key] = true
+			}
+		} else {
+			childHasChildren[key] = true
+		}
+		childByName[key] = entry
+	}
+	keys := make([]string, 0, len(childByName))
+	for key := range childByName {
+		if childSelectable[key] || childHasChildren[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		entries = append(entries, childByName[key])
+	}
+	return entries
+}
+
+func moveDelimiter(mailboxes []db.Mailbox, accountID int64, currentPath string) string {
+	if currentPath != "" {
+		if mb, ok := exactMoveMailbox(mailboxes, accountID, currentPath); ok {
+			return moveMailboxDelimiter(mb)
+		}
+	}
+	known := false
+	for _, mb := range mailboxes {
+		if mb.AccountID == accountID {
+			known = true
+		}
+		if mb.AccountID == accountID && mb.Delimiter != "" {
+			return mb.Delimiter
+		}
+	}
+	if known {
+		return ""
+	}
+	return "/"
+}
+
+func moveMailboxDelimiter(mb db.Mailbox) string {
+	return mb.Delimiter
+}
+
+func exactMoveMailbox(mailboxes []db.Mailbox, accountID int64, path string) (db.Mailbox, bool) {
+	for _, mb := range mailboxes {
+		if mb.AccountID == accountID && mb.Name == path {
+			return mb, true
+		}
+	}
+	return db.Mailbox{}, false
+}
+
+func splitMovePath(path, delimiter string) []string {
+	if path == "" {
+		return nil
+	}
+	if delimiter == "" {
+		return []string{path}
+	}
+	parts := strings.Split(path, delimiter)
+	out := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func sameMovePrefix(parts, prefix []string) bool {
+	if len(prefix) > len(parts) {
+		return false
+	}
+	for i := range prefix {
+		if parts[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func moveParentPath(path, delimiter string) string {
+	parts := splitMovePath(path, delimiter)
+	if len(parts) <= 1 {
+		return ""
+	}
+	return strings.Join(parts[:len(parts)-1], delimiter)
+}
+
+func (m Model) handleMovePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.movePicker.creating {
+		switch {
+		case keyMatches(msg, m.keys.Cancel):
+			m.movePicker.creating = false
+			m.movePicker.nameInput.Blur()
+			return m, nil
+		case keyMatches(msg, m.keys.Confirm):
+			name := strings.TrimSpace(m.movePicker.nameInput.Value())
+			m.movePicker.creating = false
+			m.movePicker.nameInput.Blur()
+			if name == "" {
+				return m, nil
+			}
+			parent := m.movePicker.currentPath
+			if moveDelimiter(m.mailboxes, m.movePicker.accountID, parent) == "" {
+				parent = ""
+			}
+			return m, m.createFolderCmd(m.movePicker.accountID, parent, name)
+		default:
+			var cmd tea.Cmd
+			m.movePicker.nameInput, cmd = m.movePicker.nameInput.Update(msg)
+			return m, cmd
+		}
+	}
+	switch {
+	case keyMatches(msg, m.keys.Cancel):
+		m.movePicker = movePicker{}
+		m.overlay = overlayNone
+		return m, nil
+	case keyMatches(msg, m.keys.Up):
+		if m.movePicker.cursor > 0 {
+			m.movePicker.cursor--
+		}
+		return m, nil
+	case keyMatches(msg, m.keys.Down):
+		if m.movePicker.cursor < len(m.movePicker.entries)-1 {
+			m.movePicker.cursor++
+		}
+		return m, nil
+	case keyMatches(msg, m.keys.Confirm):
+		if len(m.movePicker.entries) == 0 {
+			return m, nil
+		}
+		entry := m.movePicker.entries[m.movePicker.cursor]
+		if entry.isConfirm {
+			return m.confirmMovePicker(entry.mailboxID)
+		}
+		if entry.isDir {
+			m.movePicker.currentPath = entry.path
+			m.movePicker.cursor = 0
+			m.refreshMovePickerEntries()
+		}
+		return m, nil
+	case keyMatches(msg, m.keys.Left), keyMatches(msg, m.keys.Back):
+		if m.movePicker.currentPath == "" {
+			m.movePicker = movePicker{}
+			m.overlay = overlayNone
+			return m, nil
+		}
+		m.movePicker.currentPath = moveParentPath(m.movePicker.currentPath, moveDelimiter(m.mailboxes, m.movePicker.accountID, m.movePicker.currentPath))
+		m.movePicker.cursor = 0
+		m.refreshMovePickerEntries()
+		return m, nil
+	case msg.String() == "n":
+		input := textinput.New()
+		input.Placeholder = "folder name"
+		input.Focus()
+		m.movePicker.nameInput = input
+		m.movePicker.creating = true
+		return m, nil
+	default:
+		key := msg.String()
+		if len(key) == 1 && ((key >= "a" && key <= "z") || (key >= "A" && key <= "Z")) {
+			lower := strings.ToLower(key)
+			for i, e := range m.movePicker.entries {
+				if strings.HasPrefix(strings.ToLower(e.label), lower) {
+					m.movePicker.cursor = i
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+	}
+}
+
+func (m Model) confirmMovePicker(targetMailboxID int64) (tea.Model, tea.Cmd) {
+	target := m.mailboxByID(targetMailboxID)
+	if target == nil {
+		m.setStatus("move failed: target mailbox not found", true)
+		return m, m.clearStatusCmd()
+	}
+	msgs := append([]db.Message(nil), m.movePicker.messages...)
+	m.movePicker = movePicker{}
+	m.overlay = overlayNone
+	m.clearSelection()
+	return m, m.scheduleMove(msgs, *target)
+}
+
+func (m Model) renderMovePicker(width, height int, chrome managerChrome) string {
+	path := m.movePicker.accountName
+	if m.movePicker.currentPath != "" {
+		path += " / " + m.movePicker.currentPath
+	}
+	pathLine := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.muted).
+		Width(width).
+		Padding(0, 2).
+		Render(clampView(path, max(1, width-4), 1, chrome.baseBg))
+
+	labelW := max(1, width-2) // minus the 2-cell rail
+	listH := max(1, height-6)
+
+	if m.movePicker.creating {
+		nameInput := m.movePicker.nameInput
+		nameInput.PromptStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.accent)
+		nameInput.TextStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text)
+		nameInput.PlaceholderStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted)
+		prompt := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(width).
+			Padding(0, 2).
+			Render(clampView("new folder: "+nameInput.View(), max(1, width-4), 1, chrome.baseBg))
+		rows := []string{prompt}
+		for len(rows) < listH {
+			rows = append(rows, lipgloss.NewStyle().Background(chrome.baseBg).Width(width).Render(""))
+		}
+		hints := renderSoftHints(width, chrome, "enter", "create", "esc", "cancel")
+		return lipgloss.JoinVertical(lipgloss.Left, pathLine, lipgloss.JoinVertical(lipgloss.Left, rows...), hints)
+	}
+
+	start := 0
+	if m.movePicker.cursor >= listH {
+		start = m.movePicker.cursor - listH + 1
+	}
+	end := min(start+listH, len(m.movePicker.entries))
+	visible := m.movePicker.entries[start:end]
+
+	rows := make([]string, 0, listH)
+	for i, e := range visible {
+		idx := start + i
+		selected := idx == m.movePicker.cursor
+		label := e.label
+		switch {
+		case e.isConfirm:
+			label = "move here"
+		case e.label == "..":
+			label = "../"
+		case e.isDir:
+			label = e.label + "/"
+		}
+		cell := lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text).Render(" " + truncate(label, max(1, labelW-1)))
+		rows = append(rows, softRail(chrome, selected, chrome.baseBg)+padStyled(cell, labelW, chrome.baseBg))
+	}
+	for len(rows) < listH {
+		rows = append(rows, lipgloss.NewStyle().Background(chrome.baseBg).Width(width).Render(""))
+	}
+
+	hints := renderSoftHints(width, chrome,
+		"enter", "open/move",
+		"n", "new folder",
+		"h", "parent",
+		"esc", "cancel",
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, pathLine, lipgloss.JoinVertical(lipgloss.Left, rows...), hints)
+}
+
+func (m *Model) createFolderCmd(accountID int64, parentPath, name string) tea.Cmd {
+	if m.folderOpBusy {
+		m.setStatus(folderBusyMsg, false)
+		return m.clearStatusCmd()
+	}
+	m.folderOpBusy = true
+	return m.createFolderOnServerCmd(accountID, parentPath, name)
+}

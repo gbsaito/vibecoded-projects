@@ -1,0 +1,3 @@
+#!/bin/sh
+# Milaclone desktop (Electron) — launcher
+exec electron "$HOME/Projects/milaclone-gui-electron" "$@"

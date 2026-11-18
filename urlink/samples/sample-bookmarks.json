@@ -1,0 +1,40 @@
+{
+  "bookmarks": [
+    {
+      "id": "1",
+      "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "title": "Rick Astley - Never Gonna Give You Up (Official Video)",
+      "description": "Official music video. Classic 80s pop.",
+      "tags": ["music", "videos"],
+      "archived": false,
+      "createdAt": 1738000000000
+    },
+    {
+      "id": "2",
+      "url": "https://github.com/facebook/react",
+      "title": "React · The library for web and native user interfaces",
+      "description": "The library for web and native user interfaces.",
+      "tags": ["dev", "web"],
+      "archived": false,
+      "createdAt": 1738000100000
+    },
+    {
+      "id": "3",
+      "url": "https://en.wikipedia.org/wiki/Tokyo_Night",
+      "title": "Tokyo Night — colour theme",
+      "description": "Wikipedia article about the Tokyo Night colour scheme.",
+      "tags": ["design", "night"],
+      "archived": false,
+      "createdAt": 1738000200000
+    },
+    {
+      "id": "4",
+      "url": "https://news.ycombinator.com/item?id=12345678",
+      "title": "Show HN: A terminal bookmark manager",
+      "description": "Hacker News discussion.",
+      "tags": ["news"],
+      "archived": false,
+      "createdAt": 1738000300000
+    }
+  ]
+}

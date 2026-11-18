@@ -1,0 +1,662 @@
+package ui
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/allisonhere/tidemail/internal/update"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// settingsOverlayMaxW caps how wide Settings grows on a large terminal. Narrower
+// caps left controls ~17 columns, cutting off theme names, action hints and
+// picker values however much room the terminal had.
+const settingsOverlayMaxW = 96
+
+func (m Model) renderOverlay(base string) string {
+	if m.overlay == overlayContextMenu {
+		return m.renderContextMenu(base)
+	}
+	var box string
+
+	switch m.overlay {
+	case overlayQuitConfirm:
+		quitW := 40
+		qt := m.styles.Theme
+		chrome := newManagerChrome(quitW, qt, m.styles.PlainUI)
+		body := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(quitW).
+			Padding(1, 2).
+			Render("Exit Tide now?")
+		hints := renderSoftHints(quitW, chrome, "y", "quit", "esc", "cancel")
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, quitW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, quitW, "tidemail", "quit tide?", chrome)
+
+	case overlaySyncAllConfirm:
+		winW := 52
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		body := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(winW).
+			Padding(1, 2).
+			Render(m.syncAllConfirmText())
+		hints := renderSoftHints(winW, chrome, "y/enter", "sync", "esc", "cancel")
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "sync all?", chrome)
+
+	case overlayFolderDeleteConfirm:
+		winW := 56
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		body := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(winW).
+			Padding(1, 2).
+			Render(m.folderDeleteConfirmText())
+		hints := renderSoftHints(winW, chrome, "y/enter", "delete", "esc", "cancel")
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "delete folder?", chrome)
+
+	case overlayUnsubscribeConfirm:
+		winW := 52
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		method := "opens the list's page in your browser"
+		if supportsOneClickUnsubscribe(m.pendingUnsubscribe.Headers) {
+			method = "one-click, handled by tidemail"
+		}
+		text := fmt.Sprintf("Unsubscribe via %s?\n(%s)", unsubscribeHost(m.pendingUnsubscribe), method)
+		body := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(winW).
+			Padding(1, 2).
+			Render(text)
+		hints := renderSoftHints(winW, chrome, "y/enter", "unsubscribe", "esc", "cancel")
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "unsubscribe?", chrome)
+
+	case overlayDraftCloseConfirm:
+		winW := 48
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		body := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(winW).
+			Padding(1, 2).
+			Render("Save this draft before closing compose?")
+		hints := renderSoftHints(winW, chrome, "y/enter", "save", "d", "discard", "esc", "cancel")
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "save draft?", chrome)
+
+	case overlayBulkDeleteConfirm:
+		winW := 48
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		count := len(m.pendingBulkDelete)
+		body := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(winW).
+			Padding(1, 2).
+			Render(fmt.Sprintf("Delete %d selected messages?", count))
+		hints := renderSoftHints(winW, chrome, "y/enter", "delete", "esc", "cancel")
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "delete messages?", chrome)
+
+	case overlayThemePicker:
+		winW, winH := themePickerSize(m.width, m.height)
+		box = m.renderThemePicker(winW, winH)
+
+	case overlayAccountManager:
+		winW := min(m.width-4, 74)
+		winH := min(m.height-4, 40)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.accountManager.View(winW, winH, m.styles)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", m.accountManager.softTitle(), chrome)
+
+	case overlayContactManager:
+		winW := min(m.width-4, 74)
+		winH := min(m.height-4, 40)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.contactManager.View(winW, winH, m.styles)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", m.contactManager.softTitle(), chrome)
+
+	case overlayCompose:
+		winW, winH := m.compose.overlayDimensions(m.width, m.height)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		view := m.compose
+		_, view.pgpAvailable = m.pgpComposePlugin()
+		inner := view.View(winW, winH, m.styles)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		title := m.compose.softTitle()
+		if m.compose.picker.active {
+			title = "attach file"
+		}
+		box = renderSoftPanelBox(inner, winW, "tidemail", title, chrome)
+
+	case overlaySaveAttach:
+		winW := min(m.width-4, 74)
+		winH := min(m.height-4, 36)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderSaveAttachPicker(winW, winH, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "save attachments", chrome)
+
+	case overlayMoveMessage:
+		winW := min(m.width-4, 74)
+		winH := min(m.height-4, 36)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderMovePicker(winW, winH, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "move to", chrome)
+
+	case overlaySnooze:
+		box = m.renderSnoozePicker()
+
+	case overlayTagColors:
+		box = m.renderTagColors()
+
+	case overlayColorPicker:
+		box = m.renderColorPicker()
+
+	case overlayMailTags:
+		box = m.renderMailTagsOverlay()
+	case overlayClassification:
+		box = m.renderClassificationOverlay()
+
+	case overlayPlugins, overlayPluginPicker, overlayPluginResult, overlayPluginAnnotations, overlayPluginConfirm, overlayPluginSettings:
+		box = m.renderPluginOverlay()
+
+	case overlayOutbox:
+		winW := max(1, min(m.width-4, 90))
+		winH := max(1, min(m.height-4, 28))
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		box = renderSoftPanelBox(m.renderOutbox(winW, winH, chrome), winW, "tidemail", "outbox", chrome)
+	case overlayFilterManager:
+		winW := min(m.width-4, 78)
+		winH := min(m.height-4, 32)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderFilterManager(winW, winH, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "filters", chrome)
+
+	case overlayGrammarPreview:
+		box = m.renderGrammarPreview()
+
+	case overlaySpellDictionary:
+		winW := min(m.width-6, 56)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderSpellDictionary(winW, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "personal dictionary", chrome)
+
+	case overlayPluginCatalog:
+		winW := min(m.width-6, 78)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderPluginCatalog(winW, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "available plugins", chrome)
+
+	case overlaySource:
+		box = m.renderSourceOverlay()
+
+	case overlayLogViewer:
+		winW := min(m.width-6, 90)
+		winH := min(m.height-4, 38)
+		box = m.renderLogViewer(winW, winH)
+
+	case overlayHelp:
+		winW, leftW, _, paneH := helpLayout(m.width, m.height)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		m.helpVP.Style = lipgloss.NewStyle().Background(chrome.baseBg)
+		var footer string
+		switch {
+		case m.helpSearchActive:
+			input := m.helpSearchInput
+			if input.Value() == "" {
+				// bubbles' placeholderView pads to Width with unstyled spaces
+				// when Width is set, leaking the terminal's default background.
+				// Leave padding to padStyled below, which styles it.
+				input.Width = 0
+			} else {
+				input.Width = max(1, winW-6)
+			}
+			input.Prompt = "/ "
+			input.PromptStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.accent).Bold(true)
+			input.TextStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text)
+			input.PlaceholderStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted)
+			input.Cursor.Style = lipgloss.NewStyle().Background(chrome.accent).Foreground(accentReadableOn(chrome.text, chrome.accent, 4.5))
+			footer = padStyled("  "+inputViewWithCursor(input, true), winW, chrome.baseBg)
+		case m.helpSearchInput.Value() != "":
+			footer = renderSoftHints(winW, chrome, "/", "edit search", "esc", "clear", "?/q", "close", "↑↓", "choose/scroll", "←→", "pane")
+		default:
+			footer = renderSoftHints(winW, chrome, "/", "search", "esc/?/q", "close", "↑↓", "choose/scroll", "←→", "pane")
+		}
+		left := renderHelpCategories(m.helpSectionsFiltered(), m.helpCat, !m.helpRight, leftW, paneH, chrome)
+		divider := strings.TrimSuffix(strings.Repeat(lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted).Render("│")+"\n", paneH), "\n")
+		panes := lipgloss.JoinHorizontal(lipgloss.Top, left, divider, m.helpVP.View())
+		inner := panes + "\n\n" + footer
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "help", chrome)
+
+	case overlaySettings:
+		winW := min(m.width-4, settingsOverlayMaxW)
+		winH := min(m.height-4, 36)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		var detail func(int, int) string
+		if m.settings.activeSection == ssPlugins {
+			detail = func(width, height int) string { return m.renderSettingsPluginPane(width, height, chrome) }
+		}
+		inner := m.settings.viewWithDetail(winW, winH, chrome, detail)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "settings", chrome)
+
+	case overlayUpdateConfirm:
+		winW := min(m.width-8, 72)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderUpdateConfirmOverlay(winW, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", m.updateOverlayTitle(), chrome)
+
+	case overlaySummary:
+		winW := min(m.width-8, 76)
+		winH := min(m.height-6, 20)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderSummaryOverlay(winW, winH, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "ai summary", chrome)
+
+	case overlayCommandPalette:
+		winW := min(m.width-6, 72)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		inner := m.renderCommandPalette(winW, chrome)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "command", chrome)
+
+	case overlayScheduleSend:
+		winW := min(m.width-6, 56)
+		chrome := newManagerChrome(winW, m.styles.Theme, m.styles.PlainUI)
+		var body string
+		var hints string
+		if m.scheduleCustom {
+			if m.scheduleDate.IsZero() {
+				body = renderScheduleCalendar(m.scheduleCalendar, winW, chrome)
+				hints = renderSoftHints(winW, chrome, "←→/↑↓", "choose date", "pgup/pgdown", "month", "enter", "choose", "esc", "cancel")
+			} else {
+				input := m.scheduleSendInput
+				input.Width = max(1, winW-8)
+				input.Prompt = "  "
+				input.PromptStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.accent)
+				input.TextStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text)
+				input.PlaceholderStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted)
+				body = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text).Width(winW).Padding(1, 2).
+					Render("Send on " + m.scheduleDate.Format("Monday, January 2") + " at (local time)\n\n" + input.View() + "\n\nFormat: 3:04 PM")
+				if m.scheduleSendInput.Err != nil {
+					body += "\n" + lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.errorFg).Padding(0, 2).Render(m.scheduleSendInput.Err.Error())
+				}
+				hints = renderSoftHints(winW, chrome, "enter", "schedule", "esc", "cancel")
+			}
+		} else {
+			picker := m.schedulePicker
+			picker.SetSize(max(1, winW-4), 4)
+			body = lipgloss.NewStyle().Background(chrome.baseBg).Width(winW).Padding(1, 2).Render(picker.View())
+			hints = renderSoftHints(winW, chrome, "↑↓", "choose time", "enter", "continue", "esc", "cancel")
+		}
+		inner := lipgloss.JoinVertical(lipgloss.Left, body, hints)
+		inner = clampView(inner, winW, strings.Count(inner, "\n")+1, chrome.baseBg)
+		box = renderSoftPanelBox(inner, winW, "tidemail", "schedule send", chrome)
+	}
+
+	if m.overlay == overlayCompose && m.compose.maximized {
+		return clampView(box, m.width, m.height, m.styles.Theme.Bg)
+	}
+	if m.overlay == overlayCompose && m.composeBackdrop != nil {
+		return m.composeBackdrop.composite.View(base, box, m.width, m.height, m.styles.Theme.Bg, m.cfg.Display.Shadow)
+	}
+	return overlayOnBase(base, box, m.width, m.height, m.styles.Theme.Bg, m.cfg.Display.Shadow)
+}
+
+func (m Model) updateOverlayTitle() string {
+	switch {
+	case m.updateState == updateStateInstalled:
+		return "update installed"
+	case m.updateState == updateStateNeedsElevation, m.manualUpdateRequired():
+		return "manual update"
+	case m.updateInProgress():
+		return "installing update"
+	default:
+		return "install update?"
+	}
+}
+
+func (m Model) renderCommandPalette(width int, chrome managerChrome) string {
+	input := m.commandInput
+	if input.Value() == "" {
+		// bubbles' placeholderView pads to Width with unstyled spaces when
+		// Width is set, leaking the terminal's default background. Leave
+		// padding to the outer Width(width) wrap below, which styles it.
+		input.Width = 0
+	} else {
+		input.Width = max(1, width-4)
+	}
+	input.PromptStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.accent).Bold(true)
+	input.TextStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text)
+	input.PlaceholderStyle = lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted)
+	input.Cursor.Style = lipgloss.NewStyle().Background(chrome.accent).Foreground(accentReadableOn(chrome.text, chrome.accent, 4.5))
+	input.Cursor.TextStyle = lipgloss.NewStyle().Background(chrome.accent).Foreground(accentReadableOn(chrome.text, chrome.accent, 4.5))
+
+	items := m.filteredCommandItems()
+	rows := []string{inputViewWithCursor(input, true), ""}
+	if len(items) == 0 {
+		rows = append(rows, lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted).Render("No commands"))
+	} else {
+		limit := min(8, len(items))
+		start := 0
+		if m.commandCursor >= limit {
+			start = m.commandCursor - limit + 1
+		}
+		for i := start; i < min(start+limit, len(items)); i++ {
+			item := items[i]
+			selected := i == m.commandCursor
+			fg := chrome.text
+			if !item.enabled {
+				fg = chrome.muted
+			} else if selected {
+				fg = chrome.text
+			}
+			labelW := max(1, width-4-2) // minus the 2-cell rail
+			label := lipgloss.NewStyle().Background(chrome.baseBg).Foreground(fg).Render(" " + truncate(item.label, max(1, labelW-1)))
+			rows = append(rows, softRail(chrome, selected, chrome.baseBg)+padStyled(label, labelW, chrome.baseBg))
+		}
+	}
+	body := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.text).
+		Width(width).
+		Padding(1, 2).
+		Render(strings.Join(rows, "\n"))
+	hints := renderSoftHints(width, chrome, "enter", "run", "esc", "close")
+	return lipgloss.JoinVertical(lipgloss.Left, body, hints)
+}
+
+func (m Model) renderSummaryOverlay(width, height int, chrome managerChrome) string {
+	var bodyText string
+	switch {
+	case m.summaryGenerating:
+		bodyText = m.spinner.View() + " Generating summary…"
+	case m.summaryErr != "":
+		bodyText = "Error: " + m.summaryErr
+	default:
+		bodyText = formatSummaryBody(m.summaryMessage.Summary, width-4, m.styles.PlainUI)
+	}
+
+	body := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.text).
+		Width(width).
+		Padding(1, 2).
+		Render(bodyText)
+
+	var hints string
+	if !m.summaryGenerating && m.summaryErr == "" && m.summaryMessage.Summary != "" {
+		provider := ""
+		if m.summarizer != nil {
+			prefix := "  ·  "
+			if m.styles.PlainUI {
+				prefix = " | "
+			}
+			provider = prefix + m.summarizer.ProviderName()
+		}
+		providerLine := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.muted).
+			Width(width).
+			Padding(0, 2).
+			Render(provider)
+		hints = lipgloss.JoinVertical(lipgloss.Left,
+			providerLine,
+			renderSoftHints(width, chrome, "c", "copy", "M", "save .md", "esc", "close"),
+		)
+	} else {
+		hints = renderSoftHints(width, chrome, "esc", "close")
+	}
+
+	bodyH := max(1, height-lipgloss.Height(hints)-1)
+	body = clampView(body, width, bodyH, chrome.baseBg)
+	return lipgloss.JoinVertical(lipgloss.Left, body, hints)
+}
+
+// updatePanel is one modal body: a heading, wrapped detail lines, an optional
+// shell command in a code box, an optional muted footnote, and a hint row. Every
+// branch of the update modal goes through it so they cannot drift apart again —
+// they differ in content, not in layout.
+type updatePanel struct {
+	heading string
+	details []string
+	command string
+	note    string
+	hints   []string
+}
+
+func (m Model) renderUpdatePanel(width int, chrome managerChrome, p updatePanel) string {
+	contentW := max(1, width-4)
+	lines := []string{p.heading}
+	for _, detail := range p.details {
+		if strings.TrimSpace(detail) == "" {
+			lines = append(lines, "")
+			continue
+		}
+		// Wrap here rather than leaning on the block style: a long target path
+		// or a 140-character release summary would otherwise set the modal's
+		// width and overflow a narrow terminal.
+		lines = append(lines, wrapShellCommand(detail, contentW)...)
+	}
+	body := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.text).
+		Width(width).
+		Padding(1, 2, 0, 2).
+		Render(strings.Join(lines, "\n"))
+
+	parts := []string{body}
+	if cmd := strings.TrimSpace(p.command); cmd != "" {
+		// renderShellCommandBox sizes the block's interior; its border adds two
+		// cells on top, so subtract them to land flush with the body text.
+		box := lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Width(width).
+			Padding(1, 2, 0, 2).
+			Render(renderShellCommandBox(max(1, contentW-2), cmd, false, chrome))
+		parts = append(parts, box)
+	}
+	if strings.TrimSpace(p.note) != "" {
+		parts = append(parts, lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.muted).
+			Width(width).
+			Padding(1, 2, 1, 2).
+			Render(strings.Join(wrapShellCommand(p.note, contentW), "\n")))
+	}
+	if len(p.hints) > 0 {
+		parts = append(parts, renderSoftHints(width, chrome, p.hints...))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// manualUpdateReason explains why this install cannot replace its own binary.
+// It returns detail lines rather than one string so a long install path lands on
+// its own line: wrapped mid-sentence it strands the punctuation after it.
+func (m Model) manualUpdateReason() []string {
+	pkg, ok := update.OwningPackageInstall()
+	if m.previewPackageOwner != nil {
+		pkg, ok = *m.previewPackageOwner, true
+	}
+	if ok {
+		return []string{"TideMail was installed by " + pkg.Manager + " as " + pkg.Package +
+			", so it cannot replace its own binary."}
+	}
+	lines := []string{"TideMail cannot write to its install location, so it cannot replace its own binary."}
+	if target, _ := os.Executable(); strings.TrimSpace(target) != "" {
+		lines = append(lines, "", "Location: "+target)
+	}
+	return lines
+}
+
+func (m Model) renderUpdateConfirmOverlay(width int, chrome managerChrome) string {
+	target, _ := os.Executable()
+	contentW := max(1, width-4)
+
+	if m.updateState == updateStateInstalled {
+		panel := updatePanel{
+			heading: "Updated TideMail to " + m.updateInstall.Version + ".",
+			hints:   []string{"enter", "restart", "esc", "close"},
+		}
+		if shadowed := strings.TrimSpace(m.updateInstall.ShadowedPath); shadowed != "" {
+			cmd := strings.TrimSpace(m.updateInstall.ShadowedCommand)
+			if cmd == "" {
+				cmd = "rm -f " + shadowed
+			}
+			panel.details = []string{
+				"",
+				shadowed + " is still earlier on PATH.",
+				"Remove it so tidemail starts this version:",
+			}
+			panel.command = cmd
+			panel.hints = []string{"C", "copy", "enter", "restart", "esc", "close"}
+		}
+		return m.renderUpdatePanel(width, chrome, panel)
+	}
+
+	if m.updateInProgress() {
+		verb := "Downloading"
+		if m.updateState == updateStateInstalling {
+			verb = "Installing"
+		}
+		label := fmt.Sprintf("%s TideMail %s... %d%%", verb, m.updateInfo.Version, m.updateProgress)
+		return lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Foreground(chrome.text).
+			Width(width).
+			Padding(1, 2).
+			Render(strings.Join([]string{
+				label,
+				"",
+				updateProgressBar(m.updateProgress, contentW, chrome),
+			}, "\n"))
+	}
+
+	// Either the installer downloaded an update it cannot place, or this install
+	// is package-managed and was never going to place one. Same shape either way:
+	// explain, show the command, let them copy it.
+	if m.updateState == updateStateNeedsElevation || m.manualUpdateRequired() {
+		heading := "Update available: " + m.updateInfo.Version
+		reason := m.manualUpdateReason()
+		if m.updateState == updateStateNeedsElevation {
+			heading = "Update downloaded, but it cannot be installed here."
+			reason = []string{"The install target is not writable."}
+		}
+		details := append([]string{""}, reason...)
+		details = append(details, "", "Run this outside TideMail:")
+		return m.renderUpdatePanel(width, chrome, updatePanel{
+			heading: heading,
+			details: details,
+			command: m.updateManualCommand(),
+			note:    "Also available in Settings > Updates",
+			hints:   []string{"C", "copy", "esc", "close"},
+		})
+	}
+
+	details := []string{}
+	if summary := strings.TrimSpace(m.updateInfo.Summary); summary != "" {
+		details = append(details, "", "What's new: "+summary)
+	}
+	details = append(details,
+		"",
+		"Asset: "+m.updateInfo.AssetName+".tar.gz",
+		"Target: "+target,
+		"",
+		"The update will download first, then replace the current binary if the install path is writable.",
+	)
+	return m.renderUpdatePanel(width, chrome, updatePanel{
+		heading: "Install TideMail " + m.updateInfo.Version + "?",
+		details: details,
+		note:    "Also available in Settings > Updates",
+		hints:   []string{"enter", "install", "esc", "cancel"},
+	})
+}
+
+func updateProgressBar(pct int, width int, chrome managerChrome) string {
+	width = max(1, width)
+	pct = clamp(pct, 0, 100)
+	filled := clamp(width*pct/100, 0, width)
+	full := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.accent).
+		Render(strings.Repeat("█", filled))
+	empty := lipgloss.NewStyle().
+		Background(chrome.baseBg).
+		Foreground(chrome.muted).
+		Render(strings.Repeat("░", width-filled))
+	return full + empty
+}
+
+func (m Model) renderLogViewer(width, height int) string {
+	t := m.styles.Theme
+	bg := modalSurface(t)
+	border := t.OverlayBorder
+	if border == "" {
+		border = t.BorderFocus
+	}
+
+	// Build log lines
+	var logLines []string
+	vpWidth := max(1, width)
+	for _, entry := range m.logBuffer {
+		timeStr := entry.Time.Format("15:04:05")
+		fg := readableText(t.Dimmed, bg, 3.0)
+		if entry.IsError {
+			fg = t.Error
+		}
+		line := lipgloss.NewStyle().
+			Background(bg).
+			Foreground(fg).
+			Width(vpWidth).
+			Render(fmt.Sprintf("%-8s %s", timeStr, entry.Message))
+		logLines = append(logLines, line)
+	}
+	if len(logLines) == 0 {
+		logLines = []string{lipgloss.NewStyle().Background(bg).Foreground(readableText(t.Dimmed, bg, 3.0)).Width(vpWidth).Render("(no log entries yet)")}
+	}
+
+	// Reverse so newest first
+	for i, j := 0, len(logLines)-1; i < j; i, j = i+1, j-1 {
+		logLines[i], logLines[j] = logLines[j], logLines[i]
+	}
+
+	m.helpVP.SetContent(strings.Join(logLines, "\n"))
+	m.helpVP.Style = lipgloss.NewStyle().Background(bg)
+	m.helpVP.Width = vpWidth
+	m.helpVP.Height = max(1, height-4)
+
+	// Viewport view
+	title := lipgloss.NewStyle().Background(bg).Foreground(t.BorderFocus).Bold(true).Width(width).Padding(0, 1).Render(fmt.Sprintf("LOGS (%d)", len(logLines)))
+	footer := lipgloss.NewStyle().Background(bg).Foreground(readableText(t.Dimmed, bg, 3.0)).Width(width).Padding(0, 1).Render("[esc] close  [↑↓/j/k] scroll")
+
+	return lipgloss.NewStyle().
+		Background(bg).
+		Border(lipPaneBorder(m.styles.PlainUI)).
+		BorderForeground(border).
+		Width(width).Height(height).
+		Render(lipgloss.JoinVertical(lipgloss.Left, title, m.helpVP.View(), footer))
+}

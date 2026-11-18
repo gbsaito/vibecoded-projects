@@ -1,0 +1,103 @@
+GoField,Keys,HelpDisplay,Description,Context
+Up,"k,up",k/↑,up (Focus line on: move highlight; off: scroll one row or previous LINKS entry; first exits),global
+Down,"j,down",j/↓,down (Focus line on: move highlight; off: scroll one row; another Down at bottom enters LINKS; no wrapping),global
+Left,"h,left",h/←,move left,global
+Right,"l,right",l/→,move right,global
+NextPane,"tab,]",tab/],next pane,global
+PrevPane,"shift+tab,[",shift+tab/[,prev pane,global
+Enter,enter,enter,"expand/collapse a conversation parent; open a child or single message; open or immediately sync a folder; in content open the selected or focused link; mailto opens TideMail compose",global
+Back,esc,esc,back,global
+Sync,s,s,sync mailbox,main
+SyncAll,"F,ctrl+s",F/ctrl+s,sync all,main
+MarkRead,x,x,collapsed: mark all read if any unread or all unread if all read; expanded/single: toggle this email; mark-read advances; mark-unread stays; explicit selection toggles individually without advancing (unavailable in Drafts),main
+ToggleStar,*,*,toggle star (unavailable in Drafts),main
+NeedsYouDismiss,X,X,dismiss from Needs You / stop waiting,main
+Snooze,Z,Z,snooze (in Snoozed: unsnooze),main
+RunPlugin,p,p,run plugin,main
+PGPDecode,D,D,decrypt and verify PGP message (needs a PGP plugin),main
+EditTags,e,e,correct classification and manage current message tags,message list+content
+PluginCatalog,b,b,browse available plugins (i install / u update / x remove),plugin list
+PluginCardUnsubscribe,u,u,unsubscribe when offered,plugin result card
+MarkAllRead,"R,ctrl+x",R/ctrl+x,mark all read on server including uncached mail (retry if message operations are pending),main
+OpenBrowser,o,o,open explicitly selected or keyboard-focused visible link; mailto opens TideMail compose,main
+Unsubscribe,ctrl+u,ctrl+u,unsubscribe,content
+NextLink,"ctrl+n,alt+n",ctrl+n,next LINKS entry (scroll into view; ctrl+c copies full URL),content
+PrevLink,alt+p,alt+p,previous LINKS entry (scroll into view),content
+Search,/,/,search,main
+UnreadOnly,u,u,toggle unread only,main
+Compose,c,c,compose (one account starts in To; multiple accounts start in From),main
+Reply,r,r,reply,main
+ReplyAll,ctrl+r,ctrl+r,reply all,main
+Forward,f,f,forward,main
+NewFolder,n,n,new folder (top-level on flat accounts),sidebar
+RenameFolder,r,r,rename folder,sidebar
+DeleteFolder,d,d,delete folder,sidebar
+HideFolder,H,H,hide folder,sidebar
+MoveAccountUp,K,shift+k,"move account up (account manager); folder up the tree: reorder, into an open parent, or out of its parent (sidebar)",sidebar
+MoveAccountDown,J,shift+j,"move account down (account manager); folder down the tree: reorder, into an open parent, or out of its parent (sidebar)",sidebar
+IndentFolder,>,>,nest folder under the one above (hierarchical accounts),sidebar
+OutdentFolder,<,<,move folder out of its parent (hierarchical accounts),sidebar
+Archive,a,a,archive (unavailable in Drafts),main
+Move,m,m,move to folder/label (unavailable in Drafts),main
+Command,":,ctrl+p",":/ctrl+p",command palette,global
+AccountManager,M,M,accounts,global
+ThemePicker,T,T,theme picker,global
+Settings,S,S,settings,global
+SupportCopyLink,ctrl+c,ctrl+c,copy selected support link,settings support
+Outbox,O,O,outbox,global
+UpdateInstall,U,U,install update,main
+UpdateIgnore,i,i,ignore update,main
+Help,?,?,help,global
+Quit,q,q,quit,global
+Summary,`,`,AI summary,main
+VisualSelect,v,v,visual select,content
+VisualLine,V,V,select message,content
+CopyText,C,C,copy text,summary
+PasteText,ctrl+v,ctrl+v,paste text,compose
+SaveMD,M,M,save as .md,summary
+DiscardDraft,d,d,discard draft,compose
+ContentSearch,ctrl+f,ctrl+f,find in content,content
+ToggleQuote,z,z,toggle quoted text,content
+ToggleHeaders,ctrl+e,ctrl+e,toggle full headers,content
+OpenInBrowser,ctrl+b,ctrl+b,view message in browser,message list+content
+ViewSource,ctrl+o,ctrl+o,view message source (c copies),message list+content
+ToggleImages,i,i,load remote images (unsupported in foot/WezTerm),content
+SaveAttach,ctrl+d,ctrl+d,save attachments,content
+Add,a,a,add account,account_manager
+Edit,e,e,edit account,account_manager
+Delete,d,d,delete (messages: hidden at once, 6s undo window then server confirmation),account_manager+main
+SaveAccount,"ctrl+s,f2",ctrl+s,save account,account_manager
+TestAccount,"ctrl+t,f5",ctrl+t,test account,account_manager
+DiscoverServers,ctrl+l,ctrl+l,look up Custom account servers (DNS SRV, MX, HTTPS autoconfig),account_manager
+AttachFile,alt+f,alt+f,attach file,compose
+GrammarCheck,ctrl+g,ctrl+g,AI grammar check,compose
+SpellCheck,f7,f7,offline spell check (needs Settings → Editor → Spell check),compose
+PGPSign,"alt+s,f8",alt+s,sign with PGP (needs a PGP plugin),compose
+PGPEncrypt,"alt+e,f9",alt+e,encrypt with PGP (needs a PGP plugin),compose
+RemoveAttach,ctrl+r,ctrl+r,remove attachment,compose
+CycleSender,ctrl+u,ctrl+u,change sender,compose
+Confirm,enter,enter,confirm,overlay
+Cancel,esc,esc,cancel (during grammar check: stop check and keep editing),overlay
+Space," ",space,toggle select (unavailable in Drafts),main
+SelectAll,A,A,select all (unavailable in Drafts),main
+Yes,y,y,yes,overlay
+No,n,n,no,overlay
+Tab,tab,tab,next field,overlay
+Backspace,backspace,backspace,delete,overlay
+MailTagToggle,space,space,toggle the selected server tag without changing other assignments,classification Category
+MailTagRename,e,e,rename the selected tag locally,tag names and colors settings
+MailTagColor,c,c,open the selected tag color picker,tag names and colors settings
+MailTagThemeColor,r,r,reset the selected tag to the theme color,tag names and colors settings
+MailTagAccount,left/right,left/right,choose the account for tag mappings,tag names and colors settings
+ComposeFind,ctrl+f,ctrl+f,find in body,compose-body
+ComposeReplace,ctrl+r,ctrl+r,toggle replacement controls,compose-find
+ComposeFindNext,f3,f3,next match,compose-body
+ComposeFindPrevious,shift+f3,shift+f3,previous match,compose-body
+ComposeReplaceAll,alt+enter,alt+enter,replace every match while Replace is shown,compose-find
+ComposeFindCase,alt+c,alt+c,toggle match case,compose-find
+ComposeFindRegex,alt+r,alt+r,toggle regex when advanced regex search is enabled,compose-find
+ComposeFindControls,tab,tab,next search control,compose-find
+ComposeFindClose,esc,esc,close search without closing compose,compose-find
+MaximizeCompose,alt+m,alt+m,maximize/restore compose (session only),compose
+GrammarQuit,"ctrl+c,ctrl+q",ctrl+c/ctrl+q,cancel grammar check and follow normal quit flow,compose grammar check
+ReaderMouseCopy,ctrl+c,ctrl+c,copy reader mouse selection preserving displayed line breaks,content

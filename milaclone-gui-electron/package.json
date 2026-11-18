@@ -1,0 +1,12 @@
+{
+  "name": "milaclone-gui-electron",
+  "version": "1.0.0",
+  "description": "Milaclone desktop: Electron GUI over the milaclone SQLite format",
+  "main": "main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "test:db": "node test-db.js"
+  },
+  "license": "MIT"
+}

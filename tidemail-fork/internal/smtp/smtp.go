@@ -1,0 +1,561 @@
+package smtp
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"html"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
+	"net"
+	"net/mail"
+	"net/smtp"
+	"net/textproto"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/allisonhere/tidemail/internal/auth"
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/yuin/goldmark"
+)
+
+var (
+	smtpNewClient = smtp.NewClient
+	smtpDial      = (&net.Dialer{Timeout: 30 * time.Second}).DialContext
+	tlsDial       = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		return (&tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: 30 * time.Second},
+			Config:    cfg,
+		}).DialContext(ctx, network, addr)
+	}
+)
+
+type Attachment struct {
+	Name string
+	Data []byte
+}
+
+type OutgoingMessage struct {
+	From        string
+	To          []string
+	CC          []string
+	BCC         []string
+	Subject     string
+	Body        string
+	HTMLBody    string
+	InReplyTo   string
+	References  string
+	Attachments []Attachment
+	// Date and MessageID are stamped once, before the message is transmitted,
+	// so that a copy appended to the Sent folder is byte-identical to what was
+	// delivered. Generating them inside buildRaw would differ per call.
+	Date      time.Time
+	MessageID string
+	// Protected, when set, replaces the content: the message was already
+	// signed or encrypted before it was queued (see Protection). The plain
+	// Body, HTMLBody and Attachments are then empty, so an encrypted message's
+	// text is never stored with the outgoing mail.
+	Protected *Protection `json:"protected,omitempty"`
+}
+
+// EnsureIdentity stamps the Date and Message-ID if they are not set yet. Call
+// it before Send so BuildRaw reproduces exactly the transmitted bytes.
+func (m *OutgoingMessage) EnsureIdentity(from string) {
+	if m.Date.IsZero() {
+		m.Date = time.Now()
+	}
+	if m.MessageID == "" {
+		m.MessageID = newMessageID(from)
+	}
+}
+
+func (m OutgoingMessage) sentAt() time.Time {
+	if m.Date.IsZero() {
+		return time.Now()
+	}
+	return m.Date
+}
+
+func (m OutgoingMessage) messageID(from string) string {
+	if m.MessageID != "" {
+		return m.MessageID
+	}
+	return newMessageID(from)
+}
+
+// newMessageID builds an RFC 5322 msg-id using the sender's domain, falling
+// back to the local host when the address has none.
+func newMessageID(from string) string {
+	domain := "localhost"
+	if addr := cleanEmail(from); addr != "" {
+		if at := strings.LastIndex(addr, "@"); at >= 0 && at+1 < len(addr) {
+			domain = addr[at+1:]
+		}
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("<%d@%s>", time.Now().UnixNano(), domain)
+	}
+	return fmt.Sprintf("<%s@%s>", hex.EncodeToString(b[:]), domain)
+}
+
+// BuildRaw returns the exact RFC822 bytes Send transmits for msg, so a caller
+// can append an identical copy to the server's Sent folder. SMTP submission
+// leaves no copy behind.
+func BuildRaw(cfg config.AccountConfig, msg OutgoingMessage) []byte {
+	return buildRaw(senderAddress(cfg, msg), msg)
+}
+
+// AccountSender resolves an account's own sending identity, independent of
+// anything a message carries. Callers that must not honour a stale per-message
+// From — an Outbox retry, whose message was serialized before the account was
+// corrected — resolve through this instead.
+func AccountSender(cfg config.AccountConfig) string {
+	if cfg.From != "" {
+		return cfg.From
+	}
+	return cfg.User
+}
+
+// senderAddress resolves the From: header value the same way Send does. A
+// message that names its own From wins, so a caller can override per message.
+func senderAddress(cfg config.AccountConfig, msg OutgoingMessage) string {
+	if msg.From != "" {
+		return msg.From
+	}
+	return AccountSender(cfg)
+}
+
+func Send(ctx context.Context, cfg config.AccountConfig, msg OutgoingMessage) error {
+	from := senderAddress(cfg, msg)
+	// The envelope (MAIL FROM) must be a bare address — Gmail rejects "Name <addr>" —
+	// but the From: header should keep the display name, so clean only the envelope copy.
+	envelopeFrom := cleanEmail(from)
+
+	var allTo []string
+	allTo = append(allTo, msg.To...)
+	allTo = append(allTo, msg.CC...)
+	allTo = append(allTo, msg.BCC...)
+	if len(allTo) == 0 {
+		return fmt.Errorf("no recipients")
+	}
+	if envelopeFrom == "" {
+		return fmt.Errorf("no sender address: configure 'from' or check account user")
+	}
+
+	raw := buildRaw(from, msg)
+
+	addr := fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort)
+
+	if cfg.SMTPPort == 465 {
+		return sendTLS(ctx, addr, cfg, envelopeFrom, allTo, raw)
+	}
+	return sendSTARTTLS(ctx, addr, cfg, envelopeFrom, allTo, raw)
+}
+
+// xoauth2Auth implements the smtp.Auth interface for XOAUTH2.
+type xoauth2Auth struct {
+	user, token string
+}
+
+func (a *xoauth2Auth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !server.TLS {
+		return "", nil, fmt.Errorf("OAuth requires an encrypted SMTP connection")
+	}
+	// Return the RAW initial-response bytes. net/smtp's Client.Auth base64-encodes
+	// whatever Start returns before sending "AUTH XOAUTH2 <base64>"; encoding here
+	// too would double-encode and the server rejects it with "501 5.5.2 Cannot Decode".
+	resp := "user=" + a.user + "\x01auth=Bearer " + a.token + "\x01\x01"
+	return "XOAUTH2", []byte(resp), nil
+}
+
+func (a *xoauth2Auth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if more {
+		// On auth failure the server sends a challenge whose body is a JSON
+		// error description (already base64-decoded by net/smtp) — surface it.
+		return nil, fmt.Errorf("xoauth2 rejected: %s", fromServer)
+	}
+	return nil, nil
+}
+
+// smtpAuth returns the smtp.Auth for the given config: XOAUTH2 for Gmail /
+// Outlook accounts with a refresh token, otherwise app password over PLAIN
+// (Gmail requires an app password + 2FA).
+func smtpAuth(ctx context.Context, cfg config.AccountConfig, host string) (smtp.Auth, error) {
+	var tok string
+	var err error
+	switch {
+	case cfg.UsesGoogleOAuth2():
+		tok, err = auth.GoogleAccessToken(ctx, cfg.ClientID, cfg.ClientSecret, cfg.SessionKey(), cfg.RefreshToken)
+	case cfg.UsesMicrosoftOAuth2():
+		tok, err = auth.MSAccessToken(ctx, cfg.ClientID, cfg.SessionKey(), cfg.RefreshToken)
+	default:
+		return smtp.PlainAuth("", cfg.User, cfg.Password, host), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("oauth2: %w", err)
+	}
+	return &xoauth2Auth{user: cfg.User, token: tok}, nil
+}
+
+func sendSTARTTLS(ctx context.Context, addr string, cfg config.AccountConfig, from string, to []string, raw []byte) error {
+	if (cfg.UsesGoogleOAuth2() || cfg.UsesMicrosoftOAuth2()) && !cfg.SMTPTLS {
+		return fmt.Errorf("OAuth requires an encrypted SMTP connection; enable SMTP TLS (STARTTLS) or use port 465")
+	}
+	conn, err := smtpDial(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("dial smtp: %w", err)
+	}
+	// ctx only bounds the dial by default (net/smtp doesn't take a context for
+	// the session that follows); set the deadline on the raw socket too so a
+	// connection left stale by e.g. a laptop suspend/resume can't block Auth/
+	// Mail/Rcpt/Data forever instead of erroring out.
+	setupDeadline := time.Now().Add(30 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(setupDeadline) {
+		setupDeadline = dl
+	}
+	_ = conn.SetDeadline(setupDeadline)
+
+	host, _, _ := net.SplitHostPort(addr)
+	client, err := smtpNewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp client: %w", err)
+	}
+	defer client.Close()
+
+	if cfg.SMTPTLS {
+		tlsCfg := &tls.Config{ServerName: host}
+		if err := client.StartTLS(tlsCfg); err != nil {
+			return fmt.Errorf("starttls: %w", err)
+		}
+	}
+
+	auth, err := smtpAuth(ctx, cfg, host)
+	if err != nil {
+		return fmt.Errorf("smtp auth: %w", err)
+	}
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Minute)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("submission deadline: %w", err)
+	}
+	return sendMail(client, from, to, raw)
+}
+
+func sendTLS(ctx context.Context, addr string, cfg config.AccountConfig, from string, to []string, raw []byte) error {
+	host, _, _ := net.SplitHostPort(addr)
+	tlsCfg := &tls.Config{ServerName: host}
+
+	conn, err := tlsDial(ctx, "tcp", addr, tlsCfg)
+	if err != nil {
+		return fmt.Errorf("dial smtp tls: %w", err)
+	}
+	// See the matching comment in sendSTARTTLS: bound the whole session, not
+	// just the dial, so a stale post-suspend socket errors out instead of
+	// hanging Auth/Mail/Rcpt/Data indefinitely.
+	setupDeadline := time.Now().Add(30 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(setupDeadline) {
+		setupDeadline = dl
+	}
+	_ = conn.SetDeadline(setupDeadline)
+
+	client, err := smtpNewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp client: %w", err)
+	}
+	defer client.Close()
+
+	auth, err := smtpAuth(ctx, cfg, host)
+	if err != nil {
+		return fmt.Errorf("smtp auth: %w", err)
+	}
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Minute)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("submission deadline: %w", err)
+	}
+	return sendMail(client, from, to, raw)
+}
+
+func sendMail(client *smtp.Client, from string, to []string, raw []byte) error {
+	if err := client.Mail(from); err != nil {
+		return fmt.Errorf("MAIL FROM: %w", err)
+	}
+	for _, addr := range to {
+		if err := client.Rcpt(addr); err != nil {
+			return fmt.Errorf("RCPT TO %s: %w", addr, err)
+		}
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("DATA: %w", err)
+	}
+	if _, err := w.Write(raw); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	err = w.Close()
+	if err != nil {
+		var response *textproto.Error
+		if !errors.As(err, &response) {
+			return fmt.Errorf("%w: %v", ErrDeliveryUncertain, err)
+		}
+	}
+	return err
+}
+
+// crlf converts bare LF line endings to CRLF. Bodies arrive with LF (a terminal or Android
+// editor), but net/smtp rewrites them to CRLF on the wire; doing it here keeps the bytes returned
+// by BuildRaw identical to what is transmitted, so a copy filed under Sent matches the sent mail.
+func crlf(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\r\n")
+}
+
+// encodeAddressHeader RFC 2047-encodes the display name of a "Name <addr>"
+// value when it is not ASCII. Anything else, or a value net/mail can't parse,
+// passes through unchanged.
+func encodeAddressHeader(value string) string {
+	for _, r := range value {
+		if r >= utf8.RuneSelf {
+			if a, err := mail.ParseAddress(value); err == nil {
+				return a.String()
+			}
+			break
+		}
+	}
+	return value
+}
+
+func buildRaw(from string, msg OutgoingMessage) []byte {
+	var hdr strings.Builder
+	// Header values must be ASCII: a non-ASCII subject or display name goes out
+	// as an RFC 2047 encoded-word, or strict servers reject it and clients show
+	// it garbled. ASCII text passes through unchanged.
+	hdr.WriteString("From: " + encodeAddressHeader(from) + "\r\n")
+	hdr.WriteString("To: " + strings.Join(msg.To, ", ") + "\r\n")
+	if len(msg.CC) > 0 {
+		hdr.WriteString("Cc: " + strings.Join(msg.CC, ", ") + "\r\n")
+	}
+	hdr.WriteString("Subject: " + mime.QEncoding.Encode("utf-8", msg.Subject) + "\r\n")
+	// RFC 5322 requires Date and an originator. A submission server stamps
+	// these when they are missing, but a copy we APPEND to Sent is our own
+	// bytes — without them it would have no date, and nothing for threading or
+	// duplicate detection to key on.
+	hdr.WriteString("Date: " + msg.sentAt().Format(time.RFC1123Z) + "\r\n")
+	hdr.WriteString("Message-ID: " + msg.messageID(from) + "\r\n")
+	if msg.InReplyTo != "" {
+		hdr.WriteString("In-Reply-To: " + msg.InReplyTo + "\r\n")
+	}
+	if msg.References != "" {
+		hdr.WriteString("References: " + msg.References + "\r\n")
+	}
+	hdr.WriteString("MIME-Version: 1.0\r\n")
+	if msg.Protected != nil {
+		return append([]byte(hdr.String()), msg.Protected.assemble()...)
+	}
+	return append([]byte(hdr.String()), buildEntity(msg, false)...)
+}
+
+// BuildEntity returns the message's content as a MIME entity (its Content-*
+// headers and body, CRLF line endings) without the envelope headers. It is
+// what gets signed or encrypted. With mailSafe the text parts are
+// quoted-printable, so no mail server can re-encode them in transit and break
+// a signature that covers them.
+func BuildEntity(msg OutgoingMessage, mailSafe bool) []byte { return buildEntity(msg, mailSafe) }
+
+func buildEntity(msg OutgoingMessage, mailSafe bool) []byte {
+	msg.Body = crlf(msg.Body)
+	msg.HTMLBody = crlf(msg.HTMLBody)
+	var hdr strings.Builder
+
+	if len(msg.Attachments) == 0 {
+		if msg.HTMLBody == "" {
+			hdr.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+			body := msg.Body
+			if mailSafe {
+				hdr.WriteString("Content-Transfer-Encoding: quoted-printable\r\n")
+				body = quotedPrintable(body)
+			}
+			hdr.WriteString("\r\n")
+			hdr.WriteString(body)
+			// net/smtp ends the DATA stream with CRLF when the body does not; end it here so
+			// the bytes match what is transmitted. (Multipart output already ends in CRLF.)
+			if !strings.HasSuffix(body, "\r\n") {
+				hdr.WriteString("\r\n")
+			}
+			return []byte(hdr.String())
+		}
+		// multipart/alternative: plain text + HTML
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.SetBoundary(fmt.Sprintf("tm-%x", sha256.Sum256([]byte(msg.MessageID+"outer"))))
+		hdr.WriteString("Content-Type: multipart/alternative; boundary=\"" + mw.Boundary() + "\"\r\n")
+		hdr.WriteString("\r\n")
+		buf.WriteString(hdr.String())
+		addTextPart(mw, msg.Body, mailSafe)
+		addHTMLPart(mw, msg.HTMLBody, mailSafe)
+		mw.Close()
+		return buf.Bytes()
+	}
+
+	// Attachments present
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.SetBoundary(fmt.Sprintf("tm-%x", sha256.Sum256([]byte(msg.MessageID+"outer"))))
+	hdr.WriteString("Content-Type: multipart/mixed; boundary=\"" + mw.Boundary() + "\"\r\n")
+	hdr.WriteString("\r\n")
+	buf.WriteString(hdr.String())
+
+	if msg.HTMLBody != "" {
+		// Wrap text+html in multipart/alternative inside multipart/mixed
+		altWriter := multipart.NewWriter(&buf)
+		_ = altWriter.SetBoundary(fmt.Sprintf("tm-%x", sha256.Sum256([]byte(msg.MessageID+"inner"))))
+		altHdr := textproto.MIMEHeader{"Content-Type": {"multipart/alternative; boundary=\"" + altWriter.Boundary() + "\""}}
+		altPart, _ := mw.CreatePart(altHdr)
+		boundary := altWriter.Boundary()
+		altWriter = multipart.NewWriter(altPart)
+		_ = altWriter.SetBoundary(boundary)
+		addTextPart(altWriter, msg.Body, mailSafe)
+		addHTMLPart(altWriter, msg.HTMLBody, mailSafe)
+		altWriter.Close()
+	} else {
+		addTextPart(mw, msg.Body, mailSafe)
+	}
+
+	// Attachment parts
+	for _, att := range msg.Attachments {
+		attHdr := textproto.MIMEHeader{
+			"Content-Type":              {"application/octet-stream"},
+			"Content-Disposition":       {mime.FormatMediaType("attachment", map[string]string{"filename": att.Name})},
+			"Content-Transfer-Encoding": {"base64"},
+		}
+		w, _ := mw.CreatePart(attHdr)
+		encoded := base64.StdEncoding.EncodeToString(att.Data)
+		for i := 0; i < len(encoded); i += 76 {
+			end := i + 76
+			if end > len(encoded) {
+				end = len(encoded)
+			}
+			_, _ = w.Write([]byte(encoded[i:end] + "\r\n"))
+		}
+	}
+
+	mw.Close()
+	return buf.Bytes()
+}
+
+func addTextPart(mw *multipart.Writer, body string, mailSafe bool) {
+	addTextual(mw, "text/plain; charset=utf-8", body, mailSafe)
+}
+
+func addHTMLPart(mw *multipart.Writer, html string, mailSafe bool) {
+	addTextual(mw, "text/html; charset=utf-8", html, mailSafe)
+}
+
+func addTextual(mw *multipart.Writer, contentType, body string, mailSafe bool) {
+	hdr := textproto.MIMEHeader{"Content-Type": {contentType}}
+	if mailSafe {
+		hdr.Set("Content-Transfer-Encoding", "quoted-printable")
+		body = quotedPrintable(body)
+	}
+	w, _ := mw.CreatePart(hdr)
+	_, _ = w.Write([]byte(body))
+}
+
+// quotedPrintable encodes text that already has CRLF line endings.
+func quotedPrintable(s string) string {
+	var buf bytes.Buffer
+	w := quotedprintable.NewWriter(&buf)
+	_, _ = w.Write([]byte(s))
+	_ = w.Close()
+	return buf.String()
+}
+
+// MarkdownToHTML converts Markdown text to HTML using goldmark.
+func MarkdownToHTML(md string) string {
+	var buf bytes.Buffer
+	if err := goldmark.Convert([]byte(md), &buf); err != nil {
+		return ""
+	}
+	return buf.String()
+}
+
+// SignatureHTML renders a signature block for the HTML part of a message.
+//
+// It deliberately does not go through MarkdownToHTML. Markdown folds
+// consecutive lines into one paragraph, so a three-line signature arrived as a
+// single run-on line in every client that prefers the HTML part — even though
+// the plain-text part was correct. A signature is not prose to be reflowed; the
+// lines are the point.
+func SignatureHTML(sig string) string {
+	sig = strings.TrimSpace(sig)
+	if sig == "" {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(sig, "\r\n", "\n"), "\n")
+	for i, line := range lines {
+		lines[i] = html.EscapeString(line)
+	}
+	// A div rather than a paragraph: <p> carries a margin above as well as
+	// below, which opened a gap visibly wider than the single blank line the
+	// text part has. The preceding paragraph's own bottom margin is the
+	// separation, and this block adds nothing on top of it.
+	//
+	// "-- " on its own line is the standard delimiter; clients use it to fold or
+	// strip the signature, and the trailing space is part of the convention.
+	return "<div>-- <br>\n" + strings.Join(lines, "<br>\n") + "</div>\n"
+}
+
+// cleanEmail extracts a bare email address from formats like "user@host" or "Name <user@host>".
+func cleanEmail(s string) string {
+	s = strings.TrimSpace(s)
+	// "Name <addr>" format
+	if idx := strings.LastIndex(s, "<"); idx >= 0 {
+		if end := strings.Index(s[idx:], ">"); end >= 0 {
+			return strings.TrimSpace(s[idx+1 : idx+end])
+		}
+	}
+	// Otherwise accept a bare token: no whitespace and no stray angle brackets.
+	// No "@" requirement, so a non-email login like "alice" still works (the server
+	// validates the address); a leftover "<"/">" from malformed input is rejected.
+	if s != "" && !strings.ContainsAny(s, " \t<>") {
+		return s
+	}
+	return ""
+}
+
+// ErrDeliveryUncertain means the connection failed while waiting for the final
+// acceptance response. Retrying automatically could deliver a duplicate.
+var ErrDeliveryUncertain = errors.New("delivery not confirmed; check Sent mail before retrying")
+
+func CanRetry(err error) bool {
+	if err == nil || errors.Is(err, ErrDeliveryUncertain) {
+		return false
+	}
+	var response *textproto.Error
+	if errors.As(err, &response) {
+		return response.Code >= 400 && response.Code < 500
+	}
+	return true
+}

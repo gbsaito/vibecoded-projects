@@ -1,0 +1,1537 @@
+# TideMail Setup and Usage Guide
+
+This guide covers installation, account setup, everyday mail tasks, settings,
+and keyboard shortcuts. For an overview of TideMail, see the
+[main README](../README.md).
+
+For shell scripts, Unix pipes, cached inbox reads, and AI agents, see the
+[CLI reference](cli.md). Running `tidemail` without arguments still opens the
+interactive client. Headless sends use the same accounts and durable outbox.
+Without delivery authorization, `tidemail send` creates a draft. Authorized
+queued mail needs the running client or periodic `tidemail outbox process`.
+
+Use `tidemail cli` for guided commands, or `tidemail send` in a terminal for the
+compose wizard. The wizard includes a file browser for attachments and a send
+countdown with undo. See [Interactive CLI](cli.md#interactive-command-menu-and-composer). Settings → CLI
+has switches for quitting after a send, skipping the review step, and the default signature.
+
+## Installation
+
+### Install a release
+
+On Linux or macOS (amd64 or arm64), run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/allisonhere/tidemail/main/install.sh | sh
+```
+
+The installer writes to `~/.local/bin` by default, so it should not ask for a
+system password. If an older `tidemail` earlier on `PATH` would still run first,
+the installer removes it when possible or prints the exact cleanup command. If
+you prefer another writable directory, set `INSTALL_DIR` before running it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/allisonhere/tidemail/main/install.sh | INSTALL_DIR="$HOME/bin" sh
+```
+
+You can also download a binary from the
+[latest release](https://github.com/allisonhere/tidemail/releases/latest).
+
+### Windows (experimental)
+
+Download `tidemail-windows-x86_64.zip` (or `tidemail-windows-aarch64.zip` on
+ARM) from the
+[latest release](https://github.com/allisonhere/tidemail/releases/latest),
+unzip it, and run `tidemail.exe` from Windows Terminal or PowerShell. In-app
+updates are not available on Windows, so download new releases by hand. There
+is no keychain support yet: passwords and tokens are stored in plain text in
+`%USERPROFILE%\.config\tidemail\config.toml`.
+
+### App launcher entry (optional)
+
+The Arch Linux package (`tidemail-bin`) and the install script on Linux both
+add a desktop entry and the TideMail icon, so TideMail appears in your app
+launcher (including Omarchy's). The script writes them to
+`~/.local/share/applications` and `~/.local/share/icons`. With a source build,
+you can add them yourself from a checkout of the repository:
+
+```bash
+install -Dm644 images/tidemail-icon.png ~/.local/share/icons/tidemail.png
+install -Dm644 packaging/linux/tidemail.desktop ~/.local/share/applications/tidemail.desktop
+```
+
+The entry runs `tidemail` in your default terminal, so `tidemail` must be on
+your `PATH`.
+
+If your launcher or installer asks for an icon URL instead (Omarchy's TUI
+installer does), use the 1024×1024 PNG with a transparent background:
+`https://raw.githubusercontent.com/allisonhere/tidemail/main/images/tidemail-icon.png`
+
+### Man page
+
+`man tidemail` shows the command-line reference. The installer puts the page in
+`~/.local/share/man/man1`; the Arch package installs it system-wide. Anywhere
+else, `tidemail man | man -l -` prints the page that matches the version you
+are running.
+
+### Build from source
+
+```bash
+git clone https://github.com/allisonhere/tidemail
+cd tidemail
+go build -o tidemail .
+./tidemail
+```
+
+## First run
+
+Start TideMail with:
+
+```bash
+tidemail
+```
+
+Press `M` to open the account manager, then add your IMAP and SMTP details.
+Gmail, Outlook, Yahoo, and iCloud have their servers built in. For a **Custom**
+account, TideMail can look the servers up from your email address: type the
+address in the **Email / login** row at the top of the form and move on, and
+if both host rows are still empty it looks the domain up. Press `Ctrl+L` to
+look up again at any time; that replaces whatever the host rows hold. TideMail
+tries, in order:
+
+- **SRV records** (RFC 6186): `_imaps._tcp` for IMAP over TLS, then
+  `_submissions._tcp` (port 465) or `_submission._tcp` for sending. A plain
+  `_imap._tcp` record is ignored, because TideMail doesn't do IMAP STARTTLS and
+  using it would send your password unencrypted.
+- **MX records**: a domain whose mail is handled by Google (Workspace),
+  Microsoft 365, iCloud or Yahoo switches the form to that provider, so its
+  sign-in options apply.
+- **Autoconfig file**: the Mozilla autoconfig file your own mail domain
+  publishes, which cPanel and many other hosting panels serve automatically.
+  TideMail asks only your domain, over HTTPS only:
+  `https://autoconfig.<domain>/mail/config-v1.1.xml`, then
+  `https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml`, passing your
+  address so the host can fill in your login. It never asks Thunderbird's
+  shared provider database. It uses only servers TideMail can reach securely
+  (IMAP over TLS, sending over TLS or STARTTLS) with a password. If the file
+  says your login is not your full address, the login row takes that login and
+  your address moves to **From address**.
+
+The lookup runs in the background and only fills in the form: nothing
+connects or saves until you press `Ctrl+T` or `Ctrl+S`. DNS answers aren't
+authenticated (and the autoconfig file is found through DNS), so check the
+servers it found before you save. If nothing is
+published, the status line says so and you enter the details yourself. If your
+provider requires an app password, create one before saving the account.
+
+Changing or clearing the email removes settings still filled by its previous
+lookup, including an MX-selected provider. Server values you edited yourself
+stay; use `Ctrl+L` to replace them for the new address.
+
+The status line sits one blank row below the form and keeps its place when
+there is no message, so updates do not shift the fields.
+
+`Ctrl+S` and `Ctrl+T` check the form before anything connects, so a typo comes
+back as a labeled field rather than a login failure. A rejected row turns red
+and takes the cursor, with the reason on the status line; editing it clears the
+mark. Both hosts are required and are hostnames, not URLs, paths, or
+`host:port` pairs — the port belongs in its own field, where it must be a
+number between 1 and 65535. Leave a port blank to take the standard one. On
+the Gmail, Outlook, Yahoo, and iCloud
+providers the **Email** row must be a full address; a **Custom** account's
+**Email / login** is whatever your host issues, which need not be an address at all
+— cPanel's `alice+example.com`, an Exchange `DOMAIN\alice`, a bare ISP login.
+When it is not an address, the **From address** row becomes required: there is
+no address to send as otherwise, and the form says so rather than leaving the
+first send to be refused by the server.
+
+Any field holding an address rejects `#` typed where `@` belongs —
+`info#example.com`. On a Nordic layout `@` is AltGr+2 and `#` is Shift+3, and
+nothing downstream can recover from the slip: `#` is legal inside an address,
+so the value stays a perfectly good string that no server can route. An address
+that really contains one, like `info#sales@example.com`, is untouched.
+
+After you add an account, press `s` to sync the selected mailbox. Press `s` on
+the Unified Inbox to sync every account's inbox, or `F` to sync all mailboxes.
+With more than 10 folders, `F` first asks for confirmation, since syncing them
+all can take a while.
+When you stop on a non-inbox folder, TideMail silently refreshes it if its cache
+is more than 15 minutes old. Scrolling past folders does not queue refreshes;
+press `Enter` on a folder row when you want to fetch it immediately. Manual-only
+accounts fetch no mail on their own, not even at launch: they refresh only when you explicitly use `Enter`, `s`, or `F`. (TideMail still lists their folders once at launch so the folder tree stays current.)
+`sync_minutes` controls how an account refreshes on its own:
+
+| Value | Meaning |
+| --- | --- |
+| `0` | Push — IMAP IDLE delivers mail as it arrives, plus a 30-minute safety poll |
+| `N` | Poll every N minutes, with IDLE accelerating it |
+| `-1` | Manual only — no polling and no background connection |
+
+Push (`0`) is the default and the best choice for servers that support IDLE,
+including Gmail. The safety poll exists because IDLE goes silent on a connection
+that wedges without dropping, so push alone can stall with nothing to show for
+it. Use `-1` if you want an account to refresh only when you press `s`.
+
+## Reading and organizing mail
+
+Use the three panes to choose an account or folder, select a message, and read
+its contents. Press `Tab` or `Shift+Tab` to move between panes.
+
+In the message list, press `Space` to select several messages. You can then
+archive them with `a`, delete them with `d`, move them with `m`, or mark them as
+read. Press `A` to select every message in the current view.
+In the sidebar, `R` or `Ctrl+X` marks all messages in the selected mailbox or
+account read on the server, including messages not yet cached. Local state and
+unread badges update after confirmation. Failed mailboxes retain their local state.
+
+Press `/` to search, `u` to show unread mail, and `t` to place starred messages
+first. Search covers subject, sender, recipients, and message body across every
+account and folder, and matches as you type.
+
+Type `#` and a tag name to search by the tags shown on message rows:
+`#github`, `#billing`, or any other category, and `#reply`, `#urgent`, or
+`#important`. Tags match as you type (`#git` already finds `#github`), several
+tags must all match, and they combine with words: `invoice #billing` finds
+billing mail mentioning an invoice. Mail tags also match their IMAP keyword or
+local name: `#$label4` or `#"To Do"`. Quote names containing spaces or punctuation.
+Your corrections count, so a recategorized message is found under its new tag.
+In the content pane, `Ctrl+E` shows the full headers and authentication results. `Ctrl+O` shows the message's
+complete source exactly as the server stores it, fetched fresh and without
+marking the message read; press `c` there to copy all of it to the clipboard.
+It also works from the message list and the command palette ("View message
+source"). `Ctrl+U` opens the mailing list's
+unsubscribe option when the message provides one.
+
+### Expandable conversations
+
+Press `g` to toggle conversation grouping (also in Settings → Display).
+Conversations start collapsed with `▸`; `Enter` on their parent expands or
+collapses them with `▾`, keeping focus in the message list. The chevron uses the
+existing spacer immediately before the sender; the read/unread indicator and
+sender/subject columns stay fixed. Several conversations can stay open. Children
+have muted `├─` / `└─` connectors at the parent's sender and subject column starts,
+indenting only the child text. With the sender hidden, the chevron precedes the
+subject and only the subject has tree connectors. Selection highlights the entire
+row, including connectors and spacing. There are no message counts or duplicate
+rows: the parent is a real email.
+
+Moving through visible rows previews only that email. `Enter` on a child or
+single message opens the reader; `Right` / `l` or `Tab` opens it for any row,
+including a parent. Reader `Enter` still opens the selected or focused link;
+`Esc` clears text selection first, then returns to the list. Double-click has
+the same behavior as `Enter` on each row.
+
+Parents follow the active message ordering: with Unread First, unread messages
+precede read messages, newest first within each group. A message marked read
+when you open it keeps its place until you leave the reader (see Pending
+read/unread changes). Starred First retains
+its priority; Needs You, Waiting on Them, and Snoozed retain their view ordering.
+Selection follows the email's database identity across sorting and refreshes.
+If a selected parent becomes a child, its conversation opens to keep it visible.
+Expansion lasts through refreshes in the same view; changing folders, searches,
+or disabling grouping resets it.
+
+Delete, archive, move, star, tags, and `Space` selection affect only the selected
+email, including a parent. Removing a parent promotes the next-ranked surviving
+email. Explicit multi-selection still acts on the selected emails.
+When collapsed, a conversation shows unread if any member is unread. Pressing
+`x` marks every member read if any is unread; if all are read, it marks every
+member unread. The conversation stays collapsed. When expanded, both parent and
+child rows show their individual read state, and `x` toggles only that email.
+Single-message rows keep their normal individual behavior.
+
+Marking an unread email read with `x` immediately advances to the next visible
+email in its conversation, or the following list row when no conversation member
+follows. Marking a collapsed conversation read advances to the next visible
+conversation. At the end of the list, selection stays in place. The next target
+is chosen before read-state sorting changes, and confirmation or reloads do not
+undo the move. Marking read mail unread does not advance. Without advancement,
+a collapsed read action follows its conversation's new parent while keeping it
+closed; expanded selection follows the exact email ID. With explicit selection,
+`x` toggles each selected email individually without advancing.
+
+Expansion currently shows messages already included in the folder or search
+results, not additional Sent or archived history. In Unread Only mode, read
+messages remain hidden even when a conversation is expanded. A conversation
+with only one visible unread email has no chevron.
+
+### Thunderbird / IMAP mail tags
+
+TideMail recognizes message tags stored as IMAP keywords, including Thunderbird's
+five default tags: Important, Work, Personal, To Do, and Later. Custom keywords
+initially appear under their identifiers. Thunderbird keeps tag names and colors
+in its own settings, so TideMail cannot obtain custom names or colors from IMAP.
+Keywords that servers and clients set to describe a message (`$Junk`, `$Forwarded`,
+`$HasAttachment`, `$HasNoAttachment`, and similar) are status flags, not tags, and are
+never shown. Tags appear below the date and sender in the message pane as well as on message
+rows. Under **Settings → Display → Message tags**, turn off **Show tags in
+message header** to hide only that content-pane row.
+
+With a message highlighted or open, press `e` to correct its classification.
+Use `↑`/`↓` to choose **Category** and `←`/`→` to select a choice. Important, Work,
+Personal, To Do, and Later appear alongside the existing categories, with one
+Personal choice. `Enter` saves the compatible tag to the server first, then saves
+the local category correction. Other categories remain local.
+
+`[x]` marks tags already saved on the server. `Space` explicitly adds or removes
+the selected compatible tag. Existing custom tags also appear in the Category
+choices; `Enter` adds one without changing the local category, and `Space`
+toggles it. A new category never removes other tags. **No category**, **Use plugin
+decision**, and `r` reset local corrections only; use `Space` to remove a server
+tag. Removing a tag does not change a local classification correction.
+
+A collapsed conversation edits only its representative message. Server changes
+require a connection and support for the keyword. A failed server write does not
+save a new local category correction. Cached tags remain visible offline, and
+Thunderbird changes appear after a normal or manual sync. `+N` on a message row
+indicates tags that do not fit. Open `e` to browse their names.
+
+Under **Settings → Display → Tag names and colors**, use `←`/`→` to choose an
+account, `↑`/`↓` to choose a discovered tag, `e` to rename its local label, `c` to
+choose its color, or `r` to use the theme color. These changes affect only
+TideMail, not Thunderbird's settings or server assignments. There is no keyword
+entry form.
+
+**Settings → Display → Tag style → Tag icons** shows colored tag-shaped glyphs
+in message rows. This requires a Nerd Font with the Font Awesome tag glyph
+`U+F02B` (``); disabling icons uses `#`. Settings previews the style, and the
+editor keeps readable names. Existing style preferences stay unchanged until
+you choose another style. This option changes appearance only.
+
+AI/JEV behavior is unchanged and does not assign IMAP tags automatically.
+Automatic Thunderbird profile import, offline queued edits, and bulk tagging are
+not supported.
+
+With **Focus line** on, Up/Down moves the reading highlight. With it off,
+Up/Down scrolls one row. At the bottom, another Down selects the first LINKS
+entry. Arrows then move between entries without wrapping; Up from the first
+clears selection, and the next Up resumes scrolling. Selected LINKS entries
+keep their highlight and chevron in both modes.
+
+`o` or `Enter` opens a selected LINKS entry or a visible link deliberately focused
+with the keyboard. New messages start with no link selected. Clicking a LINKS
+entry selects it without opening it; ordinary body clicks and scrolling never
+open links. `Ctrl+B` views the whole message in your browser. These actions use
+**Browser command** from Settings → Display when one is set.
+
+View in Browser (`Ctrl+B`) works from the message list or reading pane. It fetches
+the original message without marking it read and opens its HTML as a private local
+`.html` file in your browser: the **Browser command** from Settings → Display when
+one is set, otherwise the system default (`xdg-open` on Linux). Messages without
+HTML show a status message. Links are preserved. Remote content is blocked so
+opening a message does not load tracking pixels: remote images, scripts, frames,
+stylesheets, and web fonts are left out, and the status line reports how many
+remote images were dropped. Press `Ctrl+B` again right away to reopen the message
+with remote images loaded; this tells the sender the message was opened, so it only
+happens when you ask. Embedded CID images are not exported. Exports are
+written to a private per-user folder in the system temporary directory and
+deleted automatically after an hour (older ones are also pruned when TideMail
+starts).
+
+When **Actionable links** is enabled in Display settings, the **LINKS** section
+near the end of the message uses links from the displayed representation: HTML
+links for HTML messages, or plain-text URLs when the reader displays plain text.
+It does not combine links from both MIME alternatives. Entries show anchor text
+or `[image: ALT TEXT]`, falling back to the URL when no description is available.
+HTML entries come from anchor destinations and visible body URLs, not metadata,
+image resources, scripts, or comments. A link that only wraps a hidden or 1x1
+tracking pixel is left out. Available Outlook fallback anchor text
+and button-input captions are also used when no ordinary anchor label is
+available. Email actions appear as `[mailto: Approve]` or, without a description,
+`[mailto: email action]`. Deliberately opening one starts TideMail's composer
+using the account that received the source message, including in Unified Inbox.
+If that account is unavailable, TideMail uses your default sender; if no usable
+sender is available, it reports an error. The link can prefill To, CC, BCC,
+subject, and body. All fields remain editable, and the account's normal signature
+is inserted at the `⁂` marker when you send, just as for a new message. Nothing is
+sent until you explicitly send it. `Ctrl+N` / `Alt+N` and `Alt+P`
+select the next or previous entry and scroll it into view; the chevron, highlight,
+and status counter follow together. New messages start unselected: the first Next
+selects the first entry, and the first Previous selects the last. Press `o` or
+`Enter` to open the selected entry. Switching messages or threads clears selection.
+`Ctrl+C` on a LINKS row without a visual selection copies its full destination, even when
+the label is shortened or the URL is too long for a terminal hyperlink. Explicit
+text selections still copy the displayed text. Because the label is chosen by the
+sender, each entry also shows its real destination host in parentheses, and a label
+that names a different site than the link goes to (for example "paypal.com" over a
+link to another domain) is marked with `!`.
+
+### Managing folders
+
+Gmail's standard folders appear in the System section: Sent Mail, Drafts, All
+Mail, Trash, Spam, Starred, and Important. Inbox appears first under the account.
+An unselectable server container does not hide its selectable subfolders.
+
+Folders are your mail server's real folders, shown as a tree: a folder such as
+`Work/Projects` sits under `Work`, and a folder with subfolders has a `▾`/`▸`
+marker. If a server reports no hierarchy delimiter, its folders stay flat:
+punctuation in names is literal, `n` creates at the account root, and nesting
+or moving folders into/out of parents is unavailable. Reordering, renaming,
+deleting, and moving messages still work. In the left pane:
+
+- `Enter` or `Space` on a folder with subfolders collapses or expands it (the
+  state is remembered). `←` collapses an open folder, or moves to its parent
+  folder; `→` expands a collapsed one. A collapsed folder's unread count includes
+  everything inside it. To fetch a folder that has subfolders, use `s`.
+- `n` creates a folder: on a folder it makes a subfolder, on an account or
+  section header a top-level folder. Type the name in the prompt row and press
+  `Enter` (or `Esc` to cancel).
+- `r` renames the selected folder; its subfolders come along.
+- `d` deletes the selected folder from the server after asking. The prompt says
+  how many subfolders go with it and that every message in them is deleted, and
+  `y` or `Enter` confirms. The Inbox and system folders (Sent, Drafts, Trash,
+  Junk, Archive, and Gmail's `[Gmail]` folders) can't be renamed or deleted.
+- `H` hides the selected folder (and its subfolders) from TideMail's sidebar
+  only; nothing changes on the server. "Show hidden folders" in the command
+  palette lists them again, marked `(hidden)`, and `H` on one unhides it.
+- `Shift+K` / `Shift+J` walk the selected folder up or down the tree one row at a
+  time, and it is shown indented while it is inside a parent. Passing a sibling
+  just reorders it (the order is local to TideMail). Moving onto an open folder
+  that has subfolders puts it inside, as the first child going down or the last
+  going up; moving past a parent's last or first subfolder takes it out, to just
+  after or before that parent. Collapsed folders are stepped over, never entered.
+  Moving in or out is a real move on the server, subfolders included, and is
+  refused if the destination already has a folder of the same name. The Inbox
+  and system folders can be reordered but never moved in or out.
+- `>` nests the selected folder under the folder just above it, as its last
+  child, even if that folder has no subfolders yet (Shift+J/K can only move into
+  a folder that already has some). `<` moves it out of its parent to just after
+  it. Both are real moves on the server, subfolders included. While a create,
+  rename, move or delete is still running on the server, further ones are
+  refused with a short notice, so a quick second keypress can't act on a name
+  that is changing.
+  A rename or move is also refused up front if any subfolder would land on an
+  existing folder, and deleting a folder is refused if a system folder (such as
+  a `\Sent` subfolder) is inside it.
+
+The command palette has matching entries: New folder, Rename selected folder,
+Delete selected folder, Hide or unhide selected folder, and Show hidden folders.
+Creating a folder is also possible from the move picker with `n`.
+
+### Needs You
+
+**Needs You**, just below Unified Inbox in the sidebar, gathers the inbox
+messages across every account that need you: ones tagged as needing a reply,
+urgent, or important. Its number is how many there are, read or not. Reading a
+message does not remove it; Needs You is about what still needs doing, not what
+is unread (`u` still narrows the list to unread mail).
+
+The tags come from annotations stored by plugins (for example TideMail Smart (JEV)),
+from any plugin, installed or since removed. Without such a plugin Needs You
+stays empty ("Nothing needs your attention."). Opening it only reads what is
+already stored: it never runs a plugin or goes online.
+
+The most pressing messages come first: urgent, then needing a reply, then
+important (a message with several of these ranks higher), newest first within
+each. With threaded conversations, qualifying messages are grouped and the
+parent's tags combine those messages' signals. Children show their own tags.
+
+If a message doesn't belong there, press `X` (or choose **Dismiss from Needs
+You** in the palette). The message and its tags are untouched; TideMail just
+remembers not to show it here, even if a plugin later tags it again. `Ctrl+Z`
+while still in Needs You brings back the latest dismissal, and **Restore to
+Needs You** in the palette does the same for a dismissed message opened from
+its normal folder. **Why is this in Needs You?** lists the reasons and the
+annotations behind them. All the usual actions (reply, archive, delete, move,
+star, mark read) work on messages here. The sidebar count updates immediately
+when you archive or move messages, including during the six-second undo
+window. Delete works the same way: the message and its count leave the list at once and
+stay hidden through folder switches, searches and reloads while the undo window runs and
+while the server works, so it cannot flicker back. Only the status-bar pill shows the
+countdown. The cursor stays on its message, or moves to the next one if the focused message
+was removed; `Ctrl+Z` during the countdown restores the message in place. If the server
+refuses, the message returns with an error, and the cursor goes back to it if you
+haven't moved since, so pressing `d` again retries the same message. On Gmail, where
+one message appears under several folders, the delete also hides and then removes its
+copies in All Mail, Sent Mail and labels, so it doesn't reappear when you open another
+folder. If the server never answers, it is restored
+after 90 seconds with a "timed out" error; the next sync shows its real state.
+Pending read/unread and destructive actions block conflicting operations on the
+affected messages; other messages remain interactive. Mailbox/account mark-all-read
+is blocked if a target mailbox has a pending read or destructive operation; retry
+after it finishes. While mark-all-read runs, its target mailboxes are reserved.
+If a server-confirmed delete cannot be removed from the local cache, TideMail
+reports the cache error and keeps it hidden for this session. Later list reloads
+retry local cleanup without repeating the IMAP deletion.
+While a delete, archive, or move waits out its undo window, the status bar shows one pill,
+for example `delete pending · ctrl+z undo`. It is yellow (`#FCD05F` with `#AA7B18` text) and
+drains like a fuel gauge: the drained part swaps the two yellows, so the bright part shrinks
+as the six seconds run out. Plain themes use brackets and show the whole seconds left
+instead. Once the undo window has passed, the pill refills to bright yellow and reads
+`deleting`, `archiving` or `moving to …` with a spinner while the server confirms. When it
+does, the pill fades over 0.4 seconds into the green confirmation (`#70C68E` with `#1A5E33`
+text), or into a red error pill (`#DD6A6A` with `#8C1A22` text) if the action failed. Other
+errors in the status bar show as the same red pill, and every other status message
+(synced, marked read, starred and so on) shows as the same green pill. Plain themes wrap them in
+brackets instead.
+
+Each delete, archive or move also writes two lines to the Logs pane: one when it is sent to the
+server and one when it finishes, with how long the server work took and how long the app took to
+see the result. If a pill ever seems stuck, those two times show which side was slow.
+
+### Waiting on Them
+
+**Waiting on Them**, below Needs You, lists conversations where you sent the
+latest message and are waiting for someone else to answer, across every
+account. It is worked out from the conversation itself, not from plugins:
+nothing is classified and nothing goes online.
+
+- A conversation appears when its newest real message is from you (from any of
+  your configured accounts' addresses; display names don't count) and went to
+  at least one other person. First messages count; a reply beforehand is not
+  needed.
+- It leaves as soon as someone else's reply arrives, and returns when you
+  answer again.
+- On a new install, only mail you send after TideMail was first set up can
+  start a wait, so the first sync of years of Sent mail doesn't fill the view
+  with old, already-handled conversations. Existing installs keep their
+  current waits.
+- Mail in Inbox, Sent, Archive, and other folders counts, so archiving a
+  conversation doesn't hide it. Trash, Spam, and Drafts are ignored.
+- Mail between your own addresses, and mail only to robots or lists
+  (`noreply@`, `notifications@`, `mailer-daemon@`, obvious mailing lists), is
+  left out. Bounces and drafts don't change a conversation's state.
+- Mail you send from TideMail appears once TideMail has fetched your Sent
+  folder, which it does right after sending. Mail sent from your phone or
+  webmail appears after your next sync of Sent (`s` in Waiting on Them syncs
+  inboxes and Sent folders).
+- The longest wait comes first. The sender column shows who you're waiting
+  for (`↗ Sarah +1`); the number beside the entry counts conversations.
+
+Press `X` (or **Stop waiting** in the palette) to stop tracking a
+conversation; `Ctrl+Z` right after, or **Resume waiting**, brings it back. This
+only affects the current wait: if they reply and you answer again, or you send
+another nudge, the conversation appears again. Stopping never changes your
+mail or any plugin annotations. **Why is this in Waiting on Them?** says when
+you sent the latest message and who you're waiting for.
+
+Waiting on Them and Needs You are independent. After you reply, an old plugin
+tag may still keep the message in Needs You until you dismiss it there.
+
+### Snooze
+
+Press `Z` (or **Snooze** in the palette) to hide something from Needs You or
+Waiting on Them until later. In Needs You it snoozes the message (or every
+selected message); in Waiting on Them it snoozes the conversation; elsewhere it
+snoozes messages so they stay out of Needs You. With several messages selected,
+the picker opens once and snoozes them all to the same time.
+
+| Choice | Wakes at |
+| --- | --- |
+| Later today | 7:00 PM today; after 5:00 PM, three hours after the next full hour |
+| Tomorrow morning | 8:00 AM tomorrow |
+| Tomorrow evening | 7:00 PM tomorrow |
+| This weekend | 9:00 AM Saturday (next Saturday once this Saturday's has passed) |
+| Next week | 9:00 AM next Monday |
+| Pick date/time | any future time, typed as `YYYY-MM-DD HH:MM` (past times are refused) |
+
+Times are your local time (daylight-saving changes keep 9:00 AM at 9:00 AM)
+and are stored as absolute times.
+
+Snooze is local to TideMail. It creates no folder on the server, doesn't move
+or archive anything, doesn't change read state, and leaves plugin tags alone:
+the mail stays in its normal folders. **Snoozed**, below Waiting on Them, lists
+what's snoozed, soonest to wake first, with the wake time in place of the date;
+`Z` there unsnoozes, and **Why is this snoozed?** shows until when.
+
+When a snooze ends, TideMail checks the item again: it comes back only if it
+still needs you or is still waiting, using whatever plugin tags it has by then.
+A dismissal or Stop waiting still applies after a snooze ends; snoozing never
+clears them. If someone replies to a snoozed waiting conversation, the snooze
+ends at once (the conversation isn't waiting any more, though the reply may
+show up in Needs You). If you write again, that's a new wait and it shows
+normally. Snoozes that came due while TideMail was closed end when it starts.
+There's no notification when a snooze ends; the item simply reappears.
+
+Receipt tables keep item descriptions, quantities, and prices together, even
+when the sender uses ordinary cells for headings or merges cells for totals.
+Amounts align on the right. When columns would be too cramped, each row becomes
+a labelled record; tables without headings use label/value pairs for two-column
+rows. This adapts automatically as you resize the reading pane. Complex tables
+with row-spanning cells retain the simpler text fallback.
+
+Newsletters keep each card together: an image stays next to its heading,
+description, and button, and a thin rule separates one card from the next.
+Cards that sit side by side in a browser stack in reading order, left to right
+and then top to bottom. Quoted and forwarded messages are not grouped.
+
+On a terminal with Kitty graphics support — Ghostty, Kitty, Rio —
+images embedded in the message (CID parts, inline data URIs, and
+content-location references) are drawn as real raster images inside the reading
+pane. They are scaled to the pane width and to the sender's width and height,
+never stretched or enlarged, and scroll, clip, and reflow with the surrounding
+text. Changing the terminal font size re-lays them out for the new cell size. Remote images are blocked for
+privacy: press `i` in the content pane to load them for the message you are
+reading. On terminals without graphics support, every image becomes a labelled
+text placeholder such as `[image: Fall sale]`, and the message stays readable.
+Set `[display] images = "off"` to use placeholders everywhere, including on a
+graphics-capable terminal.
+
+Images supplied as MIME parts stay local even when their Content-Location is
+an HTTPS URL. If a previously loaded remote image has left the image cache,
+press `i` again when prompted to reload it.
+
+Choose **Settings → Display → Reading → Images** (`Auto` or `Off`) and press
+`Ctrl+S` to save. The change takes effect immediately; remote images still require
+`i` to load. The setting also shows whether inline images are supported.
+
+TideMail picks the graphics mode from your terminal's environment. If that finds
+nothing (for example inside a terminal multiplexer such as Herdr), it asks the
+terminal at startup whether it supports Kitty graphics and uses them if it
+does, so no setup is needed. To force the choice, set
+`TIDEMAIL_IMAGE_PROTOCOL=kitty` or `none`.
+
+**foot and WezTerm: inline images are currently unsupported.** TideMail uses
+text placeholders there because the renderer requires Kitty Unicode placeholders
+and virtual placements. foot supports Sixel images, which this renderer does not
+use. Email text and attachment saving still work; pressing `i` does not enable
+image display in these terminals.
+
+Search only reaches mail TideMail has cached. The first sync fetches the 100
+most recent inbox messages and 25 messages from other folders, whose attachments
+can make each batch much larger. Moving down past the last message in a folder
+pulls the next 100 from the server, so you can page back as far as it goes.
+Incremental sync also fetches at most 100 messages per page and continues through
+the backlog automatically, keeping its previous sync watermark until complete.
+
+Filter deletes remove the cached message only after the server succeeds; failures
+are reported in TideMail. Remote moves refresh the destination using its server
+message identifiers. Actionable links with terminal controls or Unicode line/paragraph separators are
+rejected. Labels stay on one row so the displayed entry matches its activation
+target. Mail text drops bare carriage returns while retaining CRLF line breaks.
+
+## Writing mail
+
+Press `c` to compose a message, or `r` to reply and `Ctrl+R` to reply all (from the
+message list or content pane). Reply all puts the sender (or Reply-To) in To and the
+other recipients in Cc, leaving out your own addresses. Recipient lines too long for
+the field scroll sideways as you type or move the cursor. TideMail
+saves your work to the sending account's Drafts folder as you type. Open Drafts
+and press `Enter` to continue writing, or `d` to delete a draft. The preview pane
+shows the first 64 KB of a very large draft and notes how much is hidden.
+Drafts do not support archive, move, read/star toggles, or message selection.
+Autosaves run one at a time and include edits made during an earlier save.
+Closing, discarding, or sending waits for a pending save; if saving fails, the
+composer keeps your text and shows the error so you can retry.
+
+In the header rows (From, To, Cc, Bcc, Subject), `Down` and `Up` move to the next or
+previous row, like `Tab` and `Shift+Tab`, except that `Up` stops at the top row. While
+the recipient suggestions are open, `Up` and `Down` choose a suggestion instead. In the
+body they move the text cursor.
+
+With one account, compose starts in **To** so you can type immediately.
+With multiple accounts, it starts in **From**, which works as an account picker.
+Focus it with `Shift+Tab` or `Up` from the To row, then press `Enter` or `Space` and
+choose the account. `Ctrl+U` cycles through the same list. TideMail uses that
+account's SMTP settings, From address, and signature.
+
+A new message starts from your default account — the one marked `★ [default]`
+in **Accounts**. Set it by highlighting an account there and pressing `Space`.
+Replies and forwards ignore the default and use the account the message
+arrived on. Without a default, a new message starts from the first account in
+your config.
+
+After delivery, TideMail saves a copy to the sending account's server-side Sent
+folder. Submission allows up to ten minutes for attachment uploads; connection
+and authentication setup remain bounded to 30 seconds. Multipart Sent copies use
+the same boundaries as the submitted message.
+Gmail already files SMTP submissions itself, so TideMail does not append
+a duplicate there. Other providers use the server's `\Sent` folder flag, with
+common names such as `Sent`, `Sent Items`, and `INBOX.Sent` as fallbacks.
+
+TideMail waits five seconds before sending by default. Press `Ctrl+Z` during
+that window to cancel delivery and reopen the draft. Change the delay under
+Settings → Editor, or set it to `0` to send at once. `Ctrl+Z` never cancels a
+scheduled send or one waiting to retry, so it stays free for undoing your latest
+action; edit or delete those from the Outbox.
+
+The **Outbox** has a row of its own in the accounts pane, under the Unified
+Inbox — outgoing mail spans accounts the same way. Its badge counts the sends
+that need you; a message passing through on its way out adds nothing to it.
+Resting on the row lists what is waiting and why, and `Enter`, `Space`, or `O`
+from anywhere opens the Outbox itself, where `r` retries a failed message and
+`e` moves an unsent one back into compose.
+
+The row is a doorway rather than a folder: the message pane previews it, but
+archiving, starring and the other folder keys do not apply to a message that
+has not been sent yet.
+
+A send that fails does not go quiet. The status bar reports it — `retrying 1 in
+Outbox` while automatic retries run, then `1 failed send in Outbox (2m)` once
+they are spent — and keeps reporting it until the Outbox has nothing left
+needing you. A message still inside its undo window is not a failure and says
+nothing.
+
+The time in brackets is how long that message has been waiting, which is what
+tells you whether the warning is about the message you just sent or one that
+has been stuck since yesterday. Both look the same otherwise.
+
+A delivery interrupted mid-flight, which TideMail finds when it starts up
+again, reads `1 unconfirmed send in Outbox` instead. That wording is the point:
+the server may have taken the message before the connection went, so it is not
+a failure and TideMail will not retry it on its own. Check Sent mail before
+you retry one by hand.
+
+Every attempt takes the sending address from the account as it stands at that
+moment, not from a copy saved when the message was queued. So if a send failed
+because the account's **From address** was wrong, correcting it and pressing
+`r` is enough — the queued message does not have to be rewritten or composed
+again.
+
+Failed deliveries retry after one minute. The maximum attempt setting includes
+the first try; it defaults to `3`, and `1` disables automatic retries. An
+interrupted delivery is marked uncertain because the server may have accepted
+it. Check Sent mail before manually retrying an uncertain message.
+
+When replying, the quoted original is editable text inside the message body;
+there is no separate expand/collapse control in compose.
+
+The compose window expands with the terminal up to 110 columns and 48 rows,
+with the extra space available to the message editor. The header fields carry
+their own labels, so there are no group titles above them.
+
+The footer is always three rows, so the message body never changes height as
+focus moves, Find opens, or a status message appears. The first row shows state:
+the Vim mode or command line and status messages on the left, and the PGP
+**Sign**/**Encrypt** toggles (`●` on, `○` off) and the `⁂ sig` marker on the
+right. The second row holds the message actions and never changes with focus:
+Send, Commands (`Ctrl+P` opens the command palette), Sender, and Templates. The
+third row starts with Cancel, then Grammar and Spell, which work from any field
+and stay in place, followed by the focused field's keys as a group — Find,
+Copy, and Cut in the body, or Pick sender on From. With Vim keys on, the body's
+keys follow the Vim mode instead: `/` find, `y` yank, `p` put, and `u` undo in
+Normal; `y`, `d`, and `c` in Visual; Run, `:w`, and `:q` on the command line;
+none in Insert. Outside Normal, `Esc` is labeled Normal because it returns
+there rather than cancelling. `Esc` always opens the last
+row, here and in the sender picker and Find footers. Shortcuts show the
+key in a rounded pill with the action beside it, lined up in columns; the Esc
+pill uses the theme's error color and Send its success color. Rounded pills use
+the same Nerd Font glyphs as rounded message tags; plain (VT52) themes use
+bracketed keys instead. Narrow windows drop the least important hints rather
+than wrapping; every shortcut stays listed in help (`?`) and the palette.
+
+The standard editor is on by default. Use Shift with the arrow keys to select
+text, `Ctrl+C`/`Ctrl+X`/`Ctrl+V` for the system clipboard, `Ctrl+Z`/`Ctrl+Y` for
+undo and redo, and Ctrl with the arrow keys to move by word.
+
+The compose body soft-wraps at word boundaries, falling back to character
+wrapping for long words and URLs. It reflows when resized or maximized without
+adding line breaks to your message or saved draft. Hard line breaks and blank
+lines stay as entered. To wrap at the edge of the pane instead, turn off
+**Settings → Editor → Wrap at word boundaries** (`compose_word_wrap = false`).
+
+Press `Ctrl+F` in the compose body to open Find. Matches highlight as you type;
+`Enter` or `F3` goes forward, `Shift+F3` goes backward, and navigation wraps.
+Press `Ctrl+R` inside Find to show Replace and focus the replacement field
+immediately. Press it again to hide Replace and return focus to Find. `Enter`
+in Replacement changes the current match and advances, and `Alt+Enter` replaces
+every match as a single undo step from either field. `Alt+C` toggles match case
+and `Alt+R` toggles regex. Each pill shows its key (`Replace ⏎`, `All ⌥⏎`,
+`Aa ⌥C`, `.* ⌥R`), so nothing needs Tabbing onto; `Tab`/`Shift+Tab` still cycle
+the fields and pills if you prefer. Narrow windows drop the key labels from the
+pills first. `Esc` closes
+Find without closing compose or undoing replacements. Copy/cut operate on the
+whole focused search field; paste inserts at its caret. Find takes over the
+footer rather than the body: the Find row (and With row while replacing) sit
+above the keys for the focused control, and the body keeps its full height. The
+bar is compact: the inputs share one width (up to 40 columns), and the match
+count sits above Replace with the `Aa`/`.*` toggles above All. Replace and All
+are pills, dimmed when there is nothing to replace; a toggle that is on shows as
+a tinted pill and one that is off as plain text. `No results` shows in the
+theme's error color. Focus moves only the `▌` rail and the accent pill. In the
+message, the current match is solid accent and the others are softly tinted,
+leaving underlines to spell check. A regex or replacement error shows
+in full on its own footer row. Long queries scroll to keep the input caret visible.
+
+Search is literal and case-sensitive by default; use the `Aa` control to ignore
+case. **Settings → Editor → Advanced regex search** (off by default;
+`display.compose_search_regex`) reveals the optional `.*` toggle. Enabling the
+setting does not activate regex. Regex uses Go syntax and supports replacement
+captures (`$0` for the whole match, `$1`, `${name}`). Anchors `^` and `$` match
+each logical line, independently of visual wrapping; `\A` and `\z` match the
+whole document's boundaries. Use `(?-m)` to disable multiline mode explicitly.
+For example, replacing `^> ` with nothing strips the quote prefix on every line.
+
+In regex replacements, write `$$` for a literal dollar: replace `cat` with `$$5`
+in `price cat` to get `price $5`. References to nonexistent capture groups show
+an inline replacement error and block Replace and All without editing the draft.
+Valid optional groups that did not participate in a match expand to empty.
+Use `${1}suffix` for group 1 followed by text; `$1suffix` is a group name.
+Invalid patterns also show an error and cannot replace text. In literal mode, replacement dollar signs and backslashes stay literal.
+Empty queries cannot replace text. Searches cover the whole body, including
+quoted text. In Vim Normal mode, `/` and `?` preview searches; Enter accepts,
+Esc restores the prior position, and `n`/`N` repeat/reverse the search direction.
+Vim `:s` and `:%s` substitution commands are not supported.
+
+Enable Vim keys under Settings → Editor if you prefer modes, motions, counts,
+operators such as `dw`, `cw`, and `dd`, and a command line. `:w` sends the
+message, while `:q` cancels it.
+
+Replies and forwards quote the readable text of an HTML message, not its markup,
+and a forward keeps the original's attachments.
+
+### Templates
+
+Press `F6` in compose (the footer shows `f6 templates` in every field) to open
+the template picker: canned replies you can insert at the cursor. The built-ins
+are **Thanks**, **Got it**, **Out of office**, **Propose a meeting**, **Polite
+decline** and **Follow up**. Choose one with `←`/`→` or `↑`/`↓` (the highlighted
+template is previewed in the message area, tags shown as written) and press
+`Enter` to insert it as one undo step. The subject is set only if it is empty.
+Without an `F6` key, use **Insert template…** in the command palette.
+
+- `e` edits the highlighted template in place: `Ctrl+S` saves it, `Esc`
+  discards the edit. Editing a built-in saves your own copy, which replaces it.
+- `n` saves the message you are writing as a new template: type a name and
+  press `Enter`. Quoted text in a reply or forward is left out. Names can't
+  repeat, start with `.`, or contain `/`, `\` or `:`.
+- Tags are filled when you insert: `{first_name}` (first word of the first
+  recipient's display name, or "there"), `{name}` (the full display name),
+  `{my_name}` (the sending account's name) and `{date}` (today). Unknown tags
+  stay as written.
+
+Templates are plain files. Any `.md` or `.txt` file in the `templates` folder
+next to `config.toml` (`~/.config/tidemail/templates`) is a template named after
+the file without its extension, and a file named like a built-in replaces it.
+A file may start with a `---` block holding `subject: ...`; the rest is the
+body. Files over 64 KiB, hidden files and files that are not UTF-8 text are
+ignored. `tidemail templates list` and `tidemail send --template NAME` use the
+same templates; see the [command line](cli.md).
+
+## Contacts
+
+Press `C` to open Contacts. Press `n` to add someone, `f` to browse addresses
+found in your mail, `i` to import a vCard, or `x` to export `contacts.vcf`.
+Select contacts with `Space`, then press `c` to write to them.
+
+Compose suggestions show saved contacts before addresses gathered from your
+mail. vCard imports and exports include names, email addresses, phone numbers,
+organizations, titles, and notes. Adding or importing an address you already
+saved fills in missing details but never blanks a saved name; edit the contact
+to clear it.
+
+## Passwords and API keys
+
+TideMail stores IMAP and SMTP passwords, AI API keys, and OAuth refresh tokens
+in the system keychain. It uses `secret-tool` on Linux and Keychain on macOS.
+When TideMail starts, it loads any blank password, API key, or refresh token
+from the keychain. Saving Settings moves loaded secrets into the keychain and
+clears them from the config file.
+
+If `secret-tool` is unavailable on Linux, TideMail writes these secrets to
+`~/.config/tidemail/config.toml`. Keep that file private. Windows has no
+keychain support yet, so it always stores these secrets in
+`%USERPROFILE%\.config\tidemail\config.toml`.
+
+- Gmail: Google Account → Security → App passwords (requires 2-Step Verification),
+  or sign in with OAuth (below)
+- Outlook.com / Microsoft 365 / Exchange Online: OAuth only — pick the **Outlook**
+  provider and sign in (below); Microsoft no longer accepts passwords here
+- Yahoo: Account Security → Generate app password
+- iCloud: Apple ID → Sign-In and Security → App-Specific Passwords
+- On-premises Exchange or any other server: **Custom** provider with your normal
+  username and password (basic auth over TLS)
+
+If you expose an app password, revoke it and create a new one.
+
+**Typing a password in a window of its own (optional).** On the account form,
+press `Alt+P` on the Password row to enter the password in your desktop's
+native dialog (`zenity` or `kdialog`, whichever is installed) instead of the
+terminal field. The password never appears in a command line or log, and
+Cancel leaves the stored password unchanged. The dialog is not offered over
+SSH, without a display, or when neither program is installed; the terminal
+field always works.
+
+Gmail currently requires an app password while Google approval is pending. Turn
+on 2-Step Verification, generate one at
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords),
+then paste it into the password field in the account manager (`M`) and save with
+`Ctrl+S`.
+
+### Gmail OAuth sign-in
+
+Google OAuth is temporarily unavailable while TideMail's Google app awaits
+approval. The account form and installer both call this out. Use a Google App
+Password instead; existing saved Gmail OAuth accounts are left unchanged.
+
+Developers can preview the Gmail App Password-only account form without changing
+saved credentials:
+
+```sh
+go run . --disable-google-oauth
+```
+
+See [Development flags](flags.md) for the behavior and other UI preview options.
+
+### Outlook OAuth sign-in
+
+The **Outlook** provider covers Outlook.com, Hotmail/Live, and Microsoft 365 /
+Exchange Online mailboxes. Microsoft retired basic auth for all of these, so the
+account signs in with OAuth. TideMail
+uses Mozilla Thunderbird's shared public client ID, which is already consented
+for IMAP/SMTP and needs no verification.
+
+1. In the account manager, add an account with provider **Outlook**, leave the
+   **Auth** row on *OAuth*, and press `Ctrl+O`.
+2. Thunderbird's client can't use the device-code flow, so TideMail copies a
+   sign-in URL to your clipboard. Open it, sign in, and you'll land on an
+   unreachable `https://localhost` page. Paste that page's URL (or the `code=`
+   value from it) into the **Code** field and press Enter.
+3. Save with `Ctrl+S`. IMAP and SMTP authenticate with XOAUTH2.
+
+To use your own Azure app registration instead (which enables the device-code
+flow — a short code you approve at `microsoft.com/devicelogin`), register a
+"Mobile and desktop" app with the `offline_access`,
+`https://outlook.office.com/IMAP.AccessAsUser.All`, and
+`https://outlook.office.com/SMTP.Send` delegated permissions, then set
+`TIDEMAIL_MS_CLIENT_ID` (or `ms_client_id` under `[oauth]`).
+
+Microsoft 365 work/school tenants often disable IMAP entirely; an admin must run
+`Set-CASMailbox -ImapEnabled $true` for the mailbox.
+
+### On-premises Exchange Server
+
+A self-hosted Exchange server (2016/2019/Subscription Edition) is **not** the
+Outlook provider — it does not authenticate against Microsoft's cloud. Use the
+**Custom** provider:
+
+- IMAP host: your Exchange server's hostname, port 993, TLS
+- SMTP host: the same server, port 587 (STARTTLS) or 465
+- Username: your login (often `DOMAIN\user` or your UPN)
+- Password: your normal mailbox password
+
+On-premises Exchange still accepts basic auth over TLS — Microsoft only removed it
+from Exchange Online. TideMail speaks XOAUTH2 and PLAIN only, so it cannot connect
+to an on-prem server whose admin has disabled basic auth and requires NTLM or
+Kerberos (GSSAPI).
+
+## Configuration files
+
+TideMail stores its config in `~/.config/tidemail/config.toml` and its SQLite
+cache in `~/.local/share/tidemail/mail.db`. Set `XDG_DATA_HOME` to use a
+different cache location. The update checker's own state (when it last
+checked, and which version you dismissed) is kept in `mail.db`, not in
+`config.toml`, so a config file under version control doesn't change every time
+TideMail checks for updates.
+
+Example configuration:
+
+```toml
+theme = "catppuccin-mocha"
+default_account = "8f43c9e644384bd5a25a27ff0d9c2701"
+
+[display]
+send_delay_seconds = 5
+send_max_attempts = 3
+images = "auto"  # "auto" (inline + blocked remote), or "off" (text placeholders)
+
+[[account]]
+id = "8f43c9e644384bd5a25a27ff0d9c2701" # generated by TideMail; do not copy or edit
+name = "Personal"
+imap_host = "imap.example.com"
+imap_port = 993
+imap_tls = true
+smtp_host = "smtp.example.com"
+smtp_port = 587
+smtp_tls = true
+user = "alice@example.com"
+auth_method = "password"  # "password" (default) or "oauth2"
+password = "app-password"
+from = "Alice <alice@example.com>"
+signature = "Alice\nSent with TideMail"
+sync_minutes = 0  # 0 = push (IDLE), N = poll every N min, -1 = manual only
+```
+
+`from` is the **From address** row in the account form. Give it an address —
+`alice@example.com` or `Alice <alice@example.com>` — or leave it blank to send
+as `user`, which works only when `user` is itself an address. A display name on
+its own is not enough: the account form refuses to save one, because SMTP has
+no address to send from and would only fail once the message was already
+queued.
+
+A standalone `⁂` in the compose body marks where your signature will be inserted
+when sending. New messages, replies, forwards, and email-link compositions include
+it automatically; in replies and forwards it appears before quoted correspondence.
+Move the symbol to change placement, or delete it to send without a signature.
+The actual signature stays out of the editor and uses the sending account selected
+when you send. An empty account signature simply removes the marker.
+
+Keep at most one marker, in its own paragraph with blank lines around it. Spaces
+or tabs around it are allowed unless indentation makes it a Markdown code block.
+The symbol is reserved in the interactive body: embedded, duplicated, quoted, or
+code-block markers stop sending with an error rather than being removed silently.
+A `⁂` inside the original message is shown as `⁎` in the quoted text of replies and
+forwards, so it is never mistaken for a marker. Saved templates never include the marker; one inserted into a message that already has it is dropped. Drafts preserve the body as edited; reopening never adds a marker. A draft without
+a marker, including an older draft or a draft created through the CLI, sends
+without an automatically added signature from the inbox composer.
+
+Headless `send` and the separate CLI wizard retain their existing signature flags
+and choices; they do not interpret `⁂` as a marker. Queued messages already contain
+the prepared signature, so retries do not add it again.
+
+The signature is a multi-line box in the account form — press `Enter` for a new
+line, `Tab` to move on, and `Ctrl+S` to save without leaving it. Arrow keys walk
+its lines and step to the next field at the top and bottom. Editing the file by
+hand works too; a TOML multi-line string is easier to read than escapes:
+
+```toml
+signature = """
+Alice
+Sent with TideMail"""
+```
+
+`auth_method` is set for you: it becomes `"oauth2"` once you complete a `Ctrl+O`
+sign-in for a Gmail/Outlook account, otherwise `"password"`. The refresh token
+and password live in the system keychain, not this file. An account never
+switches to OAuth on its own — a leftover keychain token cannot promote it.
+
+`default_account` names the account a new message is sent from, and the account
+TideMail focuses at startup. It holds an account `id`, not a position, so
+renaming or reordering accounts never moves it. Delete it, or the account it
+names, and TideMail falls back to the first account and opens on the Unified
+Inbox. `Space` in **Accounts** writes this line for you.
+
+The order of the `[[account]]` blocks is the order accounts appear in: the
+sidebar, the account list, and the `Ctrl+U` sender picker in compose. Reorder
+them here, or with `Shift+J` and `Shift+K` in **Accounts**.
+
+The generated account `id` links this block to cached mail, drafts, queued mail,
+and keychain credentials. It stays fixed when the display name changes. TideMail
+adds missing IDs on upgrade and first saves the original file as
+`config.toml.pre-account-ids.bak`.
+
+If `config.toml` is malformed or an automatic migration cannot be saved,
+TideMail stops instead of starting with defaults that could overwrite the real
+settings. The startup error names the exact config path and the parse or
+permission problem to fix. If an account's cached folders no longer have a
+matching config block, affected actions stop with a status-line explanation;
+open **Accounts** and re-enter that account's server details.
+
+### Plugins (experimental)
+
+TideMail can run external plugins placed in
+`$XDG_CONFIG_HOME/tidemail/plugins/` (or `~/.config/tidemail/plugins/` when
+`XDG_CONFIG_HOME` is unset).
+When any are installed, the command palette (`:`) gains **Plugins
+(experimental)**, a read-only list of installed plugins, and **Run plugin**.
+Plugins receive a message's sender, recipients, subject, date, and flags, never
+its body, and they never change your mail. The one exception is a PGP plugin,
+which you install for that purpose (see
+[PGP encryption and signing](#pgp-encryption-and-signing)).
+
+The command hints at the bottom of **Settings → Plugins** wrap to fit the pane.
+
+**Installing plugins.** Open **Settings → Plugins** (or the command palette's
+**Browse available plugins…**) and press `b` to list the official plugins from
+the [tidemail-plugins](https://github.com/allisonhere/tidemail-plugins)
+repository. Select one and press `i` to install it, `u` to update it when a
+newer version exists, or `x` to remove an installed one. TideMail asks first and
+shows what the plugin will be able to do; it downloads from GitHub, checks the
+release's checksum, and never runs the plugin while installing. The new plugin
+appears in the list straight away, with automatic processing still off. The
+list is fetched only when you open it. Plugins from elsewhere can still be
+copied into the plugins directory by hand.
+
+**Run plugin** runs a plugin you choose on mail, whether or not it has already
+been classified, for example after updating a plugin or changing its settings.
+Press `p` in the message list or reader, or use the command palette. The
+picker lists each plugin by name with a short description of what it does;
+you pick once:
+
+- **Run plugin on current message…** runs it on the message you are on and
+  opens a result card that explains what the plugin found in plain words:
+  for example **Newsletter · low priority**, followed by a short **Why**.
+  Type, priority, confidence, raw tags, and technical information live under
+  `d` **Details**; press `d` again to go back and `Enter` or `Esc` to close.
+  When TideMail itself finds an unsubscribe option in the message, the card
+  says **Available — press u**. `u` uses the same safe flow as `Ctrl+U` in the
+  reader: TideMail shows the destination and requires confirmation before a
+  web unsubscribe, or opens a prefilled unsubscribe draft for email links.
+  Otherwise the card says **No unsubscribe option**. The plugin never receives
+  the unsubscribe link and cannot unsubscribe on its own. If the plugin found
+  nothing new, the card says **No changes**; if it failed or took too long, the
+  card says so in plain words, with the technical reason under Details.
+- With messages selected (`Space`), the same command reads **Run plugin on N
+  selected messages…** and runs on the selection (asking first for 10 or
+  more).
+- **Run plugin on all N messages in Inbox…** (or the current folder, Unified
+  Inbox, search results, Needs You, Waiting on Them, or Snoozed) runs on every
+  message the list currently shows. It always asks first, with the count.
+  Only mail already in TideMail's cache is used; nothing is downloaded.
+
+After you have run a plugin, the palette also offers **Run *name* again**, which
+skips the picker.
+
+Several messages run one at a time, with progress on the status line
+(`running on 312 messages in Inbox… 87 / 312`), and end with one summary card:
+how many were processed, changed, unchanged, or failed, and what the plugin
+found (for example **Newsletter 9**, **Automated sender 2**). Failure reasons
+are under Details. A failing message does not stop the run, and its earlier
+annotations are kept. **Cancel plugin run** in the palette stops a run; quitting
+TideMail stops it too. The run works whether or not the plugin processes new
+mail automatically, and does not affect that.
+
+A plugin that also declares the `annotations` permission can attach short
+notes to a message, such as "needs reply" or "category: github". TideMail
+stores them in its local cache and shows them as tags in message rows. When
+enabled, they also appear below the date and sender in the content pane:
+`↩ REPLY`, `! URGENT`, `◆ IMPORTANT`, and the category name (`GITHUB`). On
+narrower screens tags shrink to their
+symbols, with the category becoming a single glyph chosen for that category
+(`↩ ◆ ⚙` for github), then to a plain `#github`, or disappear before the
+subject does. Each plugin run replaces
+that plugin's notes on the message; a successful run with nothing to say
+clears them. **Message annotations** in the palette lists all of a message's
+annotations. Running a plugin can move messages into or out of Needs You at once;
+snoozed messages stay snoozed, and Waiting on Them does not use annotations.
+
+### Local classification corrections
+
+Press `e` to open the classification editor. You can also
+search the command palette for **Edit tags / Correct classification**, or press
+`e` in **Message annotations**.
+Use `↑`/`↓` to choose a field, `←`/`→` to choose a value, and `Enter` to save it. You can correct needs reply, urgency,
+importance, or category. A correction overrides every plugin for that field,
+while the original plugin annotations remain visible. **Use plugin decision**
+or **Reset all corrections** removes the local decision. Corrections survive
+plugin reruns, annotation cleanup, and plugin removal. They are not sent to Jev, TypeSafe, or any plugin with a message. Deliberately
+selecting a Thunderbird-compatible category also saves its tag to the mail
+server, as described above.
+The one exception is report plugins that declare permission to read
+classifications (`annotations_query` and `analytics_read`). Those can see a
+message's current classification, including that it came from your
+correction. Reports with `analytics_read` also see corrected categories as
+part of category totals.
+
+Choose how tags look under **Settings → Display → Appearance → Message
+tags**:
+
+- **Show tags in message header**: turn the content-pane tag row on or off;
+  message-list tags are unaffected.
+
+- **Tag style**: use `←`/`→` on the single picker to choose **Pills (Square)**,
+  **Pills (Round)**, **Pills (None)**, **Compact**, **Plain**, or
+  **Glyph Pills (Round)**, or **Tag icons**. The picker
+  names and previews every choice. Square pills pad each side, Round uses
+  rounded caps (needs a Nerd Font), and None removes the padding. Compact uses
+  colored text such as `↩REPLY #github`; Plain uses uncolored
+  `[REPLY] [github]`. Glyph Pills (Round) shows only the matching category
+  glyph (for example, ⚙ for GitHub or ✉ for newsletters) inside rounded
+  colored pills, even when full labels would fit. Unknown categories use ●;
+  disabling icons uses ASCII markers. On narrow rows the caps may drop to
+  preserve subject space. Tag icons uses a colored tag glyph, or `#` with icons disabled.
+- **Tag colors** opens an editor for the background and foreground of each
+  tag: needs reply, urgency, importance, the default category color, and the
+  known categories (github, shipping, security, calendar, newsletter, support,
+  social, billing, receipt, notification, personal). Other categories use the
+  default category color. Select a tag and press `b` or `f` to open a visual
+  color picker for that swatch: `tab` moves between the RGB sliders (or the
+  HSL field in HSL mode, toggled with `m`) and the hex/R/G/B/H/S/L fields,
+  `↑↓←→` adjust whatever has focus, and `enter` on a field types an exact
+  number while `enter` elsewhere applies the color and returns to the list.
+  `#` jumps straight to typing a hex value, `y` copies the current hex to the
+  clipboard, and `esc` cancels without changing anything. Press `r` on a tag
+  to reset both its colors to follow the theme. Changes apply and save the
+  moment you confirm; colors you do not set follow the theme, and plugins can
+  never choose colors.
+
+Annotations stay after you remove a plugin, so its tags remain until you clear
+them. In **Message annotations**, select a plugin and press `c` to clear its
+annotations from that message, or `C` to clear all of them. In **Plugins
+(experimental)**, select a plugin (including one listed under **Stored data from
+removed plugins**) and press `c` to clear everything it stored. TideMail asks
+before clearing, and clearing never deletes or changes your mail.
+
+A plugin can also process new mail automatically, if it supports that and you
+turn it on: in **Plugins (experimental)**, select it and press `a`, then
+confirm. It then receives the same metadata (never message bodies) for each
+newly arrived unread message, and its tags appear as mail comes in. Old mail,
+first-time setup of an account, and loading older messages are never sent.
+The plugin list shows its current queue, running state, dropped events,
+failures, last success, last failure, and a sanitized last error when those
+values exist. Three consecutive automatic failures pause that plugin; press
+`r` on it to resume. Manual **Run plugin** actions remain available while
+automatic processing is paused.
+
+Each plugin's entry in **Plugins (experimental)** reads like a short product
+page: its name and description, its permissions as a checklist in plain words
+(✓ Message details, ✓ Save tags, ✗ Message body, ✗ Network), and whether
+**Automatic processing** is on.
+
+Automatic processing is off for every plugin until you enable it. A plugin that
+fails three times in a row is paused; select it and press `r` to resume.
+
+Some plugins are **reports**, such as mail analytics. The plugin list shows
+**enter  run report** for them: select one in **Settings → Plugins** or
+**Plugins (experimental)** and press `enter`. The report opens in the plugin
+result window when it finishes; closing a report launched from Settings
+returns to the Plugins section. Press `r` in the plugin list to reopen the
+last result. Reports can be charts as
+well as text: stat tiles, sparklines, bar charts, heatmaps, and tables, drawn
+in your theme. Category bars use your category tag colors, so changing those
+under **Settings → Display → Appearance** changes the charts too. Scroll with
+`↑`/`↓`. To answer, a report asks
+TideMail read-only questions, only those its permissions allow (the list shows
+them): for example message counts per day, category totals, or a list of
+conversations. TideMail answers from its local cache. A report never sees
+message bodies, cannot change your mail or TideMail's state, and cannot draw
+its own screens or colors. If a folder or account is selected in the sidebar,
+the report can treat it as the current one.
+
+Open **Settings → Plugins** to administer plugins directly in the right-hand
+pane. Press `→` to focus the list, `↑`/`↓` to select a plugin, and `s` to edit
+its settings in the same pane. The list also offers automatic-processing,
+resume, and stored-data controls when available. In a plugin form, `esc`
+returns to the list; from the list, `esc` returns to the Settings sidebar.
+`Tab` also returns to the sidebar when you are not typing a secret.
+Plugin changes save immediately. The command palette's **Plugins (experimental)**
+view still offers `s` to open a plugin's settings. Secret values such as API keys are stored in your system keychain, never
+in `config.toml`, and are shown only as `************`. A secret must be at least 6
+characters, so it can be masked in plugin output. Plugins are separate
+programs, not part of TideMail's mail handling: for example, TideMail Smart (JEV)
+(an external plugin) can call TypeSafe's Jev model over the network, and its
+settings describe exactly what it sends.
+
+Plugin support is experimental. Only install plugins you trust. To write a
+plugin, see [`plugins.md`](plugins.md) and the Plugin API v1 docs in
+[`plugins/`](plugins/README.md).
+
+## Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `:` or `Ctrl+P` | Open the command palette. In a Vim compose body, `:` belongs to the editor, so use `Ctrl+P` for the palette. |
+| `m` | Move selected message(s) to folder/label |
+| `c` | Compose (autosaves to Drafts as you type) |
+| `C` | Contacts manager |
+| `c` in Contacts | Compose to selected contact(s) |
+| `M` | Account manager |
+| `Space` in Accounts | Mark the highlighted account `★ [default]` — the sender for new messages |
+| `Shift+J` / `Shift+K` in Accounts | Move the highlighted account down / up the list |
+| `Ctrl+T` in the account form | Test the connection without saving |
+| `Ctrl+L` in the account form | Look up a Custom account's servers from its email domain (DNS SRV, MX, then HTTPS autoconfig) |
+| `s` | Sync current mailbox (Unified Inbox: syncs all inboxes) |
+| `Enter` on a conversation parent | Expand/collapse; `Right` / `l` or `Tab` opens its email in the reader |
+| `Enter` on a child or single message | Focus the reader |
+| `Enter` on a folder | Fetch that folder now; on a folder with subfolders, collapse or expand it |
+| `n` / `r` / `d` in Accounts | New, rename, delete the selected folder (see Managing folders) |
+| `H` in Accounts | Hide or unhide the selected folder (local only) |
+| `>` / `<` on a folder | Nest it under the folder above / move it out of its parent |
+| `Shift+K` / `Shift+J` on a folder | Walk the folder up / down the tree: reorder, move into an open parent, or out of its parent |
+| `←` / `→` on a folder | Collapse or go to parent / expand |
+| `F` | Sync all mailboxes (asks first when there are more than 10 folders) |
+| `Enter` in Drafts | Reopen selected draft in compose |
+| `d` in Drafts | Delete selected draft |
+| `r` | Reply to the selected or open message |
+| `Ctrl+R` | Reply all to the selected or open message |
+| `e` | Correct classification and manage tags for the current message |
+| `Space` in Category | Toggle the selected server tag, preserving other assignments |
+| `e` / `c` / `r` in Tag names and colors | Rename a discovered tag locally, choose its color, or use the theme color |
+| `x` | Collapsed: toggle conversation; expanded/single: toggle email. Mark-read advances; explicit selections toggle individually without advancing |
+| `*` | Toggle star (IMAP `\Flagged`) on selected message(s); syncs to the server |
+| `a` | Archive selected message |
+| `d` | Delete selected message |
+| `Space` | Multi-select messages; auto-advances and keeps the cursor visible (then `d`/`a`/`m`/`x` for bulk actions) |
+| `A` | Select all messages in current view |
+| `R` | Mark selected mailbox/account read |
+| `/` | Search messages |
+| `Shift+Left` / `Shift+Right` | Resize the accounts pane |
+| `Shift+Up` / `Shift+Down` | Resize the messages/content split |
+| `u` | Toggle unread-only view |
+| `t` | Toggle starred-first sort (starred messages float to the top) |
+| `X` | In Needs You: dismiss the message; in Waiting on Them: stop waiting (mail and tags untouched) |
+| `Z` | Snooze from Needs You / Waiting on Them (local only); in Snoozed: unsnooze |
+| `Ctrl+Z` | Cancel a send still in its delay; in Needs You or Waiting on Them, undo the latest dismiss or stop; otherwise undo the latest pending delete, archive, or move |
+| `O` | Open the Outbox |
+| `o` or `Enter` | Open an explicitly selected LINKS entry or a visible link deliberately focused with the keyboard |
+| `Ctrl+U` | Unsubscribe from the mailing list for the open message |
+| `Ctrl+U` in compose | Cycle the sending account; focus From and press `Enter` to open the account picker |
+| `Ctrl+N` / `Alt+N` | Select the next LINKS entry and scroll it into view |
+| `Alt+P` | Select the previous LINKS entry and scroll it into view |
+| `Alt+P` on the account form's Password row | Enter the password in a native dialog (`zenity` or `kdialog`) |
+| `Ctrl+E` | Toggle email headers on/off |
+| `Ctrl+O` | View the message source; `c` copies it, `Esc` closes |
+| `Ctrl+B` | View the whole message in your browser (remote content blocked) |
+| `Ctrl+F` | Find in message; Find/Replace when composing in the body |
+| `v` / `V` | Visual select line range / whole message |
+| `` ` `` | AI summary |
+| In the summary overlay | `C` copies, `M` saves a `.md` file to the AI save path, `z` toggles quoted text, `Esc` closes |
+| `S` | Settings |
+| `T` | Theme picker |
+| `Alt+F` in compose | Attach a file (opens the file picker) |
+| `Ctrl+R` in compose | Remove the last attachment |
+| `Ctrl+D` | Save attachments to folder |
+| `Ctrl+G` | AI grammar & spell check (compose). The preview fits the screen and scrolls with `↑`/`↓`, `PgUp`/`PgDn`, and `Home`/`End`; `y` accepts, `n` or `Esc` cancels |
+| `F7` | Offline spell check (compose); needs Settings → Editor → Spell check |
+| `Alt+M` in compose | Maximize the compose panel across the full terminal; press again to restore. The application status bar is hidden; compose notifications (including autosave failures) appear in the composer footer. Each new compose, reply, forward, or reopened draft starts compact. |
+| `F6` in compose | Template picker; `Enter` inserts, `e` edits, `n` saves the message as a new template |
+| `D` | Decrypt and verify the open PGP message (needs a PGP plugin) |
+| `Alt+S` / `Alt+E` in compose | Sign / encrypt the message with PGP (needs a PGP plugin); `F8` / `F9` also work if your terminal or desktop doesn't claim them |
+| Standard compose editor | Selection, system clipboard, undo/redo, word movement, and Home/End |
+| Spell check in compose | Off by default. Turn on **Settings → Editor → Spell check in compose (F7)** to underline misspelled words in the body as you type (the word you are still typing is left alone until you move on). Press `F7` to step through them: `Enter` replaces with the highlighted suggestion (or press `1`–`5`), `←`/`→` choose another, `s` skips, `i` ignores the word until you restart, `a` adds it to your personal dictionary (kept in TideMail's database), and `Esc` closes. To see, add, or remove those words later, open **Settings → Editor → Personal dictionary** (`a` adds, `d` removes, `Esc` goes back); changes apply right away. The language is **Settings → Editor → Spell check language**: English (US and GB spellings) or Español. It works offline and never sends text anywhere. It ignores URLs, email addresses, numbers, ALL-CAPS words and quoted or forwarded text, and it accepts the names, addresses and domains of people in your mail, so correspondents are not flagged. Suggestions put the likeliest fix first: swapped or doubled letters, neighbouring-key slips and sound-alikes are weighed, favouring everyday words. `Ctrl+G` still runs the AI grammar check |
+| Vim keys in compose | Enable in Settings → Editor. `:w`/`:wq` send; `:q` or double `Esc` cancels |
+| `?` | Help |
+| `q` | Quit |
+
+### PGP encryption and signing
+
+TideMail can read and send PGP mail (the PGP/MIME and inline formats) through a
+**PGP plugin**. TideMail does not contain any cryptography itself: the plugin
+runs your own GnuPG against your own keyring, so your private key never goes
+near TideMail. A plugin that is allowed to do this declares the `message_raw`
+(read) and `message_compose` (send) permissions, shown in the plugin list as
+✓ Decrypt/verify received mail and ✓ Sign/encrypt outgoing mail. Only install
+one you trust: while it is doing its job it sees the part of the message it is
+working on.
+
+TideMail's plugin repository has a ready-made one, `pgp`: install it
+from **Settings → Plugins → `b`**. It needs `gpg` (GnuPG 2.x) installed, with
+your key and the keys of the people you write to in your keyring.
+
+**Reading.** A message that contains PGP data shows
+`PGP-protected message. Press D to decrypt or verify.` under its date line, and
+`D decrypt` appears in the key hints at the bottom while it is selected. An
+encrypted message has no readable text of its own, so where "No message body."
+would be, the pane says `This message is PGP-encrypted. Press D to decrypt it.`
+(or, without a PGP plugin, where to get one: Settings → Plugins → `b`).
+Press `D` (or choose **Decrypt / verify (PGP)** in the command palette). TideMail
+fetches that one message, hands the encrypted or signed part to the plugin,
+and shows the result in the reading pane with a line such as
+`PGP: decrypted · good signature from Ann <ann@example.com>`. The line says
+`BAD SIGNATURE` if the message was changed after it was signed, tells you when
+it is signed with a key you don't have, and shows the plugin's reason if it
+can't decrypt (for example, you don't have the secret key). Decrypted text is
+kept in memory only: it is not saved to TideMail's database or search index and
+is gone when you quit, so encrypted mail is not searchable and you press `D`
+again after restarting. Attachments inside an encrypted message are not
+available yet.
+
+**Sending.** In compose, press `Alt+S` to sign and `Alt+E` to encrypt (also in
+the command palette; `F8` and `F9` work too if your terminal or desktop doesn't
+claim them). Each press shows `PGP encrypt: on` (or `sign`, or `off`) on the
+footer's state line; turning encryption on adds a reminder that the subject is
+not encrypted. The `⌥S Sign` and `⌥E Encrypt` toggles at the right of that line
+show `●` when on and `○` when off, and stay visible beside long messages. If you see no message, the
+key never reached TideMail; use the palette instead. They are per message and
+start off. When you press send, the plugin signs or encrypts first (your
+passphrase prompt may appear then), and only then is the message queued, so
+the Outbox, retries and the copy in your Sent folder all hold the protected
+form. **If anything goes wrong, nothing is sent**: a recipient you have no key
+for, a cancelled passphrase prompt or a plugin error stops the send with the
+reason, and compose stays open. TideMail never falls back to sending the
+message unprotected. Encrypted messages are also encrypted to you, so you can
+read your own Sent copy. Editing a queued message brings its toggles back.
+
+**Before you send encrypted mail.** Encryption needs three things on your
+computer; if one is missing, nothing is sent and the status line says which:
+
+1. **A public key for every recipient** (To, Cc and Bcc) in your GnuPG keyring.
+   Check with `gpg --list-keys ADDRESS`. Fetch a missing one with
+   `gpg --locate-keys ADDRESS` (it tries the recipient's domain and key
+   servers), or import a key they sent you with `gpg --import FILE.asc`. If
+   there is no key, `Alt+E` turns encryption off for that message. TideMail
+   shows `Not sent: no PGP key for ADDRESS`.
+2. **Your own key, under the address you send from.** A key only matches the
+   addresses on it. To use another address of yours, add it:
+   `gpg --quick-add-uid KEYID "Your Name <address>"` (this asks for your
+   passphrase), then re-publish your public key if you shared it.
+3. **A graphical pinentry** to ask for your passphrase (GNOME, KDE and
+   Omarchy ship one; GnuPG picks it, TideMail does not). If a prompt looks
+   broken, check `pinentry-program` in `~/.gnupg/gpg-agent.conf`, then run
+   `gpgconf --reload gpg-agent`. `gpg-agent` remembers your passphrase for a
+   few minutes, so you are not asked on every message.
+
+Things to know:
+
+- The **subject and the From/To/Date headers are not encrypted**; only the
+  body and attachments are (this is how PGP/MIME works). Keep secrets out of
+  the subject line.
+- Encrypted mail is addressed to **every recipient including Bcc**, and PGP
+  messages name the keys they were encrypted to, so a Bcc recipient's key can
+  be recognized by the other recipients. Avoid Bcc on encrypted mail you want
+  to keep private.
+- While you compose, and while a message waits in the Outbox, TideMail's local
+  database keeps the plain text of your draft (it is deleted once the message
+  is sent). Only your own computer holds it; drafts are not uploaded to the
+  server.
+- `tidemail send` on the command line does not sign or encrypt.
+- Your passphrase prompt comes from GnuPG's pinentry, which must be graphical
+  or served by an agent that has your passphrase cached; a terminal pinentry
+  cannot draw over TideMail and fails with a clear error.
+- Key trust follows GnuPG's rules by default, so a recipient's key must be
+  signed or trusted. In the plugin's settings, **Key trust → always** encrypts
+  to any key in your keyring.
+
+## Themes
+
+Press `T` to open the theme picker, or pick one under Settings → Display. There
+are 51 built-in themes in 23 families (Catppuccin, Tokyo Night, Rosé Pine,
+Gruvbox, Nord, Solarized, Nightfox, Kanagawa, GitHub and others, plus the retro
+`vt100` and `vt52` and three original palettes), grouped by family in the
+picker. `↑`/`↓` preview a theme across the whole app, `Enter` keeps it and saves
+it, and `Esc` puts the previous one back. Press `/` and type to search: every
+word must match the family, the variant, the theme's name, or `light` / `dark`
+(`rose dawn`, `light`, `night`). Each row has a swatch of the theme's accent,
+success, warning, error and tag colors, and a sample below the list shows how
+selection, text, links, quotes and status colors look in the highlighted theme.
+
+Every theme paints a solid background, the same color the picker shows, even when
+your terminal has background opacity set (kitty, Ghostty and others). To let that
+opacity show through instead, turn on **Settings → Display → Transparent
+background** (`transparent = true` under `[display]`). Only the theme background
+becomes see-through; selected rows, overlays and other surfaces stay solid.
+
+Alert colors are the same in every built-in theme: green for OK, yellow for
+cautions and warnings, and red for failures. Status bar pills use a fixed fill and
+text color pair for each on every theme. Plain alert text uses the brighter color
+on dark themes and the deeper one on light themes; for that text, the retro
+`vt100` and `vt52` themes and `match-omarchy` keep their own. The values are listed in
+[themes.md](themes.md#alert-colors).
+
+Every built-in theme is checked against WCAG-style contrast minimums by
+automated tests. The full list of themes and variants, with where each palette
+comes from and its license, is in [themes.md](themes.md). Saved theme names from
+earlier versions keep working.
+
+`match-omarchy` is a special entry for [Omarchy](https://omarchy.org) users: it
+follows your current Omarchy desktop theme, remapped and contrast-corrected so
+TideMail stays readable whatever palette Omarchy is on. It reads the palette
+from `omarchy-theme-color` (falling back to
+`~/.local/state/omarchy/current/theme/colors.toml`), works for both light and
+dark Omarchy themes, applies the palette to both styled UI and terminal-default
+text at startup, and repaints within a couple of seconds when you switch your
+desktop theme — no restart. If Omarchy isn't installed it falls back to
+`catppuccin-mocha`.
+
+## Settings
+
+Press `S` to open Settings.
+
+Under **Display**, **Pane header bars** controls the title-and-shortcut row above
+each pane. When disabled, those rows disappear to make more room for content;
+the focused pane's title and shortcuts appear in the bottom status line instead.
+Global message search uses a dedicated row above message subjects while active.
+
+**Needs You in sidebar** and **Waiting on Them in sidebar** (both on by default)
+hide those two rows when turned off. Only the row goes away: nothing is deleted,
+`Z` snooze and dismissals still work, and turning the setting back on restores the
+view as it was. If you turn off the view you have open, TideMail returns to the
+Unified Inbox.
+
+Mouse-driven text selection and copying in the reading pane is available with
+Focus Line either enabled or disabled. With Mouse support on, left-drag over text
+and press **Ctrl+C** to copy it, preserving displayed line breaks. Release keeps
+the highlight; another click clears it. Drag above or below the reader to
+autoscroll and extend the selection. Keyboard navigation clears the mouse
+selection. Clicking or dragging hyperlinks never opens them.
+
+**Mouse support** is off by default, so your terminal's own native
+click-drag text selection and copy keep working untouched. Turn it on to use:
+
+- **Click** a sidebar row, a message row, or a pane to focus or select it.
+  Reading-pane clicks never open links. Clicking displayed text in a LINKS entry
+  selects that entry; other content clicks only position or focus the reader.
+  Press `o` or `Enter` to open a deliberately selected entry.
+  While message search is active, clicking its search row resumes editing the query.
+- **Double-click** a conversation parent to expand/collapse it; a child, single
+  message, or draft opens. This matches `Enter`. On a sidebar row it also matches
+  `Enter` (expand/collapse, or sync the folder).
+- **Scroll wheel** over the sidebar or message list moves the selection three
+  rows at a time; over the reading pane it scrolls three rows and clears link
+  selection. With **Focus line** on, keyboard reading resumes in the visible text.
+  The wheel never changes which pane is focused.
+- **Right-click** a row to select it and open a small menu at the pointer with
+  just the actions for what you clicked: a folder offers sync, new, rename,
+  hide/unhide, and delete; an account offers new folder, sync all, and manage
+  accounts; a message (in the list or the reading pane) offers reply, reply all,
+  forward, archive, move, delete, read/unread, and snooze. Click an item to run
+  it, or use `j`/`k` (or the arrows) and `Enter`; `Esc` or a click elsewhere
+  closes it. The full command palette is still on `:` / `Ctrl+P`.
+
+Clicks and the wheel do nothing while Settings, the Account Manager, Compose, or
+any other overlay is open. Turning mouse support on trades away your terminal's
+native click-drag text selection while it's enabled.
+
+- Display: theme, icons, support reminder, tag style and colors, message tags (header row, tag names and colors), Needs You and Waiting on Them sidebar rows, date format, mark-read behavior, focus line, show sender, unread-first ordering, actionable links, reading width, browser command, density, show email headers, desktop notifications, mouse support, and quit confirmation
+- Editor: compose keys, vim keys, advanced regex search, spell check and its language, send delay, and maximum delivery attempts
+- CLI: quit after send or draft, skip the review step, and the default signature for the interactive `tidemail cli` wizard
+- Accounts: connection details, From address, signature, color, and sync interval.
+  An account's color accents its own mailbox pane (unread text, the focused
+  header, and the border) when that mailbox is selected directly, and tints
+  each of its messages in mixed views — Unified Inbox, Needs You, Waiting on
+  Them, and Snoozed — so you can still tell accounts apart at a glance when
+  browsing across all of them.
+- Updates: check, install, restart, or copy a manual install command
+- Changelog: read the release notes bundled with your installed version, newest first, offline. Scroll with `j`/`k` or the arrow keys, page with `PgUp`/`PgDn`, and jump with `g`/`G` (or `Home`/`End`); `Esc` or `←` returns to the sections list
+- AI: OpenAI, Claude, Gemini, or Ollama summary settings. Claude offers `claude-haiku-5-5` (the default: fast and cheap, plenty for summaries and grammar), `claude-sonnet-5-5`, and `claude-opus-5-5`; **Test connection** checks the key against the model you picked, and a failed grammar check names the provider's reason in the compose footer
+- Advanced: logs and feed max body size
+- Support: an animated neon café scene with a midnight blue and violet backdrop, cyan buttons, and pink and lilac lights (swaying string lights, a steaming mug, Pac-Man chasing a coffee cup). After one lap, he catches the coffee near the center of the counter in a slow, expanding neon explosion whose dots fade to white, hops upward, and falls into smaller gravity-driven bounces until he settles. A broom sweeps him off the right edge, then the chase restarts. Choose the Buy me a coffee or Copy link button with Up/Down and press Enter; Ctrl+C also copies the link, and Esc returns to Settings sections
+- About: Support Tidemail, repository, and issue links, shown over an animated night-sea scene (stars, moon, a self-drawing TIDEMAIL wordmark, and rolling waves). The animation settles after about 40 seconds
+- Plain (VT52) themes keep the original static About and Support pages instead of the animated scenes
+
+Open the command palette with `:` or `Ctrl+P` and choose **Support Tidemail**
+to go directly to the same Support page. Browser-launch failures leave the URL
+in the status line so it can still be copied. Tidemail does not show donation
+prompts during normal email use. A Pac-Man and coffee cup circle the page's
+white dotted border only while Support is open.
+
+### Pending read/unread changes
+
+Read/unread requests show an animated Braille indicator (four frames per
+second; `~` in plain or icon-disabled display) and lock the affected messages
+against further read/unread changes. Unread-to-read `x` actions advance the
+cursor immediately to the next visible email or collapsed conversation. Other
+messages remain available while the server operation is pending.
+
+Messages retain their local read state, unread count, and sorting classification
+until the server confirms. Successful updates are saved locally and the current
+view reloads using its existing ordering, preserving the highlighted message by
+ID where it remains visible. This includes Unread First ordering and Unread Only
+filtering. The exception is a message marked read by opening it: while it stays
+open in the focused reader it keeps its unread position, and stays listed under
+Unread Only, so the list does not move out from under you. When focus leaves the
+reader or another message opens, it moves to its place among the read messages,
+and the cursor stays on the same row, which is now the next unread message.
+Dialogs opened over the reader, such as a reply, do not end the hold. A conversation's parent can change as its members change read state.
+Read reconciliation keeps collapsed selections on their conversation without
+opening it; expanded selections retain their exact email ID. Intentional `x`
+advancement retains its next target through that reconciliation. Passive refreshes
+continue to preserve message identity. A pending message's row number can shift
+as other completed messages move.
+
+The indicator takes the place of the row's unread or cursor marker until the
+server confirms, so the row does not shift; the highlight still marks the
+cursor row. A collapsed parent shows pending while any member in the current
+result is pending, and refuses another conversation toggle until those operations
+finish. Expanded rows show only their own pending state. Failures clear pending and appear in
+the existing status/log mechanism without changing that operation's local read
+state. Mixed bulk actions apply successful groups and leave failed groups
+unchanged. There is no automatic retry or rollback. Other clients and normal
+synchronization can still change server state; a timeout may occur after the
+server applied a change, which later synchronization reconciles.
+
+Grammar checks can be canceled with Esc while retaining editable compose text.
+Ctrl+C or Ctrl+Q during a grammar check cancels it and follows the normal quit flow.
+Late grammar results are ignored; pending draft persistence remains protected.
+OAuth refreshes run independently per account. A malformed COPY acknowledgment
+triggers one fresh-connection source cleanup attempt without repeating COPY;
+if cleanup fails, TideMail reports the completed copy and unconfirmed removal.
+
+Message deletion updates its cached message, attachments, search index, and
+deletion marker in one transaction. Needs You dismiss/restore targets the
+selected email; failures leave the database unchanged. A failed
+Ctrl+Z restore keeps undo available for retry after the write finishes.
+
+Removing an account also removes its cached search entries atomically with the
+account's local mail cache.
+
+OAuth accounts require **IMAP TLS** and encrypted SMTP, including localhost.
+For SMTP port 587, enable **SMTP TLS** (STARTTLS); port 465 uses implicit TLS.
+TideMail rejects plaintext OAuth configurations before connecting or refreshing
+credentials, and never sends the OAuth bearer response over an unencrypted SMTP
+connection.
+
+Message-list focus stays visible after resizing, including after navigating on a
+very short terminal. Full-width plain-text mail reserves its left inset before
+wrapping, preserving the final character on each line. Legacy MIME-encoded
+subjects and address display names are decoded in the message list and reader.

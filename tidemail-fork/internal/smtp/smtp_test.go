@@ -1,0 +1,700 @@
+package smtp
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"mime"
+	"mime/multipart"
+	"net"
+	"net/mail"
+	"net/smtp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/allisonhere/tidemail/internal/config"
+)
+
+// Header bytes must be ASCII: a non-ASCII subject or sender name is sent as an
+// encoded-word that decodes back to the original, and ASCII stays untouched.
+func TestBuildRawEncodesNonASCIIHeaders(t *testing.T) {
+	for _, tc := range []struct{ from, subject string }{
+		{"José Núñez <jose@example.com>", "Café plans 🎉"},
+		{"Plain Name <plain@example.com>", "plain subject"},
+		{"bare@example.com", "Ünïcödé"},
+	} {
+		raw := buildRaw(tc.from, OutgoingMessage{To: []string{"b@example.com"}, Subject: tc.subject, Body: "hi"})
+		header, _, _ := bytes.Cut(raw, []byte("\r\n\r\n"))
+		for _, b := range header {
+			if b >= 0x80 {
+				t.Fatalf("raw 8-bit byte in headers for %q / %q:\n%s", tc.from, tc.subject, header)
+			}
+		}
+		msg, err := mail.ReadMessage(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := new(mime.WordDecoder)
+		if got, err := dec.DecodeHeader(msg.Header.Get("Subject")); err != nil || got != tc.subject {
+			t.Fatalf("subject decodes to %q (%v), want %q", got, err, tc.subject)
+		}
+		from, err := msg.Header.AddressList("From")
+		want, _ := mail.ParseAddress(tc.from)
+		if err != nil || len(from) != 1 || from[0].Name != want.Name || from[0].Address != want.Address {
+			t.Fatalf("From decodes to %+v (%v), want %+v", from, err, want)
+		}
+		if tc.subject == "plain subject" && msg.Header.Get("Subject") != "plain subject" {
+			t.Fatal("ASCII subjects must pass through unchanged")
+		}
+	}
+}
+
+func TestBuildRawAttachmentFilenameRoundTrip(t *testing.T) {
+	for _, name := range []string{"report.txt", `report"final.txt`, `report\final.txt`, "résumé.txt", "report\nfinal.txt"} {
+		t.Run(name, func(t *testing.T) {
+			raw := buildRaw("a@example.com", OutgoingMessage{
+				To: []string{"b@example.com"}, Body: "See attached",
+				Attachments: []Attachment{{Name: name, Data: []byte("content")}},
+			})
+			msg, err := mail.ReadMessage(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := multipart.NewReader(msg.Body, params["boundary"])
+			if _, err := reader.NextPart(); err != nil {
+				t.Fatal(err)
+			}
+			part, err := reader.NextPart()
+			if err != nil {
+				t.Fatal(err)
+			}
+			disposition, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if disposition != "attachment" || params["filename"] != name {
+				t.Fatalf("attachment header round trip = %q, %q; want attachment, %q", disposition, params["filename"], name)
+			}
+		})
+	}
+}
+
+func TestSendMail(t *testing.T) {
+	server, client := net.Pipe()
+
+	go func() {
+		// Go 1.26 smtp.NewClient reads 220 greeting first
+		server.Write([]byte("220 smtp.test ESMTP\r\n"))
+		buf := make([]byte, 1024)
+
+		// Read EHLO (sent by hello() inside client.Mail())
+		n, _ := server.Read(buf)
+		cmd := string(buf[:n])
+		if !strings.HasPrefix(cmd, "EHLO") {
+			t.Errorf("expected EHLO, got %s", cmd)
+		}
+		server.Write([]byte("250-Hello\r\n250 AUTH PLAIN\r\n"))
+
+		// Read MAIL FROM
+		n, _ = server.Read(buf)
+		cmd = string(buf[:n])
+		if !strings.HasPrefix(cmd, "MAIL FROM:<alice@x>") {
+			t.Errorf("expected MAIL FROM, got %s", cmd)
+		}
+		server.Write([]byte("250 OK\r\n"))
+
+		// Read RCPT TO
+		n, _ = server.Read(buf)
+		cmd = string(buf[:n])
+		if !strings.HasPrefix(cmd, "RCPT TO:<bob@x>") {
+			t.Errorf("expected RCPT TO, got %s", cmd)
+		}
+		server.Write([]byte("250 OK\r\n"))
+
+		// Read DATA
+		n, _ = server.Read(buf)
+		if !strings.Contains(string(buf[:n]), "DATA") {
+			t.Errorf("expected DATA, got %s", cmd)
+		}
+		server.Write([]byte("354 Start mail input\r\n"))
+
+		// Read content
+		n, _ = server.Read(buf)
+		data := string(buf[:n])
+		if !strings.Contains(data, "Subject: Hello") {
+			t.Errorf("expected Subject: Hello, got %s", data)
+		}
+		server.Write([]byte("250 OK\r\n"))
+
+		server.Close()
+	}()
+
+	sc, err := smtp.NewClient(client, "test.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = sendMail(sc, "alice@x", []string{"bob@x"}, []byte("Subject: Hello\r\n\r\nBody"))
+	client.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type deadlineRecordingConn struct {
+	net.Conn
+	deadlines []time.Time
+}
+
+func (c *deadlineRecordingConn) SetDeadline(t time.Time) error {
+	c.deadlines = append(c.deadlines, t)
+	return c.Conn.SetDeadline(t)
+}
+
+func TestSendSTARTTLS_NoTLS(t *testing.T) {
+	server, clientConn := net.Pipe()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Go 1.26 smtp.NewClient reads 220 first
+		server.Write([]byte("220 localhost ESMTP\r\n"))
+		buf := make([]byte, 1024)
+
+		// Read EHLO (sent by hello() inside smtp.NewClient)
+		n, _ := server.Read(buf)
+		if !strings.Contains(string(buf[:n]), "EHLO") {
+			t.Errorf("expected EHLO, got %q", string(buf[:n]))
+		}
+		// Respond with AUTH but not STARTTLS — localhost exempts PlainAuth from TLS check
+		server.Write([]byte("250-Hello\r\n250 AUTH PLAIN\r\n"))
+
+		// Read AUTH PLAIN (sent by client.Auth())
+		n, _ = server.Read(buf)
+		if !strings.Contains(string(buf[:n]), "AUTH") {
+			t.Errorf("expected AUTH, got %q", string(buf[:n]))
+		}
+		server.Write([]byte("235 Authentication successful\r\n"))
+
+		// Read MAIL FROM (sent by sendMail)
+		server.Read(buf)
+		server.Write([]byte("250 OK\r\n"))
+
+		// Read RCPT TO
+		server.Read(buf)
+		server.Write([]byte("250 OK\r\n"))
+
+		// Read DATA
+		server.Read(buf)
+		server.Write([]byte("354 Start mail input\r\n"))
+
+		// Read content
+		server.Read(buf)
+		server.Write([]byte("250 OK\r\n"))
+
+		server.Close()
+	}()
+
+	// Override dial to return pipe connection
+	recording := &deadlineRecordingConn{Conn: clientConn}
+	oldDial := smtpDial
+	oldClient := smtpNewClient
+	defer func() {
+		smtpDial = oldDial
+		smtpNewClient = oldClient
+	}()
+
+	smtpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return recording, nil
+	}
+	smtpNewClient = func(conn net.Conn, host string) (*smtp.Client, error) {
+		return smtp.NewClient(conn, host)
+	}
+
+	err := sendSTARTTLS(context.Background(), "localhost:587", config.AccountConfig{
+		User:     "user",
+		Password: "pass",
+	}, "alice@x", []string{"bob@x"}, []byte("Subject: Hello\r\n\r\nBody"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recording.deadlines) != 2 {
+		t.Fatalf("deadlines: %v", recording.deadlines)
+	}
+	if time.Until(recording.deadlines[0]) > 30*time.Second || time.Until(recording.deadlines[1]) < 9*time.Minute {
+		t.Fatalf("setup/upload deadlines: %v", recording.deadlines)
+	}
+	<-done
+}
+
+// TestSendSTARTTLS_StaleConnectionTimesOut guards against a regression where a
+// socket left stale (e.g. by a laptop suspend/resume) hangs the SMTP session
+// forever instead of erroring out once ctx's deadline passes. The fake server
+// answers the initial greeting and then goes silent, simulating a connection
+// that "dialed" fine but died before the conversation finished.
+func TestSendSTARTTLS_StaleConnectionTimesOut(t *testing.T) {
+	server, clientConn := net.Pipe()
+	defer server.Close()
+
+	go func() {
+		server.Write([]byte("220 localhost ESMTP\r\n")) //nolint:errcheck
+		buf := make([]byte, 1024)
+		server.Read(buf) //nolint:errcheck // read EHLO, then go silent forever
+	}()
+
+	oldDial := smtpDial
+	oldClient := smtpNewClient
+	defer func() {
+		smtpDial = oldDial
+		smtpNewClient = oldClient
+	}()
+	smtpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return clientConn, nil
+	}
+	smtpNewClient = func(conn net.Conn, host string) (*smtp.Client, error) {
+		return smtp.NewClient(conn, host)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sendSTARTTLS(ctx, "localhost:587", config.AccountConfig{
+			User:     "user",
+			Password: "pass",
+		}, "alice@x", []string{"bob@x"}, []byte("Subject: Hello\r\n\r\nBody"))
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error from a stale connection, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sendSTARTTLS hung on a stale connection instead of respecting ctx's deadline")
+	}
+}
+
+func TestSendSTARTTLS_NoRecipients(t *testing.T) {
+	err := Send(context.Background(), config.AccountConfig{SMTPHost: "x", SMTPPort: 587}, OutgoingMessage{})
+	if err == nil || !strings.Contains(err.Error(), "no recipients") {
+		t.Fatalf("expected 'no recipients', got %v", err)
+	}
+}
+
+func TestSend_STARTTLS_DialError(t *testing.T) {
+	oldDial := smtpDial
+	defer func() { smtpDial = oldDial }()
+	smtpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	err := Send(context.Background(), config.AccountConfig{
+		User:     "u",
+		Password: "p",
+		From:     "u@x",
+		SMTPHost: "localhost",
+		SMTPPort: 587,
+	}, OutgoingMessage{
+		To:      []string{"b@x"},
+		Subject: "Hi",
+		Body:    "Hello",
+	})
+	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("expected dial error, got %v", err)
+	}
+}
+
+func TestSend_TLS_DialError(t *testing.T) {
+	oldTLSDial := tlsDial
+	defer func() { tlsDial = oldTLSDial }()
+	tlsDial = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		return nil, fmt.Errorf("tls dial failed")
+	}
+
+	err := Send(context.Background(), config.AccountConfig{
+		User:     "u",
+		Password: "p",
+		From:     "u@x",
+		SMTPHost: "localhost",
+		SMTPPort: 465,
+	}, OutgoingMessage{
+		To:      []string{"b@x"},
+		Subject: "Hi",
+		Body:    "Hello",
+	})
+	if err == nil || !strings.Contains(err.Error(), "tls dial failed") {
+		t.Fatalf("expected TLS dial error, got %v", err)
+	}
+}
+
+func TestSend_FromFallback(t *testing.T) {
+	oldDial := smtpDial
+	defer func() { smtpDial = oldDial }()
+
+	smtpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, fmt.Errorf("simulated error with user fallback")
+	}
+
+	err := Send(context.Background(), config.AccountConfig{
+		User:     "fallback@x",
+		Password: "p",
+		SMTPHost: "localhost",
+		SMTPPort: 587,
+	}, OutgoingMessage{
+		To:      []string{"b@x"},
+		Subject: "Hi",
+		Body:    "Hello",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// TestSend_HeaderKeepsDisplayName verifies that a "Name <addr>" From is stripped to a
+// bare address for the MAIL FROM envelope (Gmail rejects display names there) while the
+// visible From: header still carries the display name.
+func TestSend_HeaderKeepsDisplayName(t *testing.T) {
+	server, clientConn := net.Pipe()
+
+	var mailFrom, data string
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.Write([]byte("220 localhost ESMTP\r\n"))
+		buf := make([]byte, 4096)
+
+		server.Read(buf) // EHLO
+		server.Write([]byte("250-Hello\r\n250 AUTH PLAIN\r\n"))
+
+		server.Read(buf) // AUTH PLAIN
+		server.Write([]byte("235 Authentication successful\r\n"))
+
+		n, _ := server.Read(buf) // MAIL FROM
+		mailFrom = string(buf[:n])
+		server.Write([]byte("250 OK\r\n"))
+
+		server.Read(buf) // RCPT TO
+		server.Write([]byte("250 OK\r\n"))
+
+		server.Read(buf) // DATA
+		server.Write([]byte("354 Start mail input\r\n"))
+
+		n, _ = server.Read(buf) // message content
+		data = string(buf[:n])
+		server.Write([]byte("250 OK\r\n"))
+
+		server.Close()
+	}()
+
+	oldDial := smtpDial
+	oldClient := smtpNewClient
+	defer func() {
+		smtpDial = oldDial
+		smtpNewClient = oldClient
+	}()
+	smtpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return clientConn, nil
+	}
+	smtpNewClient = func(conn net.Conn, host string) (*smtp.Client, error) {
+		return smtp.NewClient(conn, host)
+	}
+
+	err := Send(context.Background(), config.AccountConfig{
+		User:     "user",
+		Password: "pass",
+		From:     "John Doe <john@x.com>",
+		SMTPHost: "localhost",
+		SMTPPort: 587,
+	}, OutgoingMessage{
+		To:      []string{"bob@x"},
+		Subject: "Hi",
+		Body:    "Hello",
+	})
+	clientConn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	if !strings.HasPrefix(mailFrom, "MAIL FROM:<john@x.com>") {
+		t.Errorf("envelope should be the bare address, got %q", mailFrom)
+	}
+	if !strings.Contains(data, "From: John Doe <john@x.com>") {
+		t.Errorf("From: header should keep the display name, got %q", data)
+	}
+}
+
+func TestCleanEmail(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"John Doe <john@x.com>", "john@x.com"}, // strip display name for the envelope
+		{"john@x.com", "john@x.com"},
+		{"alice", "alice"},        // non-email login is accepted (server validates)
+		{"<foo@bar", ""},          // unmatched '<' is rejected, not returned malformed
+		{"  Name <a@b>  ", "a@b"}, // surrounding whitespace trimmed
+		{"", ""},
+		{"two words", ""},    // whitespace and no brackets → invalid
+		{"a@b <c@d>", "c@d"}, // angle-bracket address wins
+	}
+	for _, c := range cases {
+		if got := cleanEmail(c.in); got != c.want {
+			t.Errorf("cleanEmail(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestSendMail_MAILFROMError(t *testing.T) {
+	server, client := net.Pipe()
+
+	go func() {
+		server.Write([]byte("220 smtp.test ESMTP\r\n"))
+		buf := make([]byte, 1024)
+		server.Read(buf) // EHLO
+		server.Write([]byte("250-Hello\r\n250 AUTH PLAIN\r\n"))
+		server.Read(buf) // MAIL FROM
+		server.Write([]byte("550 Sender rejected\r\n"))
+	}()
+
+	sc, err := smtp.NewClient(client, "test.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = sendMail(sc, "bad@x", []string{"b@x"}, []byte("data"))
+	client.Close()
+	if err == nil || !strings.Contains(err.Error(), "MAIL FROM") {
+		t.Fatalf("expected MAIL FROM error, got %v", err)
+	}
+}
+
+func TestSendMail_RCPTError(t *testing.T) {
+	server, client := net.Pipe()
+
+	go func() {
+		server.Write([]byte("220 smtp.test ESMTP\r\n"))
+		buf := make([]byte, 1024)
+		server.Read(buf) // EHLO
+		server.Write([]byte("250-Hello\r\n250 AUTH PLAIN\r\n"))
+		server.Read(buf) // MAIL FROM
+		server.Write([]byte("250 OK\r\n"))
+		server.Read(buf) // RCPT TO
+		server.Write([]byte("550 No such user\r\n"))
+	}()
+
+	sc, err := smtp.NewClient(client, "test.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = sendMail(sc, "a@x", []string{"bad@x"}, []byte("data"))
+	client.Close()
+	if err == nil || !strings.Contains(err.Error(), "RCPT TO") {
+		t.Fatalf("expected RCPT TO error, got %v", err)
+	}
+}
+
+func TestSendMail_DATAError(t *testing.T) {
+	server, client := net.Pipe()
+
+	go func() {
+		server.Write([]byte("220 smtp.test ESMTP\r\n"))
+		buf := make([]byte, 1024)
+		server.Read(buf) // EHLO
+		server.Write([]byte("250-Hello\r\n250 AUTH PLAIN\r\n"))
+		server.Read(buf) // MAIL FROM
+		server.Write([]byte("250 OK\r\n"))
+		server.Read(buf) // RCPT TO
+		server.Write([]byte("250 OK\r\n"))
+		server.Read(buf) // DATA
+		server.Write([]byte("554 Transaction failed\r\n"))
+	}()
+
+	sc, err := smtp.NewClient(client, "test.local")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = sendMail(sc, "a@x", []string{"b@x"}, []byte("data"))
+	client.Close()
+	if err == nil || !strings.Contains(err.Error(), "DATA") {
+		t.Fatalf("expected DATA error, got %v", err)
+	}
+}
+
+func TestBuildRaw_WithAttachments(t *testing.T) {
+	raw := buildRaw("a@x", OutgoingMessage{
+		To:      []string{"b@x"},
+		Subject: "Files",
+		Body:    "See attached",
+		Attachments: []Attachment{
+			{Name: "hello.txt", Data: []byte("Hello, world!")},
+			{Name: "data.csv", Data: []byte("a,b,c\n1,2,3")},
+		},
+	})
+	s := string(raw)
+
+	if !strings.Contains(s, "multipart/mixed") {
+		t.Fatalf("expected multipart/mixed, got %q", s)
+	}
+	if !strings.Contains(s, "hello.txt") {
+		t.Fatal("expected attachment filename hello.txt")
+	}
+	if !strings.Contains(s, "data.csv") {
+		t.Fatal("expected attachment filename data.csv")
+	}
+	if !strings.Contains(s, "See attached") {
+		t.Fatal("expected body text")
+	}
+	// Base64 of "Hello, world!"
+	if !strings.Contains(s, "SGVsbG8sIHdvcmxkIQ==") {
+		t.Fatalf("expected base64 content, got %q", s)
+	}
+	// Boundary should be at end
+	if !strings.HasSuffix(strings.TrimSpace(s), "--") {
+		t.Fatal("expected closing boundary")
+	}
+}
+
+func TestBuildRaw_MultilineBody(t *testing.T) {
+	raw := buildRaw("a@x", OutgoingMessage{
+		To:      []string{"b@x"},
+		Subject: "Hi",
+		Body:    "Line1\n Line2\n Line3",
+	})
+	s := string(raw)
+	if !strings.Contains(s, "Line1") || !strings.Contains(s, "Line2") || !strings.Contains(s, "Line3") {
+		t.Fatalf("expected multiline body, got %q", s)
+	}
+}
+
+// The copy appended to Sent must be exactly what was delivered, or the user's
+// record of what they sent is a near-miss rather than the thing itself.
+func TestBuildRawIsStableAcrossCalls(t *testing.T) {
+	cfg := config.AccountConfig{From: "me@example.com", User: "me@example.com"}
+	msg := OutgoingMessage{
+		To:      []string{"you@example.com"},
+		Subject: "Stable bytes",
+		Body:    "hello",
+	}
+	msg.EnsureIdentity(cfg.From)
+
+	first := BuildRaw(cfg, msg)
+	second := BuildRaw(cfg, msg)
+	if string(first) != string(second) {
+		t.Fatal("BuildRaw must be deterministic once identity is stamped")
+	}
+	if len(first) == 0 {
+		t.Fatal("BuildRaw produced nothing")
+	}
+}
+
+// Without these headers an appended copy has no date and nothing to thread or
+// deduplicate on — a submission server stamps them, but our own copy is ours.
+func TestBuildRawIncludesDateAndMessageID(t *testing.T) {
+	cfg := config.AccountConfig{From: "Me <me@example.com>"}
+	msg := OutgoingMessage{To: []string{"you@example.com"}, Subject: "Headers", Body: "hi"}
+	msg.EnsureIdentity(cfg.From)
+
+	raw := string(BuildRaw(cfg, msg))
+	if !strings.Contains(raw, "Date: ") {
+		t.Fatalf("missing Date header:\n%s", raw)
+	}
+	if !strings.Contains(raw, "Message-ID: <") {
+		t.Fatalf("missing Message-ID header:\n%s", raw)
+	}
+	// The msg-id domain should come from the sender, not a placeholder.
+	if !strings.Contains(raw, "@example.com>") {
+		t.Fatalf("Message-ID should use the sender's domain:\n%s", raw)
+	}
+}
+
+// EnsureIdentity must not overwrite values a message already carries.
+func TestEnsureIdentityIsIdempotent(t *testing.T) {
+	msg := OutgoingMessage{MessageID: "<fixed@example.com>", Date: time.Unix(1700000000, 0)}
+	msg.EnsureIdentity("me@example.com")
+	if msg.MessageID != "<fixed@example.com>" {
+		t.Fatalf("MessageID = %q, want it left alone", msg.MessageID)
+	}
+	if msg.Date.Unix() != 1700000000 {
+		t.Fatalf("Date = %v, want it left alone", msg.Date)
+	}
+}
+
+// Markdown folds consecutive lines into one paragraph, which arrived in the
+// recipient's client as a single run-on signature line even though the
+// plain-text part was correct.
+func TestSignatureHTMLKeepsItsLines(t *testing.T) {
+	got := SignatureHTML("-allie\nSent with Tidemail\nhttps://github.com/allisonhere/tidemail")
+	if !strings.HasPrefix(got, "<div>") {
+		t.Fatalf("signature should be a plain block, not a paragraph with margins:\n%s", got)
+	}
+	for _, want := range []string{
+		"-- <br>",
+		"-allie<br>",
+		"Sent with Tidemail<br>",
+		"https://github.com/allisonhere/tidemail",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("signature HTML missing %q:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, "<br>"); n != 3 {
+		t.Fatalf("expected a break after the delimiter and each of the first two lines, got %d:\n%s", n, got)
+	}
+}
+
+// A signature is user text, not markup.
+func TestSignatureHTMLEscapesMarkup(t *testing.T) {
+	got := SignatureHTML("Allie <allie@example.com>\nR&D <script>alert(1)</script>")
+	for _, bad := range []string{"<allie@example.com>", "<script>"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("signature HTML left %q unescaped:\n%s", bad, got)
+		}
+	}
+	for _, want := range []string{"&lt;allie@example.com&gt;", "R&amp;D", "&lt;script&gt;"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("signature HTML missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSignatureHTMLEmptyIsNothing(t *testing.T) {
+	if got := SignatureHTML("   \n  "); got != "" {
+		t.Fatalf("blank signature produced %q", got)
+	}
+}
+
+func TestBuildRawUsesCRLFLineEndings(t *testing.T) {
+	cases := map[string]OutgoingMessage{
+		"plain":       {To: []string{"b@x"}, Subject: "s", Body: "one\ntwo\r\nthree"},
+		"alternative": {To: []string{"b@x"}, Subject: "s", Body: "one\ntwo", HTMLBody: "<p>a</p>\n<p>b</p>"},
+		"attachment":  {To: []string{"b@x"}, Subject: "s", Body: "one\ntwo", Attachments: []Attachment{{Name: "f.txt", Data: []byte("x")}}},
+		"attachment+html": {To: []string{"b@x"}, Subject: "s", Body: "one\ntwo", HTMLBody: "<p>a</p>\n<p>b</p>",
+			Attachments: []Attachment{{Name: "f.txt", Data: []byte("x")}}},
+	}
+	for name, msg := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw := string(buildRaw("a@x", msg))
+			if bare := strings.Count(raw, "\n") - strings.Count(raw, "\r\n"); bare != 0 {
+				t.Errorf("%d bare LF line endings in:\n%q", bare, raw)
+			}
+			if !strings.HasSuffix(raw, "\r\n") {
+				t.Errorf("message must end with CRLF: %q", raw[max(0, len(raw)-20):])
+			}
+			if strings.Contains(raw, "\r\r\n") {
+				t.Errorf("an existing CRLF was doubled:\n%q", raw)
+			}
+		})
+	}
+	raw := string(buildRaw("a@x", cases["plain"]))
+	if !strings.HasSuffix(raw, "one\r\ntwo\r\nthree\r\n") {
+		t.Errorf("body not normalised, got %q", raw)
+	}
+}

@@ -1,0 +1,1511 @@
+# Changelog
+Please report bugs ;)
+-allie
+
+All notable changes to TideMail are documented in this file.
+
+## Unreleased
+
+### Changed
+
+- With Unread first or Unread only on, a message marked read when you open it
+  now stays in its place while you read it. It moves to the read messages (or
+  out of the Unread only list) when you leave the reader or open another
+  message, and the cursor stays where it was, on the next unread message,
+  instead of following the read message to the bottom of the list.
+
+### Fixed
+
+- Quitting during a sync could hang forever on "Safely Quitting…". Sync all
+  queues one fetch per folder on each account's connection, and quitting had to
+  wait for every queued fetch to reconnect and run. Queued fetches now stop as
+  soon as quitting starts, and the in-flight one is cut off by closing its
+  socket rather than only expiring a deadline the IMAP library could reset.
+- Forwarding with `f` dropped the original's attachments; only Forward from the
+  command palette or the right-click menu kept them. The key now loads them the
+  same way, from the message list or the reading pane.
+- `keybindings.csv` listed `Ctrl+A` for attach file and `Ctrl+P` for paste in
+  compose; the keys are `Alt+F` and `Ctrl+V`, as Help and the guide say.
+- Replying to a sender whose name contains a comma (`Merk, Philipp <…>`) no
+  longer fails with "invalid email: mail: missing '@' or angle-addr". Reply now
+  quotes the name the way reply all does, and reply all keeps the whole name
+  instead of dropping the part before the comma (#102).
+- Claude grammar checks and summaries failed with every model Settings offered,
+  because those names (`claude-sonnet-4`, `claude-haiku`, `claude-opus-4`) aren't
+  API model IDs. Settings now offers `claude-haiku-5-5` (default),
+  `claude-sonnet-5-5`, and `claude-opus-5-5`, and a saved old name maps to the
+  model of the same tier, so no settings change is needed. **Test connection**
+  now tries the selected model, Claude replies that open with a thinking block
+  are read correctly, and a failed grammar check shows the reason (#103).
+
+## v1.9.0
+
+### Added
+
+- Expandable conversations. With conversation grouping on (`g`), a conversation
+  is one row marked `▸`; `Enter` expands it (`▾`) and shows its emails with muted
+  tree connectors. Every row previews only its own email, and delete, archive,
+  move, star and `Space` act on that email alone. `x` on a collapsed conversation
+  marks every member read (or unread); marking mail read moves to the next one.
+- Word wrapping and mouse support in the compose body. Text now wraps between
+  words instead of mid-word (turn it off in **Settings → Editor → Wrap at word
+  boundaries**, or `compose_word_wrap = false`); wrapping is visual only and never
+  changes your message. With **Mouse support** on, click to place the caret, drag to
+  select (dragging past the top or bottom scrolls), double-click to select a word,
+  and use the wheel to scroll.
+- Inline images inside terminal multiplexers such as Herdr. When the environment
+  doesn't identify a Kitty-graphics terminal, TideMail asks the terminal at
+  startup and uses Kitty graphics if it answers. `TIDEMAIL_IMAGE_PROTOCOL=kitty`
+  or `none` still forces the choice.
+- On Linux, the installer adds TideMail to your app launcher (icon and desktop
+  entry under `~/.local/share`); it opens in your default terminal.
+- **Settings → Display → Transparent background** (`transparent = true` under
+  `[display]`) lets your terminal's background opacity show through the theme
+  background. Selected rows, overlays and the other surfaces stay solid.
+
+### Changed
+
+- Every theme now has a solid background, the same color the theme picker shows.
+  Terminals such as kitty apply their background opacity to any cell whose color
+  equals the terminal's default background, and TideMail set that default to the
+  theme's own background, so with opacity configured the whole app looked
+  see-through. `vt52`'s background is now pure black, like `vt100`'s.
+- Alert colors are now fixed color pairs: green (`#70C68E` fill, `#1A5E33` text)
+  for OK, yellow (`#FCD05F` / `#AA7B18`) for warnings and red (`#DD6A6A` /
+  `#8C1A22`) for failures. Status bar pills use each pair exactly on every theme,
+  and errors in the status bar are now a red pill. Plain alert text uses the first
+  color on dark themes and the second on light ones; for that text `vt100`, `vt52`
+  and `match-omarchy` keep their own.
+- Deleting a message hides it at once, like archive and move, and keeps it hidden
+  through folder switches, searches and reloads during the six-second undo window
+  and while the server works. A refused delete, or one the server never answers
+  within 90 seconds, brings the message back with an error. The cursor stays on its
+  message unless that message was removed, so deleting a selection made elsewhere
+  no longer moves it. Mark-all-read is blocked while a read or
+  delete is pending in the same mailbox.
+  The pending state (`delete pending · ctrl+z undo`) of a delete, archive or move
+  is one yellow status bar pill that drains like a fuel gauge over the undo window
+  (the drained part swaps the two yellows; plain themes show the seconds left). While
+  the server confirms, it reads `deleting ⠋` (or `archiving`/`moving`) with a spinner,
+  then fades into the green confirmation, or into a red pill if the action failed.
+
+### Fixed
+
+- Gmail's temporary `NO System Error` reply to a move is treated as success when
+  the message has left the source folder, and TideMail no longer sends the move a
+  second time when it can't confirm that.
+- On Gmail, a deleted message no longer lingers in All Mail, Sent Mail or labels
+  (even after a restart) until those folders sync: its copies there are hidden
+  while the delete is pending and removed from the cache once Gmail confirms.
+- Search keeps the spaces you type between words; `E2E 0` used to search for
+  `E2E0`.
+- The folder path in the move, save-attachments and contact-import pickers stays
+  on one line instead of wrapping.
+- When a delete, archive or move fails and the message comes back, the cursor
+  returns to it if you haven't moved, so a retry acts on the same message rather
+  than the one that took its place.
+
+## v1.8.0
+
+### Added
+
+- Find and replace in compose. `Ctrl+F` opens Find with live match highlights and
+  a match count; `Ctrl+R` in the bar shows Replace. `Enter` in Find goes to the next
+  match, `Alt+Enter` replaces all in one undo step, `Alt+C` toggles match case and
+  `Alt+R` toggles regex (turn it on in **Settings → Editor → Advanced regex
+  search**). In vim mode, `/`, `?`, `n` and `N` search.
+
+### Changed
+
+- Support links (Settings → Support, README, release notes and the repository
+  Sponsor button) now point to GitHub Sponsors instead of Ko-fi.
+- The compose footer is a fixed three rows. The recipients/message headings are
+  gone, Esc is always first on the last row, the main shortcuts stay in place
+  when focus moves, and vim mode shows vim keys instead of Ctrl shortcuts. The Find/Replace bar
+  sits in the footer with its keys printed on each button.
+- The sign/encrypt toggles stay visible when a long status message shows, and
+  send errors stay visible while Find is open.
+
+### Fixed
+
+- Server-set status keywords such as `$HasNoAttachment` are no longer shown as
+  message tags, and tag definitions saved for them by earlier versions are removed.
+- Message-list navigation keeps the cursor within the viewport on very short
+  terminals, and resize clamps the list offset for messages and drafts.
+- Single-account compose starts in To and accepts typing immediately; multiple
+  accounts still start at the sender picker.
+- IMAP envelope subjects and address names decode legacy MIME charsets, including
+  ISO-8859-1, Windows-1252, and Shift_JIS, with or without live update callbacks.
+- Plain-text and Reddit body layout reserves its left inset before wrapping so
+  full-width lines retain their final character.
+- Adding an address that is already a contact, or importing a vCard without a
+  name, keeps the contact's saved name instead of erasing it. A new name still
+  replaces it, and editing a contact can still clear it.
+- Snoozes and stop-waiting dismissals no longer miss, or get pruned at startup
+  for, messages whose Message-ID has stray whitespace (tabs, line breaks) or
+  non-ASCII capitals. TideMail now computes the message key one way everywhere.
+
+- OAuth authentication requires TLS for IMAP and SMTP, including loopback hosts.
+  Plaintext configurations fail before connecting or refreshing credentials;
+  SMTP XOAUTH2 independently checks the actual TLS state before returning token
+  bytes. SMTP port 465 continues to use implicit TLS.
+
+- Account deletion removes its cached search-index rows in the same transaction
+  as the account, preventing orphan FTS entries and unnecessary startup rebuilds.
+- SQLite replacement connections retain foreign-key enforcement, the five-second
+  busy timeout, and WAL settings through connection DSN initialization. Database
+  filenames containing query/fragment punctuation are escaped correctly.
+
+- Reject Unicode line/paragraph separators in link destinations so LINKS rows
+  cannot activate a different URL from the one displayed. Labels stay single-line.
+- Strip bare carriage returns from parsed and rendered mail while preserving
+  CRLF line boundaries, preventing preformatted content from overwriting pane borders.
+
+- Message deletion commits the tombstone, attachment removal, search-index cleanup,
+  and message removal together; any failure rolls back all changes.
+- Threaded Needs You dismiss/restore actions are atomic. Failed undo keeps its
+  history for retry, and overlapping dismissal writes are serialized.
+
+- Recover source cleanup on a fresh connection after malformed COPYUID, without
+  repeating COPY; report partial moves if cleanup cannot be confirmed.
+- Isolate OAuth refreshes by account and discard refreshes for forgotten credentials.
+- Allow grammar-check cancellation with Esc, preserve editable text, and ignore late results.
+
+- Drafts no longer route message actions to hidden IMAP rows. Autosaves are
+  serialized, stale replies are ignored, and failed saves retain compose text.
+- Remote moves evict source cache rows instead of retaining source UIDs in the
+  destination. Filter deletes wait for server success and report failures.
+- Mark-all-read updates server flags, including uncached mail, and persists badges.
+- Incremental sync fetches bounded pages and continues without skipping backlog.
+- Actionable links reject terminal controls in text and HTML destinations.
+- Update the HTML parser dependency to address two reachable security issues.
+- SMTP uploads have a ten-minute submission budget with bounded setup. Multipart
+  messages use stable boundaries and omit a redundant nested MIME preamble.
+
+- `Ctrl+Z` no longer cancels a scheduled send or one waiting to retry; it only
+  takes back a send still in its undo delay.
+- Reading, starring, moving and deleting refuse to act when the server has
+  renumbered the mailbox since the last sync, instead of touching whichever
+  message now holds that number.
+- On servers without UIDPLUS, delete and move no longer expunge messages other
+  clients marked deleted.
+- Update downloads are no longer cut off by the 15-second request timeout; they
+  fail only after 30 seconds without data. Leftover update files are cleaned up.
+- Non-ASCII subjects and sender names are encoded properly when sending.
+- Moving onto a very large draft no longer freezes TideMail for seconds. The
+  Drafts preview shows the first 64 KB and says how much is hidden, and a
+  draft's preview is reused until the draft changes.
+
+## v1.7.1
+
+### Added
+
+- One friendly, one-time note about supporting TideMail appears after about a
+  week of use. It never repeats, and **Settings → Display → Support reminder**
+  (`support_reminder = false`) turns it off.
+- README support section and badges, and a support line in release notes.
+- Links in the reader show a readable label and their destination host, and a
+  `!` warns when a link's text names a different site than the link goes to.
+  Open-tracking pixel links are left out of the LINKS list.
+- Press `Ctrl+B` to open an HTML message in your default browser. It uses the
+  browser you configured, blocks remote content, and a second `Ctrl+B` reopens it
+  with remote images. Exported files are pruned.
+
+### Changed
+
+- The theme picker (`T`) now comes from tideui, so TideMail and Tide share one
+  implementation. Family grouping, `/` search, swatches and the live preview are
+  unchanged for you.
+- The theme collection is now 51 themes in 23 families. Shades of Purple was
+  removed upstream, so a saved `shades-of-purple` falls back to the default theme.
+- `Enter` and `o` open a link only after you deliberately select it, from the
+  LINKS list or with the keyboard. Clicking the message body never opens a link.
+- The status bar shows `N links` until you select one, then `link i/N`.
+
+### Fixed
+
+- Typing in the composer no longer lags.
+- The Drafts list refreshes live while you compose.
+- Scrolling up in the reader brings the message header back into view.
+
+## v1.7.0
+
+### Added
+
+- Recognize Thunderbird/IMAP tags, map their names and colors per account, search
+  by tag name or keyword, and add or remove tags online from the `e` editor.
+  Thunderbird-compatible choices share the existing Category controls; selecting
+  one saves its server tag, while Space toggles individual tags. Other tags and
+  AI/JEV behavior stay unchanged. Optional Tag icons in Settings use colored
+  tag-shaped glyphs with an ASCII fallback.
+- Settings → Display can hide the Needs You and Waiting on Them rows from the sidebar.
+- A new theme collection: 52 themes in 24 families, including every variant of Catppuccin, Tokyo Night, Rosé Pine, Gruvbox, Solarized, Nightfox, Kanagawa, Ayu and GitHub, plus Dracula, Nord, One Dark Pro, Everforest, Night Owl, Palenight, SynthWave '84, Shades of Purple, Oxocarbon and Cyberdream. Palettes are copied from each project's source; see [docs/themes.md](docs/themes.md) for sources and licenses. Saved theme names keep working.
+- The theme picker (`T`) groups themes by family, searches with `/`, shows a color swatch for each, and previews the highlighted theme with a sample of selection, text, link, quote and status colors.
+- Themes now supply link, quote, search-match, success, warning, tag and cursor colors, so those follow the theme.
+
+### Changed
+
+- `vt52` now uses a charcoal-black background instead of pure black.
+- Quoted text uses its theme's quote color, a category tag without its own color follows the theme's tag color, and starred rows use the warning color.
+
+### Fixed
+
+- iCloud mailboxes no longer fail to sync with `expected (, got ")"`: TideMail no
+  longer requests BODYSTRUCTURE, which iCloud sends in a form the IMAP parser
+  rejected, so one message could block a whole mailbox (#62).
+- Windows builds work again (tideui v0.3.1).
+
+## v1.6.0
+
+### Added
+
+- Message templates: `F6` in compose opens a picker with built-in templates and
+  your own files from the templates folder; `e` edits one, `n` saves the body
+  as a new one, `tidemail templates list` and `tidemail send --template NAME`.
+- A spell-check language setting (English, Spanish).
+- Plugin reports can be copied (`c`), saved (`s`) or printed (`p`).
+- An optional native password dialog (`Alt+P`) on the account form, through
+  `zenity` or `kdialog`, with the terminal field as the fallback.
+- A man page: `man tidemail`, or `tidemail man`.
+- `Ctrl+O` shows a message's complete source, fetched from the server without
+  marking it read; `c` copies it to the clipboard. Also in the command palette
+  as "View message source". Thanks @jaytaph
+
+### Fixed
+
+- Inline images no longer sometimes print their raw data as text under the screen
+  the first time they load: image uploads and screen redraws are now written to
+  the terminal one at a time.
+
+### Changed
+
+- Forwards keep attachments, and replies and forwards quote the readable text
+  of HTML mail.
+- Sending PGP mail with a missing recipient key now says which address and how
+  to fix it, and the guide, help and man page list the setup steps.
+- Waiting on Them on a new install only counts mail you send after TideMail was
+  first set up, so the first sync of old Sent mail doesn't fill the view.
+  Existing installs keep their current waits.
+- The compose footer shows `f6 templates` in every field, not only the body.
+
+## v1.5.0
+
+### Fixed
+
+- Changing or clearing an address after server discovery now clears its inferred
+  settings, so another address can be looked up in the same account form.
+- Attachment headings and rows now paint the reading pane background, including
+  on signed and encrypted messages.
+- The account form's Signature box no longer shows the terminal's own background through
+  the field, whether empty, typed in, or focused; its cursor now uses the accent colour like
+  the other rows.
+- The grammar check preview no longer runs off the bottom of the screen on a long email: it fits the
+  terminal, keeps the accept/cancel hints in view, and scrolls with the arrow keys, `PgUp`/`PgDn`,
+  and `Home`/`End`.
+
+### Added
+
+- Adding a Custom account can now look up its servers from the email address. The
+  address is now the first row of the account form (**Email**, or **Email / login** on
+  Custom) and new and edited accounts start there. Leaving it with an address (or pressing
+  `Ctrl+L`) looks the domain up: RFC 6186 SRV records first, then MX records that show the
+  domain is hosted by Google, Microsoft 365, iCloud or Yahoo (which switch the form to that
+  provider), then the Mozilla autoconfig file the domain itself publishes over HTTPS, as
+  cPanel hosts do. Only the user's own domain is asked; Thunderbird's shared database is
+  not. Results only pre-fill the form; nothing connects or saves until you test or save.
+- Plugins now receive the sender-check results the mail server recorded (SPF, DKIM and DMARC as
+  pass/fail values, plus the server's spam flag) as an `auth` field in the message metadata, never the
+  headers themselves. A new `suspicious` tag category (a warning color) is available to plugins.
+- **Browse and install plugins from inside TideMail.** In Settings → Plugins (or the
+  command palette's *Browse available plugins…*), press `b` to see the official plugins from
+  the plugins repository; `i` installs, `u` updates, `x` removes. TideMail asks first and lists
+  the plugin's permissions, downloads only from GitHub over HTTPS, checks the release's
+  SHA-256, unpacks plain files only, and never runs the plugin while installing. The plugin
+  list updates without a restart. The list is fetched only when you open it.
+- **PGP through a plugin.** Plugins can now be granted two new permissions,
+  `message_raw` (decrypt and verify mail you open) and `message_compose` (sign and
+  encrypt mail you send), with matching `message.decode` and `message.prepare`
+  methods in Plugin API v1. Press `D` on a PGP message to decrypt and verify it;
+  the result is shown in the reading pane and kept in memory only. In compose,
+  `Alt+S` signs and `Alt+E` encrypts (PGP/MIME; `F8`/`F9` also work where the terminal passes them on); the plugin runs before the message is
+  queued, so the Outbox and the Sent copy hold the protected message, and any
+  failure (no key for a recipient, cancelled passphrase) sends nothing. The
+  `pgp` plugin in the plugins repository uses your own
+  GnuPG keyring. Plugins also inherit `GNUPGHOME`, `DISPLAY`, `WAYLAND_DISPLAY`
+  and `XDG_RUNTIME_DIR` now. An encrypted message says so in the reading pane (instead of
+  "No message body.") and the key hints offer `D decrypt` while it is selected. The subject and
+  headers of encrypted mail are not encrypted, `tidemail send` does not sign or encrypt, and attachments inside
+  encrypted mail are not shown yet.
+
+- Settings → Editor → **Spell check in compose** (off by default): misspelled words are underlined
+  in the message body as you type, and `F7` steps through them with suggestions, skip, ignore, and
+  add-to-dictionary. It is English-only, works offline with no AI provider, and never checks quoted
+  or forwarded text. Your added words are saved in TideMail's database. The word you are typing is
+  not underlined until you move on, names and domains of people you correspond with are accepted,
+  and suggestions rank swapped letters, doubled letters, sound-alikes and everyday words first.
+  Settings → Editor → **Personal dictionary** lists the words you added and lets you add or remove them.
+- Experimental Windows builds (x86_64 and ARM64) are now attached to each release as zip files.
+  In-app updates and keychain storage are not available on Windows yet; passwords are stored in
+  the config file.
+
+## v1.4.0
+
+### Added
+
+- Settings → Display: an opt-in **Mouse support** toggle (off by default) adds click-to-select
+  for sidebar rows, message rows, and panes, and click-to-open for links in the reading pane, plus
+  scroll-wheel scrolling over each pane, double-click to open a message (like `Enter`), right-click
+  to select a row and open a context menu of just that row's actions (folder, account, or message),
+  and click-the-search-row to resume editing a search.
+  Leaving it off keeps the terminal's native click-drag text selection available, as before.
+- An account's color now also tints its own messages in the Unified Inbox, Needs You, Waiting on
+  Them, and Snoozed views, so accounts stay visually distinct even when a single mailbox pane
+  (and its usual header/border accent) isn't selected.
+- Settings → Changelog: read TideMail's release notes inside the app. The notes are bundled with
+  the build, so they work offline and always match the installed version.
+- Settings → About is now an animated "Ocean night" scene (twinkling stars, a crescent moon, a
+  self-drawing TIDEMAIL wordmark, and rolling waves), and Settings → Support is an animated
+  "Café" scene with the same Ko-fi Open/Copy link buttons. Plain (VT52) themes keep the original
+  static pages.
+
+### Security
+
+- Updated `golang.org/x/net` to v0.55.0 and `goldmark` to v1.7.17, fixing known vulnerabilities in
+  HTML parsing (used when finding unsubscribe links) and Markdown autolink rendering (used when
+  composing).
+
+## v1.3.1
+
+### Added
+
+- **CLI for shell scripts and AI agents**: `tidemail messages`, `draft`, `send`, and `outbox`
+  share the client's configured accounts and durable queue. Cached inbox list/search/read,
+  account and outbox metadata, Markdown and attachment support, and JSON output throughout.
+  `tidemail cli` opens a guided command menu, and `tidemail send` without `--yes` walks through
+  a step-by-step composer with an attachment browser, review, and undo. `install-skill` packages
+  a portable agent skill for Codex, Claude, Pi, and Hermes; capabilities and an
+  invocation-approval step separate reading, drafting, and sending. See the
+  [CLI reference](docs/cli.md).
+- **Settings → CLI**: switches for quitting after a send or draft, skipping the review step
+  (drafts, or sends with an undo countdown), and a default for the wizard's signature choice.
+  Scripted, JSON, and agent runs ignore all three.
+- `Up`/`Down` step through compose's From, To, Cc, Bcc, and Subject fields like
+  `Tab`/`Shift+Tab`, without wrapping from the top row into the body. The recipient suggestion
+  dropdown and the body editor keep their own Up/Down handling.
+
+### Fixed
+
+- `outbox process` now marks queued entries whose account is no longer configured as failed
+  instead of reporting them on every run. Unknown `messages`/`accounts`/`outbox` subcommands
+  name the supported ones and point to `messages search`.
+- Gmail's standard folders (Sent Mail, Drafts, and others) stay visible under their unselectable
+  server containers instead of disappearing from the sidebar.
+
+## v1.3.0
+
+### Fixed
+
+- The update checker's state (last check time, dismissed version) is kept in the database instead of
+  `config.toml`, so a config file kept in a dotfiles repo no longer changes on every update check.
+  Values from an older config are carried over once.
+
+## v1.2.0
+
+### Added
+
+- Folders are now a tree in the sidebar: nested folders (`Work/Projects`) collapse and expand
+  (`Enter`, `Space`, `←`/`→`), the choice is remembered, and a collapsed folder shows the unread
+  count of everything inside it.
+- Manage folders from the sidebar: `n` creates a folder or subfolder, `r` renames (subfolders come
+  along), `d` deletes after a confirmation that names the subfolders that go with it. The Inbox and
+  system folders are protected. `H` hides a folder from TideMail's sidebar only, "Show hidden
+  folders" in the command palette lists them again, and `Shift+K` / `Shift+J` walk a folder up or down the
+  tree: reorder siblings, move it into an open folder, or out of its parent. `>` nests it under the
+  folder above even when that folder is empty, and `<` moves it back out.
+  All are also in the command palette. A second folder rename, move or delete is refused until the
+  first finishes, so a fast repeat keypress can't fail with "Unknown source folder". Deleting a folder that contains a
+  system folder is refused, a rename or move whose subfolders would clash with existing folders is
+  refused before it reaches the server, and hiding hidden folders clears the list of a folder that
+  just disappeared.
+- Reply all (`Ctrl+R`, or "Reply all" in the command palette): To is the sender or Reply-To,
+  Cc is the other recipients minus your own addresses. Replies now also carry the full
+  `References` chain.
+
+### Fixed
+
+- Renaming or moving a folder whose name has non-ASCII characters (`Café`) now carries its
+  subfolders and their hide/order settings along. Settings follow the account's own folder
+  delimiter, a stale setting left at the new name can no longer abort the rename, and settings of
+  folders removed on the server are cleaned up.
+- Creating a folder is held back while a folder rename, move or delete is still running.
+- A timer tick that was already pending no longer fetches a manual-only account.
+- A folder rename remains visible if saving its new order fails afterward. TideMail reports the
+  order error without reverting the completed rename in the sidebar.
+- `fetch.log` is rotated to `fetch.log.1` once it passes 5 MB instead of growing forever.
+- If a folder rename or move succeeds on the server but TideMail can't record it locally, it now says
+  so and re-lists the folders instead of just reporting a failure.
+- Plugin secrets shorter than 6 characters are refused when saved, because error text from a
+  plugin is scrubbed of secret values and shorter ones could not be masked. Older shorter secrets
+  no longer reach plugin processes: they appear unset and must be re-entered.
+- Manual-only accounts (`sync_minutes = -1`) no longer fetch their inbox at launch; they still list
+  their folders once so the folder tree stays current.
+- The sidebar highlight stays on its folder when folders are added, removed or hidden above it, and
+  the reading pane clears when the open folder is removed.
+- Outgoing mail is built with CRLF line endings, so the copy saved to Sent matches the bytes sent
+  on the wire.
+- The Needs You count in the sidebar updates immediately when you delete, archive or move a message.
+- Servers with a flat folder namespace (no hierarchy delimiter) are no longer treated as having a
+  NUL delimiter.
+- The note about the status bar at the top of help is now a titled, wrapped section instead of two
+  clipped lines.
+- Long To/CC/BCC lines in compose scroll sideways to follow the cursor instead of running off the
+  edge of the field.
+- Text files attached to a message (parts marked as attachments) are now shown as attachments
+  instead of being mistaken for the message body.
+
+## v1.1.1
+
+### Added
+
+- Press `e` in the message list or reading pane to edit a message's tags and
+  classification. The command palette also offers **Edit tags / Correct classification**.
+- Show inline images in Rio through its Kitty Unicode-placeholder support.
+
+### Fixed
+
+- foot now uses labelled text placeholders for images. foot supports Sixel, but
+  TideMail's inline renderer requires Kitty Unicode placeholders.
+
+## v1.1.0
+
+**Release highlights:** experimental plugins can classify mail from message
+metadata, add local tags, and build reports without receiving message bodies.
+New Needs You, Waiting on Them, and Snoozed views help track what needs action.
+
+### Added
+
+- **NEW - Experimental plugin support. FINALLY** Install trusted plugins, run one on a
+  message, a selection, or the current list, and inspect a plain-language
+  result card. Opt in to automatic processing of newly arrived unread mail;
+  plugin settings live in Settings → Plugins, with secrets in the system
+  keychain. Plugins receive header-level metadata, never message bodies.
+- **Local annotations and attention views.** Plugin tags appear in message
+  rows and feed Needs You. Waiting on Them finds conversations awaiting a
+  reply without a plugin. Snooze hides messages or conversations until a
+  chosen time; dismiss and stop-waiting controls let you clear each view
+  without changing mail on the server.
+- **Classification controls.** Correct a plugin's needs-reply, urgency,
+  importance, or category decision locally; corrections survive plugin
+  reruns. Search for tags with `#tag`, and choose tag styles and colors in
+  Settings → Display → Appearance.
+- **Plugin reports.** Plugins with the appropriate permissions can ask
+  TideMail read-only questions about cached mail and show totals, tables,
+  charts, and heatmaps in the current theme. The Plugin API v1 documentation,
+  examples, and `plugin scaffold`, `validate`, and `test` commands are
+  available for plugin authors.
+- **Support page and batch mark-read action.** Settings → Support offers
+  TideMail's Ko-fi link, and selected messages can be marked read together.
+
+### Fixed
+
+- Table code blocks and image labels use the reading pane background.
+- About-page links stay visible at the bottom of shorter Settings panes.
+
+## v1.0.28
+
+**Release highlights:** images in HTML mail now render inline in the reading
+pane on Ghostty and Kitty, sized to fit without distortion and loaded in
+the background so moving through the list stays quick. Remote images stay
+blocked until you press `i`. Receipts keep their item and price columns, and
+newsletter cards stay together with a rule between them.
+
+### Added
+
+- Receipt tables retain item/price columns and merged-cell totals, including
+  simple receipts without semantic headers. Amounts align on the right; narrow
+  panes switch automatically to labelled records or label/value pairs.
+- Newsletter cards stay together. Each card's image, heading, description, and
+  button render as one block, and a thin rule separates neighbouring cards.
+  Side-by-side cards stack left to right, then top to bottom. Quoted and
+  forwarded mail is left as is.
+- Add an Auto/Off image selector under Settings → Display → Reading, with
+  terminal capability information. Saving applies the preference immediately.
+
+- **Real inline images in the reading pane.** On terminals with Kitty graphics
+  support (Ghostty, Kitty), images embedded in HTML mail — CID
+  parts, inline `data:` URIs, and content-location references — are now decoded
+  and drawn as raster images inside the reading pane, scaled to the pane width,
+  aspect-ratio preserved, and scrolling/clipping/reflowing with the document.
+  Remote images stay blocked until the reader presses `i` in the content pane,
+  which loads them for the current message (or the whole conversation in
+  threaded view). `[display] images = "off"` forces text placeholders
+  everywhere.
+
+  *Architecture*: a new `internal/richmail` package owns image parsing,
+  resolution (CID/data/remote), decode limits, layout, and the URL/SSRF policy;
+  `internal/termimage` owns terminal capability detection and the Kitty Unicode
+  placeholder backend; `internal/ui/rich_images.go` wires them into the existing
+  HTML pipeline. Images render by emitting Kitty Unicode placeholder cells into
+  the text, so the viewport moves them like ordinary document text rather than
+  fighting Bubble Tea for cursor control. The historic `[image: alt]`
+  placeholders remain the fallback and are unchanged on unsupported terminals.
+  MIME parsing now preserves `Content-ID`, `Content-Disposition`,
+  `Content-Location`, and inline status (`attachments` gains four
+  backwards-compatible columns). Remote fetches have a timeout, redirect cap,
+  byte cap, content-type validation, and reject loopback/private/link-local
+  hosts at both URL-parse and dial time. Decoded images are bounded by bytes,
+  dimensions, and pixel count, and are cached per message. An image-heavy
+  message is no longer mistaken for an empty HTML body.
+
+  *Known limitations*: animated GIFs show only the first frame; side-by-side
+  table-cell image rows stack vertically rather than forming a two-column grid;
+  foot and WezTerm do not display inline images.
+
+### Fixed
+
+- Inline images honour the sender's height as well as width, fitting inside
+  both without distortion, and are re-laid out when the terminal font size
+  changes instead of keeping placements sized for the old cells.
+- Moving through the message list no longer stalls on messages with loaded
+  images. Images upload in the background once the cursor settles, and
+  recently shown images stay in the terminal (up to 48 images or 64 MiB of
+  pixels), so returning to a message is instant. TideMail removes its images
+  from the terminal on exit.
+- MIME image parts now have a byte and entry cache budget, and clearing a
+  terminal image also releases its stored pixel data.
+- Remote images reuse decoded pixels after download-cache eviction. If both
+  copies have been evicted, the reader offers `i` to reload instead of staying
+  on a loading placeholder without an active fetch.
+- Absolute Content-Location references resolve from embedded MIME parts before
+  considering a remote download, including when `i` is pressed.
+- **WezTerm inline images are currently unsupported.** Use text placeholders
+  automatically: basic Kitty graphics support does not provide the Unicode
+  placeholders and virtual placements TideMail requires. Email text and
+  attachment saving still work.
+- A malformed private-use marker sequence (adjacent `U+E000`/`U+E001`) in a
+  message body can no longer panic the renderer.
+- Pressing `i` in a threaded conversation now loads remote images for every
+  message in the thread, not just the representative one, so each reply's
+  images appear.
+- Inline images that cannot be drawn — no graphics terminal, `images = "off"`,
+  plain UI, or a decode failure — stay in the attachment list and remain
+  saveable. Images that *are* drawn inline are hidden from the displayed list
+  but still included when saving attachments.
+- Remote image data is now evicted under a bounded byte/entry budget instead of
+  being retained for the life of the process.
+
+## v1.0.27
+
+### Added
+
+- **TideMail has an icon.** A white envelope inside a curling blue wave on a
+  rounded tile, saved as a 1024×1024 PNG with a transparent background
+  (`images/tidemail-icon.png`). It heads the README, and a new desktop entry
+  (`packaging/linux/tidemail.desktop`) uses it, so TideMail can appear in app
+  launchers. The `tidemail-bin` AUR package installs both, starting with the
+  first release that includes them. The guide shows how to install them by hand.
+
+### Fixed
+
+- **Background updates no longer close the window you are working in.** When a
+  sync or reload left the message view empty, the cleanup that followed also
+  closed whatever window was open, so an account form you were halfway through
+  could vanish the moment a notification appeared, taking what you had typed
+  with it. Only the in-message search bar is closed now. (#29)
+- **The account manager scrolls to the account you select.** With more
+  accounts than fit in the window (about eight on a typical screen), moving
+  down past the last visible one left the selection off screen, so the rest
+  could not be reached to edit, delete, reorder or make default. The list now
+  scrolls to keep the selected account in view. (#28)
+- **Settings uses the room a wide terminal gives it.** The Settings window was
+  capped at 62 columns however wide the terminal was, which left each control
+  about 17 columns: theme names, the View Logs hint and other values were cut
+  off with `…`, and changing the font size or display scaling did not help. It
+  now grows with the terminal, up to 96 columns, so they fit on one line. Small
+  terminals keep the same size as before. (#30)
+
+## v1.0.26
+
+## v1.0.25
+
+## v1.0.24
+
+## v1.0.23
+
+### Fixed
+
+- **A multi-line signature arrives with its lines intact.** The plain-text part
+  was always correct, but the HTML part ran the signature through the Markdown
+  renderer along with the message body, and Markdown folds consecutive lines into
+  one paragraph — so anyone whose mail client prefers HTML, which is most of
+  them, saw the whole signature run together on one line. It is now rendered as
+  its own block, with the `-- ` delimiter and a break between each line, spaced
+  to match the single blank line the plain-text part has.
+
+## v1.0.22
+
+### Changed
+
+- **The signature field takes real lines now.** It was a single-line box that
+  made you type a literal `\n` where you wanted a line break — a convention to
+  learn, and an awkward key to reach on a Nordic keyboard. It is a four-line box:
+  `Enter` starts a line, arrow keys walk them and step to the next field at the
+  top and bottom, `Tab` moves on from anywhere, and `Ctrl+S` still saves. Existing
+  signatures appear as the lines they already were.
+
+### Fixed
+
+- **Upgrading no longer duplicates every account.** A TideMail older than
+  v1.0.20 does not know about stable account IDs, so saving its settings strips
+  them from `config.toml` — which an instance left running across an upgrade will
+  do on its next save. The newer build then saw a config it did not recognise and
+  imported the whole account list again, once per restart. It now reconnects the
+  existing rows instead, keeping their cached mail, and only creates an account
+  when there is genuinely nothing to reconnect to.
+- **Adding an account after editing one no longer inherits its signature** or
+  refresh interval; the form was not clearing either.
+
+## v1.0.21
+
+### Fixed
+
+- **An AUR install is now told how to update itself.** TideMail correctly
+  refuses to overwrite a package-managed binary, but the command it offered in
+  Settings → Updates was `sudo pacman -Syu tidemail-bin`, which fails with
+  "target not found" — pacman cannot update a package it did not install from a
+  sync repo. It now offers your AUR helper (`yay -S tidemail-bin`, or paru,
+  pikaur or trizen), falling back to a `makepkg` line from the AUR when no
+  helper is installed. The README said the same wrong thing and has been
+  corrected.
+- **`U` now works whatever way TideMail was installed.** It used to be hidden
+  from the status bar for a package-managed install, and pressing it did
+  nothing, so the only route to an update was buried in Settings. The status bar
+  now offers `U update` for everyone: it installs in place where it can, and
+  otherwise opens a window explaining why it cannot, showing the command to run
+  with `C` to copy it. The update windows share one layout now, so they wrap
+  properly in a narrow terminal, and the "install target is not writable" window
+  can have its command copied too.
+
+## v1.0.20
+
+### Fixed
+
+- **Multiple accounts keep their own settings and credentials.** Accounts now
+  have stable internal IDs instead of using their editable display names as a
+  join key. Adding, renaming, or deleting an account cannot overwrite a peer,
+  attach a mailbox to the wrong server, or clear another account's keychain
+  entry. Existing configurations are backed up and migrated automatically.
+  Missing account settings now stop affected actions with a useful status
+  message, malformed configs name the file to repair, and account database
+  updates run asynchronously without blocking the interface.
+
+## v1.0.19
+
+### Fixed
+
+- **`match-omarchy` now applies and follows the real desktop palette.** TideMail
+  previously set the terminal's default foreground and background from a
+  Catppuccin placeholder, then loaded the Omarchy palette only for styled UI
+  elements. Unstyled message text could therefore keep the wrong colors until
+  the desktop theme changed. Live following could also stop after switching
+  away from and back to `match-omarchy`; each selection now starts a fresh,
+  stale-tick-safe watcher. Omarchy's explicit selection color is honored too.
+- **The Sent folder now fills in.** Opening any folder other than the inbox
+  fetches it — previously only inboxes were ever synced, so Sent, Archive and
+  every label stayed empty no matter how long you waited. Resting on a stale
+  folder refreshes it silently after a short pause; superseded refreshes are
+  cancelled so scrolling stays responsive. `Enter` fetches a folder immediately.
+  Background syncs — timers, push nudges, the startup sweep and this resting
+  refresh — no longer flash `syncing...` on the status line; only a sync you
+  start yourself (`s`, `F`, `Enter`, or the commands) shows progress.
+- **Mail you send is saved to the server's Sent folder.** TideMail delivered
+  over SMTP but never filed a copy, so on a custom domain nothing you sent
+  appeared in Sent at all. Gmail is left alone, since it files submitted mail
+  itself and a second copy would show everything twice.
+- **A first fetch of a large folder no longer fails.** Asking for a hundred
+  whole messages at once made Gmail drop the connection partway through Sent,
+  where attachments accumulate. Folders outside the inbox now start with a
+  smaller page and fill in the rest as you scroll.
+- **A sync key that cannot act now says why** instead of doing nothing, and the
+  message list advertises `s sync`.
+
+## v1.0.18
+
+## v1.0.17
+
+### Added
+
+- **`Enter` opens the link on the focus line.** In the reading pane `Enter` now
+  does what `o` does — open the focused line's link, falling back to the
+  selected content link. Reddit digest post titles are openable too, alongside
+  their `[Read post]` action, so a post opens from wherever the highlight sits.
+
+- **Scrolling through drafts shows the draft.** Moving the cursor in the Drafts
+  folder now renders the draft under it — subject, recipients, when it was last
+  saved, the body, and any attachments — instead of leaving the reading pane on
+  whatever was there before.
+
+- **TideMail is on the AUR.** Arch users can install `tidemail-bin` with
+  `paru -S tidemail-bin`, which packages the official release binary so Gmail
+  sign-in works without registering a Google app. Updates arrive through
+  `pacman -Syu`.
+
+### Fixed
+
+- **A package-managed install no longer self-updates into a second copy.** When
+  TideMail is installed by a package manager (the AUR's `tidemail-bin`, a `.deb`,
+  an `.rpm`), it can no longer write an update beside the packaged binary — that
+  left a stale copy in `~/.local/bin` shadowing the real one while `pacman`
+  reported everything up to date. Settings now shows your package manager's
+  upgrade command instead.
+
+### enjoy -allie
+
+## v1.0.16
+
+### Added
+
+- **Automatic Gmail sign-in.** Adding a Gmail account now opens Google's consent
+  page in your browser and completes the OAuth exchange on its own, instead of
+  making you copy a URL and paste a code back. `Ctrl+P` still switches to the
+  manual URL-and-paste flow, `Ctrl+O` retries after a timeout or a denial, and
+  `Esc` cancels; if no browser can be opened, the sign-in URL is shown to open
+  yourself.
+- **Scheduled send.** Composed mail can be held and delivered later from a
+  picker offering presets such as "In one hour" alongside a custom date and time
+  chosen on a calendar.
+- **An arrow marks the current message row**, so the focused message stays
+  obvious when a row's colours are hard to tell apart.
+
+### Fixed
+
+- **New mail no longer scrolls out of view at the top of the list.** When the
+  message list was already scrolled to the top, mail arriving above the focused
+  row pushed the view down with it, so the new message landed just off the top
+  edge and was never seen. The list now stays at the top in that case and the
+  arrival is visible; the selection stays on the message it was on. Scrolled
+  anywhere else in the list, the focused row still holds its screen line.
+- **OAuth tokens survive a failed write.** A refresh token that could not be
+  written to the account store was previously left only in memory, so the next
+  run silently fell back to re-authenticating. The write is now retried before
+  the token is used or refreshed again, and a persistence failure surfaces as an
+  error instead of passing quietly.
+
+## v1.0.15
+
+### Added
+
+- **Toggleable pane header bars.** The title-and-shortcut row above each pane can
+  now be turned off at **Settings → Display → Pane header bars**
+  (`display.show_pane_headers` in `config.toml`, on by default). When off, those
+  rows disappear to give content more room and the focused pane's title and
+  shortcuts move to the bottom status line; global message search still gets a
+  dedicated row above the message list while active.
+- **`--disable-google-oauth` preview flag.** A runtime-only override that clears
+  the app-level Google OAuth client, so the account manager renders the Gmail
+  App Password form that a user without a configured client sees. It never
+  rewrites saved credentials, and an existing Gmail OAuth account keeps using
+  OAuth. Outlook is untouched. See `docs/flags.md`.
+
+### Fixed
+
+- **HTML email bodies no longer lose legitimate content.** The old noise
+  stripper was aggressive enough to drop real body sections, long messages, and
+  the inner text of tables and quoted replies. Rendering now runs a conservative
+  DOM normalisation that removes only what is genuinely hidden (`display:none`,
+  `font-size:0` text with no visible descendants, `hidden` / `aria-hidden`
+  nodes), tracking pixels, and non-content elements (`script`, `style`, `head`,
+  form controls), while preserving document structure, table and quote text, and
+  message ordering at every width.
+- **Deleting several emails in a row no longer scrolls the list back to the
+  top.** The mailbox reload that follows a delete (and a background sync) now
+  keeps the focused row on the same screen line, shifting the scroll offset with
+  it, instead of resetting to the first message.
+
+## v1.0.14
+
+### Added
+
+- **`match-omarchy` theme.** For [Omarchy](https://omarchy.org) users, a theme
+  that follows the current Omarchy desktop theme: it reads the live palette from
+  `omarchy-theme-color` (falling back to
+  `~/.local/state/omarchy/current/theme/colors.toml`), remaps it onto TideMail's
+  theme, and contrast-corrects every colour to the same WCAG-style bar as the
+  built-in themes. Works for light and dark Omarchy themes, and repaints within
+  a couple of seconds when you switch your desktop theme — no restart. Falls
+  back to `catppuccin-mocha` when Omarchy isn't present. Pick it with `T` or at
+  **Settings → Display → Theme**.
+
+### Changed
+
+- **The stock theme palettes now come from the shared
+  [`tideui`](https://github.com/allisonhere/tideui) toolkit** rather than a
+  local copy (`ui.Theme` is now an alias of `tideui.Theme`), so an upstream
+  palette fix reaches TideMail on a version bump. No visible change — the 17
+  shared palettes were verified byte-identical; vt52/vt100 keep TideMail's
+  contrast-tuned accents. See `docs/tideui-migration.md`.
+
+### Fixed
+
+- **The `T` theme picker no longer spills past its border on a short
+  terminal.** The list now scrolls a fixed-height window that keeps the
+  selected row and the footer hints inside the frame.
+- **On the vt52 theme, every modal now carries its title flush in the top
+  border** (`+- tidemail · <title> --+`) instead of as a separate row below it,
+  matching the other themes.
+
+## v1.0.13
+
+No code changes — the `v1.0.13` tag re-points at the `v1.0.12` commit to correct
+release metadata.
+
+## v1.0.12
+
+### Added
+
+- **An outbox.** Press `O` to open it and inspect every outgoing message by
+  state — queued, sending, failed, sent, or uncertain. `r` retries a failed
+  message; `e` pulls an unsent one back into compose. The queue is persisted, so
+  failed and pending deliveries survive a restart.
+- **Automatic send retries.** A failed delivery is retried after one minute, up
+  to `display.send_max_attempts` total tries (default `3`; set it to `1` to
+  disable retries) — adjustable at **Settings → Editor**. A delivery interrupted
+  mid-send is marked *uncertain* rather than blindly retried, since the server
+  may already have accepted it; check Sent mail before retrying those by hand.
+
+## v1.0.11
+
+### Fixed
+
+- **Emoji in a subject no longer corrupts the content-pane title on repaint.**
+  Content and thread titles now get the same emoji-grapheme stripping the
+  message list already uses, and that stripper also catches `✌` (U+270C) and `‼`
+  (U+203C) — bare text-default symbols that some terminals draw as width-1 emoji,
+  slipping past the width-based check.
+- **The installer now removes a stale binary anywhere on `PATH`, not just the
+  first match.** `install.sh` canonicalises each `PATH` directory before
+  comparing (so a symlink, `..`, or trailing slash can't hide a stale copy or
+  endanger the fresh one), walks the whole `PATH` removing writable stale copies
+  before and after the install dir, uses `sudo rm` for a copy in a non-writable
+  dir (works under `curl … | sh`), and warns about any shadowed copy it still
+  can't remove instead of staying silent.
+
+## v1.0.10
+
+### Added
+
+- **Modal overlays now cast a soft drop shadow.** Confirm dialogs, the compose
+  window, the theme and account pickers, and every other overlay get a
+  contrast-aware shadow blended into whatever is behind them — a real
+  alpha-blend of the underlying cells, not a flat cutout, so it reads on both
+  light and dark themes. On by default; toggle it at **Settings → Display →
+  Modal drop shadow** (`display.shadow` in `config.toml`).
+
+## v1.0.9
+
+### Fixed
+
+- **A locked or unreachable system keychain no longer silently breaks stored
+  accounts.** "Is `secret-tool` installed?" is not the same as "can it read a
+  secret" — a locked gnome-keyring `login` collection (common on a box that has
+  only had SSH sessions since boot) let every stored password/token come back
+  empty, and the account then failed with a cryptic *"NO Empty username or
+  password"* or a misleading *"sign-in expired"*. TideMail now probes the
+  keychain with a bounded round-trip at startup; when it isn't usable it falls
+  back to the plaintext `config.toml` (no secrets are moved into or blanked from
+  the file), and shows one clear message: *system keychain unavailable — saved
+  passwords couldn't be loaded; unlock your login keychain, or re-enter with M*.
+  Every `secret-tool` call is now time-limited so a hung prompter can't freeze
+  startup.
+
+## v1.0.8
+
+### Fixed
+
+- **v1.0.7's auth-method migration could mis-stamp an OAuth account as
+  `password`** — e.g. if the keychain was momentarily unavailable during that
+  load, or the token was only in `config.toml`. The account then tried IMAP
+  LOGIN with an empty password ("NO Empty username or password"). The migration
+  now runs on every load and self-heals: an OAuth-capable account with a refresh
+  token (in the keychain *or* the config) and no password anywhere is treated as
+  OAuth regardless of a previous wrong stamp. A genuine app-password account
+  always has a password, so it is still never promoted. `stripSecrets` also no
+  longer wipes a token off an account it believes is password-only, so a wrong
+  classification is recoverable rather than destructive.
+
+## v1.0.7
+
+**Release highlights:** fixes a v1.0.6 regression where an app-password account
+could be silently switched to OAuth.
+
+### Fixed
+
+- **An app-password account is no longer flipped onto OAuth.** v1.0.6 decided
+  "this account uses OAuth" from the presence of a refresh token alone, so a
+  leftover keychain entry (from an earlier build, an aborted sign-in, or a
+  deleted-then-re-added account), or a stray arrow key on the account form's
+  Provider row, could route a working app-password account through XOAUTH2 and
+  break sync. The auth method is now an explicit, persisted per-account setting
+  (`auth_method = "password" | "oauth2"` in `config.toml`); OAuth is opt-in via
+  the `‹ ›` selector or a completed `Ctrl+O` sign-in. Existing accounts are
+  migrated on load — an account keeps OAuth only if it has a keychain token and
+  no password anywhere. New Gmail accounts default to App password (Outlook,
+  which has no password option, still defaults to OAuth). Deleting an account
+  now also clears its keychain secrets.
+
+## v1.0.6
+
+**Release highlights:** Gmail and Outlook can now sign in with OAuth instead of
+an app password, plus two compose-form rendering fixes.
+
+### Added
+
+- **OAuth sign-in for Gmail and Outlook.** The account form's Gmail/Outlook
+  **Auth** row is a `‹ ›` selector (App password ⇄ OAuth); the guidance shows
+  only while that row or its sub-controls are focused. Gmail is bring-your-own
+  client (`TIDEMAIL_GOOGLE_CLIENT_ID` / `_SECRET`) with a device-code flow;
+  Outlook uses Thunderbird's shared public client by default (paste-back flow)
+  or a custom `TIDEMAIL_MS_CLIENT_ID` (device-code). The **Outlook** provider
+  covers Outlook.com, Hotmail, and Microsoft 365 / Exchange Online. Both
+  authenticate IMAP and SMTP with XOAUTH2; the refresh token is stored in the
+  keychain and rotation-persisted. Revoked tokens surface a "press M to
+  re-authenticate" hint. (On-premises Exchange is unchanged — use the Custom
+  provider with a password.)
+
+### Fixed
+
+- **Installing to `~/.local/bin` now handles stale earlier binaries.** The
+  installer removes writable older `tidemail` binaries that appear earlier on
+  `PATH`, and both the installer and in-app updater show the cleanup command
+  when a privileged old binary would still run first.
+- **Compose: the sender (From) row lines up with the recipient fields.** It now
+  reads as its own control — a vertical chevron, the shared value column, and a
+  spacer below it — instead of sitting a column out from To / CC / BCC.
+- **Compose: empty To / CC / BCC / Subject fields no longer leak the terminal
+  background.** The placeholder padding on an unfocused empty field is styled
+  like the rest of the row.
+
+## v1.0.5
+
+**Release highlights:** installs now land in the user-local bin path by default,
+the in-app updater has a progress popup with restart handoff, and link cleanup
+handles another bit of Reddit tracking noise.
+
+### Added
+
+- **The in-app updater now shows install progress.** Update installs keep the
+  popup open with a progress bar, then offer a restart action once the new binary
+  is ready.
+
+### Changed
+
+- **The release installer now defaults to `~/.local/bin`.** It no longer asks for
+  `sudo` just because `/usr/local/bin` is not writable.
+- **The self-updater falls back to the user-local install path.** When the
+  current binary directory is not writable, TideMail installs the update at
+  `~/.local/bin/tidemail` and shows the manual command if automatic replacement
+  is not possible.
+
+### Fixed
+
+- **The installer verifies staged binaries before replacing an existing
+  install.** Failed downloads, bad archives, or broken staged binaries leave the
+  current `tidemail` binary untouched and remove temporary install files.
+- **SMTP reconnects no longer hang on stale post-suspend sessions.** SMTP
+  commands now use deadlines so dead connections fail and reconnect instead of
+  blocking indefinitely.
+- **Reddit links drop trailing tracking fragments like `[Read/` and `V`.** The
+  Links view no longer opens malformed Reddit URLs caused by leftover email CTA
+  text at the end of the extracted URL.
+
+## v1.0.4
+
+**Release highlights:** noisy HTML emails are easier to read in the terminal:
+Reddit digests render as compact post summaries, newsletter-style templates shed
+more boilerplate, and tracking redirects resolve to cleaner actionable links.
+
+### Fixed
+
+- **Reddit digest emails now render as compact terminal-native post summaries.**
+  TideMail extracts the subreddit, author, age, post title, excerpt, vote/comment
+  counts, and read action instead of showing the raw email-template scaffolding.
+- **Noisy newsletter-style HTML gets a cleaner fallback view.** Bulky table-heavy
+  templates with preheaders, spacer cells, and footer boilerplate now prefer
+  meaningful article text and CTA labels when the extractor can do so
+  confidently.
+- **Actionable links are cleaner for tracked email links.** Reddit click wrappers
+  and common redirect parameters such as `url=`, `u=`, `target=`, and `redirect=`
+  are normalized so the Links list points at the real destination when possible.
+
+## v1.0.3
+
+**Release highlights:** you can always tell which pane you're in now — a full
+colored border wraps the active pane, the current row actually stands out
+instead of a faint tint, and pane corners are yours to round off in Settings.
+
+### Added
+
+- **Folders are created for AI move filters.** A rule that moves mail to a folder
+  that does not exist yet now creates it, inside the account's own personal
+  namespace rather than at the server root.
+- **Pane corners are a Display setting.** Pick square (the original look) or
+  round, right below Layout density in Settings → Display.
+
+### Fixed
+
+- **Filter rules run against their own scope**, not whatever the sidebar happened
+  to have selected, so running a rule from the manager no longer depends on the
+  current view.
+- **Filter operation failures are handled atomically** — a failed toggle, delete,
+  or reorder surfaces its error and leaves the rule list untouched instead of
+  half-applied.
+- **Full-row message selection highlight** now covers the whole row.
+- **Starred rows keep their background continuity** when selected.
+
+### Changed
+
+- **Every pane always shows a full 4-sided border**, not just a single dim
+  edge — or none at all, for the Content pane. The focused pane now lights up
+  in the theme's accent color on all four sides while the other two stay
+  dim, the same treatment you'd get from a tmux or Vim split, and nothing
+  resizes as you `Tab` between panes.
+- **The focused-pane border and the current selection highlight now guarantee
+  real contrast** instead of a fixed color shift that went nearly invisible
+  on several themes. Both are checked against a contrast floor (7:1 for the
+  pane border, 3:1 for the selection background) and verified automatically
+  across all 19 built-in themes.
+- **The Go module path is now `github.com/allisonhere/tidemail`.** It previously
+  declared `github.com/allisonhere/tide`, which belongs to a separate published
+  project, so `go install github.com/allisonhere/tide@latest` fetched the wrong
+  program. Internal-only change; no effect on the binary or on installs via
+  `install.sh` or GitHub Releases.
+- `STATUS.md` rewritten to describe the current system; the June 2026 review docs
+  moved to `docs/archive/`.
+
+## v1.0.2
+
+**Release highlights:** mail history goes back further than the first 100
+messages, search matches as you type, and `sync_minutes = 0` now means push
+instead of nothing.
+
+### Added
+
+- **Older mail loads on demand.** The first sync of a mailbox only caches the
+  100 most recent messages, and nothing ever reached past that — the archive
+  simply ended, and because search only covers cached mail, it quietly limited
+  search too. Moving down past the last message now pulls the next 100 from the
+  server, repeatedly, until the mailbox is fully paged back.
+
+### Fixed
+
+- **Search matches partial words.** Search runs on every keystroke, but only
+  whole tokens matched, so results vanished mid-word and reappeared once the
+  word was finished. The final term is now a prefix match.
+- **Search combined with the unread-only toggle no longer hides results.**
+  Together they fell through to a subject-only substring filter applied on top
+  of the full-text results, dropping every message that matched on sender or
+  body.
+
+### Changed
+
+- **`sync_minutes = 0` is now push, not off.** An account set to `0` previously
+  got neither polling nor IMAP IDLE, so it refreshed only on launch or a manual
+  `s` — with nothing in the UI to say so. It now runs IDLE, delivering mail as
+  the server announces it, backed by a 30-minute safety poll for connections
+  that wedge without dropping. **Existing accounts set to `0` change behavior**
+  and will start refreshing in the background; set `-1` for the old
+  manual-only behavior.
+- **The account form's sync field is now `Refresh`**, with an inline hint for
+  all three modes, and it rejects values it cannot parse. Previously any
+  unparseable entry silently became `0`, which was harmless when `0` meant
+  "off" but now would opt an account into a persistent connection.
+
+### Fixed
+
+- **Overlapping syncs of the same mailbox are no longer started.** Launch
+  timers, the startup sweep, and IDLE nudges all target the inbox and could
+  stack up on it. The concurrent DB writes collided (`SQLITE_BUSY`), aborting
+  one sync partway through storing messages while another advanced the
+  last-synced timestamp past them — so those messages fell outside the next
+  sync window and never arrived. A manual sync of an already-syncing mailbox
+  now reports "sync already in progress" instead of doing nothing.
+
+## v1.0.1
+
+**Release highlights:** cleaner newsletter rendering and a polished in-app log
+viewer.
+
+### Fixed
+
+- **HTML newsletters render with less noise.** TideMail now hides common email
+  preheaders, spacer cells, tracking-only elements, and boilerplate-only HTML
+  before converting messages for the terminal.
+- **Image placeholders stand apart from normal message text.** Useful image alt
+  text still appears as `[image: ...]`, now with its own readable theme color in
+  rich terminal mode.
+- **The Settings log viewer no longer leaks the terminal background at the right
+  edge of log rows.** Log lines now fill the same modal width as the title and
+  command rows.
+
+### Changed
+
+- **Plain text beats boilerplate HTML.** When an HTML part only says things like
+  "View in browser," TideMail falls back to the real plain-text body while still
+  storing the original HTML.
+
+## v0.9.6
+
+**Release highlights:** correct display of non-English/legacy-encoded email, plus
+a few layout hardening fixes.
+
+### Fixed
+
+- **Emails in non-UTF-8 encodings now display correctly.** Messages in
+  ISO-8859-1, Windows-1252, Shift_JIS, and similar legacy charsets used to show
+  garbled `�` characters, and an unrecognized encoding could silently drop the
+  rest of the message. TideMail now decodes these to proper text. (Messages
+  already synced keep their earlier garbling until re-synced.)
+- **A message with attachments no longer crashes the content pane on a very
+  narrow terminal.**
+- **Long attachment filenames are truncated instead of overflowing** and pushing
+  the file-size column off-screen.
+
+### Changed
+
+- AI summary and grammar requests no longer clip a multi-byte character in half
+  when trimming long content before sending.
+
+## v0.9.5
+
+**Release highlights:** fixes a layout glitch where certain emails pushed the
+interface out of alignment.
+
+### Fixed
+
+- **Some messages no longer break the layout by wrapping or shifting the UI up a
+  line.** Emails carrying a Unicode line separator (U+2028) and related hard-break
+  characters used to render an extra line the width model couldn't see,
+  overflowing the message pane. TideMail now normalizes these to real line breaks
+  before layout, so the frame stays aligned. Reported against a newsletter from
+  ecobee.
+- **Undecodable characters no longer nudge a line out of alignment.** The
+  replacement glyph shown for bytes that fail to decode occupies a terminal cell
+  the width model counted as zero; it's now measured correctly.
+
+## v0.9.4
+
+**Release highlights:** stable message previews in terminals with color emoji,
+plus quieter starred-message styling.
+
+### Fixed
+
+- **Scrolling across emoji-heavy messages no longer leaves ghost rows or shifts
+  the message pane.** TideMail removes emoji from list-focused previews to keep
+  terminal cell widths stable, then restores the original message when you
+  enter the content pane.
+
+### Changed
+
+- **Starred messages use a subtle warm row tint instead of a star glyph.** The
+  subject column stays aligned and the cursor highlight still takes priority.
+
+## v0.9.3
+
+**Release highlights:** send cancellation, per-account signatures, sender
+selection, one-key unsubscribe, and contact suggestions in compose.
+
+### Added
+
+- **Cancel a send with `ctrl+z`.** TideMail holds outgoing mail for five seconds
+  by default. Press `ctrl+z` during that window to reopen the message. Change
+  the delay in Settings → Editor, or set it to `0` for immediate sending.
+- **Each account can use its own signature.** Set a signature in the account
+  manager. TideMail adds it when you send from that account.
+- **Choose the sender from the From row.** New messages, replies, forwards, and
+  reopened drafts share the account picker. `ctrl+u` still cycles accounts.
+- **Unsubscribe from the content pane with `ctrl+u`.** TideMail uses the standard
+  unsubscribe header when available and can fall back to a labeled unsubscribe
+  link in the message.
+- **Compose suggests more addresses.** To, CC, and BCC search saved contacts
+  first, then addresses found in synced mail.
+
+### Changed
+
+- **The account editor now groups related fields.** Account identity, incoming
+  mail, outgoing mail, credentials, sending identity, and sync settings have
+  their own sections.
+- **README and in-app help cover the new compose and message actions.**
+
+## v0.9.2
+
+**Release highlights:** undo for destructive message actions, more faithful
+HTML email rendering, and a living violet Pride DNA signature in About.
+
+### Added
+
+- **Delete, archive, and move actions can be undone.** Message actions disappear
+  immediately but wait six seconds before syncing to the server; press `ctrl+z`
+  to restore the latest pending single or bulk action.
+- **The About screen now carries a living Pride DNA signature.** A responsive
+  violet double helix hides a cinematic six-color message for curious
+  visitors to discover.
+
+### Changed
+
+- **HTML email rendering is more readable and predictable.** Newsletters,
+  semantic tables, reply quotes, calls to action, image descriptions, and wide
+  preformatted blocks retain useful structure without loading remote content.
+
+## v0.9.1
+
+**Release highlights:** server-synced message stars, starred-first sorting, and
+faster startup with immediate loading feedback and on-demand search indexing.
+
+### Added
+
+- **Messages can be starred and synced with the mail server.** Press `*` to
+  toggle IMAP `\Flagged` on the current message or selection. Press `t`, or use
+  the new Display setting, to keep starred messages and threads at the top.
+- **Initial mailbox loading now has visible progress.** The message pane shows
+  an animated loading state until the first account and message load finishes.
+
+### Changed
+
+- **Startup avoids unnecessary full-text index rebuilds.** TideMail now records
+  the FTS schema version and only rebuilds when the schema changes or the index
+  falls out of sync with the message cache.
+
+### Fixed
+
+- **Quitting no longer appears frozen on slow or wedged IMAP connections.**
+  Active operations are interrupted, account sessions close concurrently with
+  bounded network waits, and `Safely Quitting...` shimmers in the terminal
+  while the remaining database and connection cleanup completes.
+
+## v0.9.0
+
+### Changed
+
+- **Every overlay now wears the soft-panel look.** The restyle that landed for
+  Settings and the Account Manager in v0.8.0 now covers the rest of the app:
+  compose, help, the theme picker, the command palette, AI summary, the move,
+  save-attachment and filter pickers, the contact manager and all five of its
+  sub-views, and the save-draft, quit, bulk-delete and update confirms. The old
+  square chrome and shouty uppercase headers are gone — overlays are a rounded
+  border with the title in the top rule, focus and selection are a left accent
+  rail, and key hints are one quiet lowercase line.
+- **Compose shows the sender in the From row** instead of a separate header,
+  and the vim-mode indicator moved down to the footer.
+
+### Fixed
+
+- **`ctrl+e` toggles full headers in threaded view.** The threaded renderer
+  ignored the toggle, so it only worked in the non-threaded reading pane.
+
+## v0.8.0
+
+### Added
+
+- **Instant new mail via IMAP IDLE.** Accounts with `sync_minutes > 0` now hold
+  a push connection per account, so new mail syncs — and desktop-notifies — the
+  moment the server announces it instead of at the next polling tick. Interval
+  polling stays on as the fallback, and servers without IDLE quietly keep
+  polling alone. Watchers reconnect with backoff and log diagnostics to
+  `fetch.log`.
+- **Help is searchable.** Press `/` in the help overlay to filter shortcuts as
+  you type; `enter` keeps the filter while you scroll, `esc` clears it.
+
+### Changed
+
+- **Settings and the Account Manager have a new look.** The heavy accent header
+  bars are gone: overlay titles now live in a rounded border
+  (`╭─ tidemail · settings ─╮`), focus is a left accent rail, toggles read
+  `● on / ○ off`, pickers end in `‹›`, and the key hints are one quiet
+  lowercase line. Account cards are tighter (3 lines instead of 5). VT52 and
+  other ASCII terminals degrade gracefully.
+- **The Display settings section is organized into topical groups** —
+  Appearance, Terminal colors, Message list, Reading, and Behavior — instead of
+  one long list, and keyboard order follows the visual order.
+
+### Removed
+
+- **The Outlook provider preset.** Microsoft disabled password/app-password
+  IMAP sign-in for Outlook.com in 2024, so the preset could only ever produce a
+  failed login. Existing accounts saved with the Outlook preset now edit as
+  Custom with their saved servers intact.
+
+## v0.7.0
+
+### Security
+
+- **Email content can no longer hijack your terminal.** Message subjects,
+  sender names, attachment filenames, and bodies were rendered with raw
+  control bytes intact, so a crafted message could emit terminal escape
+  sequences when viewed — manipulating the clipboard (OSC 52), spoofing the
+  UI, or moving the cursor. Control bytes are now stripped from all untrusted
+  message text, both when it's stored and when it's drawn (covering escapes
+  hidden behind HTML entities such as `&#27;`).
+- **In-app updates are now integrity-checked.** Each release publishes a
+  `SHA256SUMS` file; the updater pins downloads to GitHub and verifies the
+  downloaded archive's checksum before installing, refusing to replace the
+  binary if the checksum is missing, unreachable, or doesn't match. Previously
+  the self-update trusted whatever it downloaded.
+- **Desktop notifications are hardened** against a sender or subject beginning
+  with `-` being misread as a `notify-send` option.
+
+### Fixed
+
+- **Deleting a Gmail message no longer reports a false "delete failed".** Gmail
+  returns a technically-malformed `COPYUID` response on a successful move to
+  Trash that the IMAP library rejected, so the message was moved on the server
+  but left visible locally with an error. The move is now recognized as the
+  success it is.
+
+## v0.6.3
+
+### Fixed
+
+- **Accounts no longer get stuck on the syncing spinner.** After folder
+  auto-refresh was added, a stalled server folder listing could hold an
+  account's IMAP connection open indefinitely, blocking that account's inbox
+  sync so it spun forever (other accounts kept working). IMAP operations are
+  now bounded by a timeout — a hung connection fails and is redialed instead of
+  wedging the account.
+
+## v0.6.2
+
+### Fixed
+
+- **Terminal no longer left broken after quitting.** TideMail sets the
+  terminal's default colors to match the theme and resets them on exit. That
+  reset was skipped when the program ended through an error path or `Ctrl+C`,
+  leaving the shell prompt drawn in the theme's colors (an invisible / garbled
+  prompt). Cleanup now runs on every exit path.
+- **In-app update restart no longer corrupts the terminal.** "Restart after
+  update" previously launched the new version while the old one still held the
+  terminal, so two processes fought over it. The app now quits first — letting
+  the terminal fully restore — then re-execs the freshly installed binary for a
+  clean handoff.
+
+## v0.6.1
+
+### Added
+
+- **Toggle hidden files in the file browsers.** The attach-file picker
+  (compose) and the save-attachments picker hide dotfiles by default; press
+  `.` to show hidden files and folders, and `.` again to hide them. The choice
+  persists as you navigate directories. The `.` hint now appears in each
+  browser's footer.
+
+### Fixed
+
+- The compose attach-file picker footer no longer clips its second row of key
+  hints (it reserved too few lines for the action bar).
+- Account form field navigation stops at the first and last field instead of
+  wrapping around.
+- The inbox now syncs immediately on startup rather than waiting for the first
+  timer tick.
+- Near-black terminal themes (vt100, vt52) render monochrome phosphor text and
+  a more visible selection background, and inline markdown styles set an
+  explicit foreground so text no longer falls back to the terminal default.
+
+## v0.6.0
+
+### Added
+
+- **Optional vim (modal) editing in the compose body.** Turn it on in
+  Settings → Editor (or `[display] compose_vim` in config). The message body
+  gains Normal / Insert / Visual modes with the common vim grammar:
+  - Motions: `h j k l`, `w b e`, `0 ^ $`, `gg G`, and numeric counts (e.g. `3j`);
+    arrows work too.
+  - Edits: `x`, `dd`, `yy`, `p`/`P`, `D`, `C`, `s`, and the `d`/`c`/`y` operators
+    with motions (`dw`, `cw`, `d$`, …).
+  - Visual `v` / `V`, undo/redo `u` / `ctrl+r`.
+  - A `:` command line where `:w` / `:wq` / `:x` send and `:q` (or double-`Esc`)
+    cancels.
+  - A mode indicator in the compose title and a mode-aware cursor — a block in
+    Normal/Visual, a thin bar in Insert.
+
+  Vim mode is **off by default**, so nothing changes unless you enable it. It is
+  powered by the [ripple](https://github.com/allisonhere/ripple) editor library.
+- A new **Editor** category in Settings, home to the vim toggle.
+
+### Changed
+
+- **`ctrl+p` now opens the command palette everywhere** (it previously pasted
+  inside compose). `ctrl+v` is the single paste key. In a vim compose body, `:`
+  is the editor's command line — use `ctrl+p` to open the palette there.
+- Settings reorganized: the mislabeled "Accounts" section (which only held the
+  feed max-body size — not account settings) is replaced by the new **Editor**
+  category, and the feed max-body knob moved to **Advanced**. Account details
+  are still managed in the Account Manager (`M`).
+- Replying now places the cursor at the top of the body, above the quoted text,
+  ready to type.
+
+### Internal
+
+- The compose editor library [ripple](https://github.com/allisonhere/ripple) is
+  bumped to v0.2.0, which adds the opt-in vim mode.
+
+## v0.5.2
+
+### Internal
+
+- The compose message-body editor now lives in its own published module,
+  [`github.com/allisonhere/ripple`](https://github.com/allisonhere/ripple)
+  (v0.1.0), instead of the in-tree `internal/editor` package. No user-facing
+  changes. The library adds a configurable `KeyMap`; TideMail uses the defaults.
+
+## v0.5.1
+
+### Fixed
+
+- Compose: the message-body caret no longer sticks to the top while typing a
+  reply. The stored editor was sized by width only and collapsed to a single
+  row, so freshly typed lines scrolled off the top behind the quoted message;
+  it is now sized to the same height the form renders.
+
+### Internal
+
+- The compose editor adopts the idiomatic Bubble Tea `Update(msg) (Model,
+  tea.Cmd)` signature and owns copy/cut/paste through a pluggable clipboard,
+  replacing the host-managed clipboard glue — work toward extracting it as a
+  standalone Go TUI editor library.
+
+## v0.5.0
+
+### Highlights
+
+A new, owned keyboard-first compose editor replaces the stock textarea for the
+message body, bringing real text editing to compose:
+
+- Text selection (`shift`+arrows), word selection (`ctrl+shift`+arrows), and
+  select-all (`ctrl+a`)
+- Undo / redo (`ctrl+z` / `ctrl+y`)
+- Copy / cut / paste (`ctrl+c` / `ctrl+x` / `ctrl+v`) via the system clipboard
+- Word-wise movement (`ctrl`+arrows), logical-line Home/End, and smooth soft-wrap
+
+### Changed
+
+- **Sign in with an App Password — OAuth removed.** Google accounts now
+  authenticate with an app password instead of "Sign in with Google", removing
+  the forced re-authentication every ~7 days that came with unverified OAuth
+  apps.
+  - If you used "Sign in with Google": open the Account Manager (`M`), edit your
+    Gmail account, and paste a Google **App Password** (enable 2-Step
+    Verification → myaccount.google.com/apppasswords). The account form walks
+    you through it.
+  - If you already use an app password: nothing changes.
+- **Attach file moved to `alt+f`** (freeing `ctrl+a` for select-all in the body).
+
+### Fixed
+
+- Compose body no longer spills onto the left edge of the screen when replying
+  (carriage returns and grapheme-width mismatches in quoted email).
+- Up/down arrow navigation now tracks wrapped lines instead of jumping or sticking.
+- Cut (`ctrl+x`) now copies the removed text to the clipboard, not just deletes it.
+- BCC edits are now included in compose autosave.
+
+### Internal
+
+- Removed the `golang.org/x/oauth2` dependency.

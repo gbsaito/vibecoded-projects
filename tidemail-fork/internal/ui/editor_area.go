@@ -1,0 +1,321 @@
+package ui
+
+import (
+	"github.com/allisonhere/ripple"
+	"github.com/allisonhere/tidemail/internal/clipboard"
+	"github.com/allisonhere/tidespell"
+	"github.com/allisonhere/tidespell/lang/es"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// systemClipboard adapts internal/clipboard to ripple.Clipboard so the editor
+// owns copy/cut/paste without importing the host's clipboard package directly.
+type systemClipboard struct{}
+
+func (systemClipboard) Read() (string, error)   { return clipboard.Read() }
+func (systemClipboard) Write(text string) error { return clipboard.Copy(text) }
+
+// editorClipboard is the clipboard wired into every compose editor. It is a
+// package var so tests can substitute an in-memory fake.
+var editorClipboard ripple.Clipboard = systemClipboard{}
+
+// editorVimMode, when true, starts every compose body editor in vim mode. It is
+// a package var (set once from config in NewModel) so all four compose
+// constructors pick it up through newEditorArea without threading config
+// through each. Mirrors the editorClipboard pattern.
+var editorVimMode bool
+
+var editorSearchRegex bool
+
+// editorWordWrap, when true, wraps compose text at word boundaries instead of
+// at the editor's right edge. Visual only: the message text is never changed.
+var editorWordWrap = true
+
+func setEditorWordWrap(on bool) { editorWordWrap = on }
+
+func editorWrapMode() ripple.WrapMode {
+	if editorWordWrap {
+		return ripple.WrapWord
+	}
+	return ripple.WrapCharacter
+}
+
+func setEditorSearchRegex(on bool) { editorSearchRegex = on }
+
+// setEditorVimMode sets whether new compose editors use vim modal editing.
+func setEditorVimMode(on bool) { editorVimMode = on }
+
+// editorSpell is the offline spell checker shared by every compose editor, or
+// nil when Settings → Editor → Spell check is off. editorSpellGen bumps on any
+// change that can alter results (toggle, ignore, add) so cached results are
+// recomputed. Mirrors the editorVimMode package-var pattern.
+var (
+	editorSpell    *tidespell.Checker
+	editorSpellGen int
+	// editorSpellNames are words from people's names and domains (see
+	// spellNameWords), kept so a rebuilt Checker is seeded with them again.
+	editorSpellNames []string
+)
+
+// spellLangs are the spell check languages offered in settings. The first is
+// the default, and also what an empty or unknown config value means.
+var spellLangs = []struct {
+	id, label string
+	lang      *tidespell.Language
+}{
+	{"en", "English", tidespell.English},
+	{"es", "Español", es.Language},
+}
+
+// setEditorSpell enables or disables spell checking and seeds the personal
+// dictionary. Turning it on again keeps no stale state: a fresh Checker is built.
+func setEditorSpell(on bool, lang string, personal []string) {
+	editorSpellGen++
+	if !on {
+		editorSpell = nil
+		return
+	}
+	editorSpell = tidespell.New(tidespell.WithLanguage(spellLangs[spellLangIndex(lang)].lang))
+	editorSpell.Add(personal...)
+	editorSpell.Add(editorSpellNames...)
+}
+
+// addSpellNames teaches the checker the names, addresses and domains of the
+// people the user corresponds with, so "Priya" or "Kowalski" is not flagged.
+func addSpellNames(addresses []string) {
+	words := spellNameWords(addresses)
+	if len(words) == 0 {
+		return
+	}
+	editorSpellNames = append(editorSpellNames, words...)
+	if editorSpell != nil {
+		editorSpell.Add(words...)
+		editorSpellGen++
+	}
+}
+
+// typoCache memoizes the last spell check of one editor so View, which runs
+// on every frame, only re-checks when the text or the dictionary changed.
+type typoCache struct {
+	text  string
+	gen   int
+	ok    bool
+	runes int // rune count of text
+	spans []tidespell.Span
+}
+
+// editorArea adapts ripple.Model to the subset of the Bubble Tea textarea API
+// that compose relies on (Value/SetValue/Focus/Blur/SetWidth/SetHeight/Update/
+// View), so swapping the textarea for the owned editor is a minimal diff.
+//
+// Copy/cut/paste are owned by the editor itself (wired to the system clipboard
+// via SetClipboard in newEditorArea); the host no longer intercepts those keys.
+type editorArea struct {
+	ed   ripple.Model
+	w, h int
+
+	// Styling, configurable by the consumer (e.g. from the active theme).
+	CursorStyle        lipgloss.Style
+	SelectedStyle      lipgloss.Style
+	PlaceholderStyle   lipgloss.Style
+	SearchMatchStyle   lipgloss.Style
+	SearchCurrentStyle lipgloss.Style
+	SearchControlStyle lipgloss.Style
+	SearchErrorStyle   lipgloss.Style
+	TypoStyle          lipgloss.Style // underline for misspelled words
+	typo               *typoCache
+}
+
+func newEditorArea() editorArea {
+	ed := ripple.New()
+	ed.SetClipboard(editorClipboard)
+	ed.SetRegexSearchEnabled(editorSearchRegex)
+	ed.SetWrapMode(editorWrapMode())
+	if editorVimMode {
+		ed.SetInputMode(ripple.ModeVim)
+	}
+	w, h := ed.Size()
+	return editorArea{
+		ed:                 ed,
+		w:                  w,
+		h:                  h,
+		CursorStyle:        lipgloss.NewStyle().Reverse(true),
+		SelectedStyle:      lipgloss.NewStyle().Reverse(true),
+		PlaceholderStyle:   lipgloss.NewStyle().Faint(true),
+		SearchMatchStyle:   lipgloss.NewStyle().Underline(true),
+		SearchCurrentStyle: lipgloss.NewStyle().Reverse(true),
+		SearchControlStyle: lipgloss.NewStyle().Reverse(true),
+		SearchErrorStyle:   lipgloss.NewStyle().Foreground(lipgloss.Color("#e5707c")),
+		TypoStyle:          lipgloss.NewStyle().Underline(true).Foreground(lipgloss.Color("#e5707c")),
+		typo:               &typoCache{},
+	}
+}
+
+func (e editorArea) Value() string { return e.ed.Value() }
+
+func (e *editorArea) SetValue(s string) { e.ed.SetValue(s) }
+
+func (e *editorArea) SetPlaceholder(s string) { e.ed.SetPlaceholder(s) }
+
+func (e *editorArea) Focus() { e.ed.Focus() }
+
+func (e *editorArea) Blur() { e.ed.Blur() }
+
+// SetWidth and SetHeight mirror the textarea's separate sizing calls; the
+// editor takes both at once, so each remembers its dimension and re-applies.
+func (e *editorArea) SetWidth(w int)  { e.SetSize(w, e.h) }
+func (e *editorArea) SetHeight(h int) { e.SetSize(e.w, h) }
+
+// SetSize sets width and height together so the editor's viewport is computed
+// once against both real dimensions. Unchanged dimensions do not ask Ripple
+// to recompute the document layout on every input event and render. The
+// constructor remembers Ripple's default dimensions so separate width/height
+// calls also preserve the other dimension without a temporary height-1 pass.
+func (e *editorArea) SetSize(w, h int) {
+	w, h = max(1, w), max(1, h)
+	if e.w == w && e.h == h {
+		return
+	}
+	e.w, e.h = w, h
+	e.ed.SetSize(w, h)
+}
+
+func (e editorArea) SelectedText() string { return e.ed.SelectedText() }
+
+// vimMode reports whether this editor is in vim input mode.
+func (e editorArea) vimMode() bool { return e.ed.InputMode() == ripple.ModeVim }
+
+// EnterInsert puts a vim editor into Insert mode (no-op otherwise), so focusing
+// the body lets the user type immediately and Esc returns to Normal.
+func (e *editorArea) EnterInsert() { e.ed.StartInsert() }
+
+// Mode returns the vim sub-mode label ("NORMAL", "INSERT", …) for the status
+// indicator, or "" when not in vim mode.
+func (e editorArea) Mode() string { return e.ed.Mode() }
+
+// CommandLine returns the ":" command line being typed, or "" when not active.
+func (e editorArea) CommandLine() string { return e.ed.CommandLine() }
+
+// Update forwards every message to the editor and propagates the command it
+// returns (e.g. a copy/cut clipboard write, or the read that produces a
+// ripple.PasteMsg), so clipboard side effects ride back with the model.
+func (e editorArea) Update(msg tea.Msg) (editorArea, tea.Cmd) {
+	var cmd tea.Cmd
+	e.ed.SetRegexSearchEnabled(editorSearchRegex)
+	e.ed, cmd = e.ed.Update(msg)
+	return e, cmd
+}
+
+func (e editorArea) View() string {
+	opts := ripple.Options{
+		SearchMatch:   func(s string) string { return e.SearchMatchStyle.Render(s) },
+		SearchCurrent: func(s string) string { return e.SearchCurrentStyle.Render(s) },
+		SearchControl: func(s string) string { return e.SearchControlStyle.Render(s) },
+		SearchError:   func(s string) string { return e.SearchErrorStyle.Render(s) },
+		Selected:      func(s string) string { return e.SelectedStyle.Render(s) },
+		Placeholder:   func(s string) string { return e.PlaceholderStyle.Render(s) },
+	}
+	if flags := e.typoFlags(); flags != nil {
+		opts.StyleKey = func(off int) string {
+			if off >= 0 && off < len(flags) && flags[off] {
+				return "typo"
+			}
+			return ""
+		}
+		opts.Style = func(key, s string) string {
+			// Style sees every run, including the unflagged ones (key "").
+			if key != "typo" {
+				return s
+			}
+			return e.TypoStyle.Render(s)
+		}
+	}
+	switch e.ed.Mode() {
+	case "INSERT":
+		// A thin bar marks Insert mode, distinct from the Normal block.
+		opts.Cursor = e.barCursor()
+	case "":
+		// Plain (non-vim) editing: the conventional block cursor.
+		opts.Cursor = e.CursorStyle.Render(" ")
+	default:
+		// vim Normal/Visual/Command: the caret rests on a character, so render a
+		// block that still shows the glyph underneath.
+		opts.CursorRune = func(s string) string { return e.CursorStyle.Render(s) }
+	}
+	return e.ed.View(opts)
+}
+
+// barCursor renders a thin vertical bar for Insert mode by reusing the block
+// cursor's colors swapped — a foreground bar on the body background, versus the
+// Normal block's filled cell.
+func (e editorArea) barCursor() string {
+	return lipgloss.NewStyle().
+		Foreground(e.CursorStyle.GetBackground()).
+		Background(e.CursorStyle.GetForeground()).
+		Render("▏")
+}
+
+// Misspellings returns the misspelled words in what the user wrote (the quoted
+// or forwarded original is never checked), or nil when spell check is off.
+func (e editorArea) Misspellings() []tidespell.Span {
+	e.refreshTypos()
+	if e.typo == nil {
+		return nil
+	}
+	return e.typo.spans
+}
+
+// typoFlags is a per-rune "is part of a misspelling" lookup for underlining,
+// or nil when there is nothing to underline. The word the caret is in or just
+// after is left alone: it is most likely still being typed, and underlining
+// "recie" halfway through "receive" is noise. Misspellings (used by the F7
+// panel) still lists it.
+func (e editorArea) typoFlags() []bool {
+	e.refreshTypos()
+	if e.typo == nil || len(e.typo.spans) == 0 {
+		return nil
+	}
+	caret := e.ed.CursorIndex()
+	var flags []bool
+	for _, sp := range e.typo.spans {
+		if sp.Start <= caret && caret <= sp.End {
+			continue
+		}
+		if flags == nil {
+			flags = make([]bool, e.typo.runes)
+		}
+		for i := sp.Start; i < sp.End && i < len(flags); i++ {
+			flags[i] = true
+		}
+	}
+	return flags
+}
+
+func (e editorArea) refreshTypos() {
+	if editorSpell == nil || e.typo == nil {
+		if e.typo != nil {
+			*e.typo = typoCache{}
+		}
+		return
+	}
+	text := e.Value()
+	if e.typo.ok && e.typo.text == text && e.typo.gen == editorSpellGen {
+		return
+	}
+	reply, _ := splitReplyAndQuote(text)
+	*e.typo = typoCache{
+		text: text, gen: editorSpellGen, ok: true,
+		runes: len([]rune(text)), spans: editorSpell.Check(reply),
+	}
+}
+
+// ReplaceSpan swaps one misspelled word for text as a single undo step.
+func (e *editorArea) ReplaceSpan(sp tidespell.Span, text string) {
+	e.ed.ReplaceRange(sp.Start, sp.End, text)
+}
+
+// InsertText inserts s at the caret as a single undo step.
+func (e *editorArea) InsertText(s string) {
+	e.ed.InsertString(s)
+}

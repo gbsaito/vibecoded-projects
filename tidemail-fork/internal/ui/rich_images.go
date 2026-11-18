@@ -1,0 +1,1230 @@
+package ui
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/PuerkitoBio/goquery"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/allisonhere/tidemail/internal/richmail"
+	"github.com/allisonhere/tidemail/internal/termimage"
+)
+
+// Image markers are private-use runes embedded by the HTML->markdown rule and
+// replaced with either raster placeholder rows or a fallback text block once
+// the finished body is known. They survive glamour and ANSI stripping, unlike
+// control characters.
+const (
+	imageMarkerOpen  = '\uE000'
+	imageMarkerClose = '\uE001'
+	imageMarkerImage = 'I'
+	imageMarkerBlock = 'B'
+	imageMarkerLoad  = 'L'
+)
+
+// placeholderRune mirrors termimage's placeholder so this package can detect
+// and strip placeholder cells without importing internals.
+const placeholderRune = '\U0010EEEE'
+
+// renderImage is one image actually placed in the reading pane, carried from the
+// body render to the terminal upload step. Only identity strings are retained,
+// never the source bytes, so a data URI cannot keep its payload alive through
+// the viewport cache once decoding has happened.
+type renderImage struct {
+	id        uint32
+	messageID int64
+	sourceCID string
+	sourceLoc string
+	image     *richmail.Decoded
+	placement richmail.Placement
+	label     string
+	link      string
+}
+
+// imagePlan is the per-image decision made before markdown conversion.
+type imagePlan struct {
+	image    richmail.Image
+	resolved richmail.Resolved
+	id       uint32
+	place    richmail.Placement
+	label    string
+	emit     bool
+	blocked  bool
+	loading  bool
+}
+
+// remoteEntry memoises one remote fetch.
+type remoteEntry struct {
+	data  []byte
+	ctype string
+	err   error
+	done  bool
+}
+
+// imageRenderContext is the per-message state handed to the HTML renderer.
+type imageRenderContext struct {
+	store       *uiImageStore
+	messageID   int64
+	allowRemote bool
+	availCols   int
+	cellGeom    richmail.CellGeometry
+	parts       *richmail.PartStore
+}
+
+// uiImageStore owns the terminal graphics backend and every cache that keeps
+// image-heavy mail cheap to redraw. It is shared by pointer across the value
+// copies Bubble Tea makes of Model.
+type uiImageStore struct {
+	backend    termimage.Backend
+	limits     richmail.Limits
+	remoteOpts richmail.RemoteOptions
+	ids        *termimage.IDAllocator
+	enabled    bool
+
+	mu          sync.Mutex
+	partStores  map[int64]*richmail.PartStore
+	partOrder   []int64
+	partBytes   int
+	decoded     map[string]*richmail.Decoded
+	remote      map[string]*remoteEntry
+	remoteOrder []string
+	remoteBytes int
+	pending     map[string]bool
+	allowed     map[int64]bool
+	idFor       map[string]uint32
+	activeIDs   []uint32
+	activeKey   string
+	generation  uint64
+
+	// Uploads are encoded off the event loop after the cursor settles.
+	// uploadSeq identifies the current image set; results for an older set
+	// are discarded. queued holds images waiting for takeUploadCmd.
+	uploadSeq uint64
+	queued    []renderImage
+	debounce  time.Duration
+
+	// resident tracks images the terminal still holds, so returning to a
+	// message reuses them instead of re-encoding and re-sending.
+	resident      map[uint32]*residentImage
+	residentBytes int
+	useSeq        uint64
+
+	// cell is the terminal's current cell size in pixels. It is re-read on
+	// every resize because changing the font size keeps the protocol but
+	// changes the pixels per cell. detectGeometry is swapped out by tests.
+	cell           richmail.CellGeometry
+	detectGeometry func() richmail.CellGeometry
+	tty            *os.File
+	// sink, when non-nil, receives terminal escape bytes instead of /dev/tty.
+	// Tests set it to assert uploads without touching a real terminal.
+	sink func([]byte)
+}
+
+// imageUploadDebounce lets the cursor settle before any image is encoded, so
+// holding j/k over image-heavy mail never waits on uploads it would discard.
+const imageUploadDebounce = 90 * time.Millisecond
+
+// Terminal-resident images are bounded by count and by decoded RGBA size,
+// which is what the terminal itself keeps in memory.
+const maxResidentImages = 48
+const maxResidentBytes = 64 << 20
+
+// residentImage is one image held by the terminal.
+type residentImage struct {
+	geometry string
+	bytes    int
+	lastUse  uint64
+}
+
+// imageUpload is one encoded image ready to write to the terminal.
+type imageUpload struct {
+	id       uint32
+	geometry string
+	bytes    int
+	data     []byte
+}
+
+// imageUploadMsg carries encoded images back to the event loop, which alone
+// writes to the terminal.
+type imageUploadMsg struct {
+	seq     uint64
+	uploads []imageUpload
+}
+
+// maxDecodedCacheEntries bounds decoded-image memory across a large mailbox.
+const maxDecodedCacheEntries = 128
+
+// Bound both large MIME payloads and empty indexes. Oversized stores remain
+// usable by the current render but are not retained in the cache.
+const maxPartCacheBytes = 32 << 20
+const maxPartCacheEntries = 64
+
+// maxRemoteCacheBytes bounds the bytes of remote image data retained for
+// redraws. Remote payloads are capped at 8 MiB each, so an entry count alone
+// would still allow hundreds of megabytes; eviction is by byte budget in
+// insertion order.
+const maxRemoteCacheBytes = 32 << 20
+
+// maxRemoteCacheEntries bounds the remote map when payloads are tiny or fail
+// (a failed fetch stores an error entry with no bytes).
+const maxRemoteCacheEntries = 256
+
+func newUIImageStore(imagesSetting string) *uiImageStore {
+	caps := termimage.DetectFromEnv()
+	return &uiImageStore{
+		backend:    termimage.New(caps),
+		limits:     richmail.DefaultLimits(),
+		remoteOpts: richmail.DefaultRemoteOptions(),
+		ids:        termimage.NewIDAllocator(),
+		enabled:    !strings.EqualFold(strings.TrimSpace(imagesSetting), "off"),
+		partStores: map[int64]*richmail.PartStore{},
+		decoded:    map[string]*richmail.Decoded{},
+		remote:     map[string]*remoteEntry{},
+		pending:    map[string]bool{},
+		allowed:    map[int64]bool{},
+		idFor:      map[string]uint32{},
+		debounce:   imageUploadDebounce,
+		resident:   map[uint32]*residentImage{},
+
+		cell:           caps.Cell,
+		detectGeometry: termimage.DetectGeometry,
+	}
+}
+
+// refreshGeometry re-reads the terminal's cell size. When it changed, every
+// terminal image is released, since its placement was sized in the old cells,
+// and the generation moves so bodies re-render. A terminal that reports no
+// pixel size keeps the last valid geometry. It reports whether anything
+// changed.
+func (s *uiImageStore) refreshGeometry() bool {
+	if !s.graphics() || s.detectGeometry == nil {
+		return false
+	}
+	geom := s.detectGeometry()
+	if geom.CellWidthPx <= 0 || geom.CellHeightPx <= 0 {
+		return false
+	}
+	s.mu.Lock()
+	same := math.Abs(geom.CellWidthPx-s.cell.CellWidthPx) < 0.01 &&
+		math.Abs(geom.CellHeightPx-s.cell.CellHeightPx) < 0.01
+	s.mu.Unlock()
+	if same {
+		return false
+	}
+	s.clearImages()
+	s.mu.Lock()
+	s.cell = geom
+	s.generation++
+	s.mu.Unlock()
+	return true
+}
+
+func (s *uiImageStore) cellGeometry() richmail.CellGeometry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cell
+}
+
+// graphics returns whether real raster images can be placed.
+func (s *uiImageStore) graphics() bool {
+	return s != nil && s.enabled && s.backend.Capabilities().GraphicsEnabled()
+}
+
+// applyImageSetting commits the saved preference without discarding consent.
+func (m *Model) applyImageSetting() {
+	if m.images == nil {
+		m.images = newUIImageStore(m.cfg.Display.Images)
+	}
+	enabled := !strings.EqualFold(strings.TrimSpace(m.cfg.Display.Images), "off")
+	if m.images.enabled == enabled {
+		return
+	}
+	// Delete while graphics are still enabled, before clearImages becomes a no-op.
+	m.images.clearImages()
+	m.images.enabled = enabled
+	m.images.bumpGeneration()
+	m.bodyCache.clear()
+	m.viewportCache.clear()
+}
+
+// isAllowed reports whether the reader has consented to remote images for one
+// message.
+func (s *uiImageStore) isAllowed(messageID int64) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.allowed[messageID]
+}
+
+func (s *uiImageStore) allow(messageID int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.allowed[messageID] = true
+	s.generation++
+	s.mu.Unlock()
+}
+
+// bumpGeneration invalidates render cache keys after the image state changes.
+func (s *uiImageStore) bumpGeneration() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.generation++
+	s.mu.Unlock()
+}
+
+func (s *uiImageStore) gen() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.generation
+}
+
+// partsFor returns a MIME part index, reloading it after cache eviction.
+func (s *uiImageStore) partsFor(messageID int64, load func() []richmail.Part) *richmail.PartStore {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if store, ok := s.partStores[messageID]; ok {
+		s.mu.Unlock()
+		return store
+	}
+	s.mu.Unlock()
+
+	store := richmail.NewPartStore(load())
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Another caller may have loaded this message while the lock was released.
+	if cached, ok := s.partStores[messageID]; ok {
+		return cached
+	}
+	if store.ByteSize() > maxPartCacheBytes {
+		return store
+	}
+	for len(s.partOrder) > 0 && (len(s.partStores) >= maxPartCacheEntries || s.partBytes+store.ByteSize() > maxPartCacheBytes) {
+		oldest := s.partOrder[0]
+		s.partOrder = s.partOrder[1:]
+		s.partBytes -= s.partStores[oldest].ByteSize()
+		delete(s.partStores, oldest)
+	}
+	s.partStores[messageID] = store
+	s.partOrder = append(s.partOrder, messageID)
+	s.partBytes += store.ByteSize()
+	return store
+}
+
+// decodeCacheKey is the identity under which decoded bytes are reused. It mixes
+// the message so two messages sharing a Content-ID never share pixels.
+func decodeCacheKey(messageID int64, im richmail.Image) string {
+	switch im.Source.Kind {
+	case richmail.SourceCID:
+		return fmt.Sprintf("%d:cid:%s", messageID, richmail.CIDKey(im.Source.CID))
+	case richmail.SourceData:
+		return fmt.Sprintf("%d:data:%d:%d", messageID, im.Index, len(im.Source.Data))
+	default:
+		return fmt.Sprintf("%d:raw:%d:%s", messageID, im.Index, im.Source.Raw)
+	}
+}
+
+func (s *uiImageStore) cachedDecode(key string) (*richmail.Decoded, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.decoded[key]
+	return d, ok
+}
+
+func (s *uiImageStore) storeDecode(key string, d *richmail.Decoded) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.decoded) >= maxDecodedCacheEntries {
+		// Cheap deterministic eviction: drop one arbitrary entry. The cache is
+		// a redraw optimisation, not a correctness requirement.
+		for k := range s.decoded {
+			delete(s.decoded, k)
+			break
+		}
+	}
+	s.decoded[key] = d
+}
+
+// remoteResult returns the fetch outcome for a URL.
+func (s *uiImageStore) remoteResult(url string) (*remoteEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.remote[url]
+	return e, ok
+}
+
+// recordRemote stores one fetch outcome, evicting the oldest entries until the
+// cache fits its byte and entry budgets. Every production path (including the
+// async result handler) must go through here; writing s.remote directly leaks
+// downloaded bytes for the life of the process.
+func (s *uiImageStore) recordRemote(url string, e *remoteEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pending, url)
+	if old, ok := s.remote[url]; ok {
+		s.remoteBytes -= len(old.data)
+		delete(s.remote, url)
+		for i, key := range s.remoteOrder {
+			if key == url {
+				s.remoteOrder = append(s.remoteOrder[:i], s.remoteOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	s.remote[url] = e
+	s.remoteOrder = append(s.remoteOrder, url)
+	s.remoteBytes += len(e.data)
+
+	for len(s.remoteOrder) > 0 &&
+		(s.remoteBytes > maxRemoteCacheBytes || len(s.remoteOrder) > maxRemoteCacheEntries) {
+		oldest := s.remoteOrder[0]
+		s.remoteOrder = s.remoteOrder[1:]
+		if victim, ok := s.remote[oldest]; ok {
+			s.remoteBytes -= len(victim.data)
+			delete(s.remote, oldest)
+		}
+	}
+	s.generation++
+}
+
+// allocateID returns a stable image id for a message/image pair, allocating on
+// first use so re-renders address the same terminal image.
+func (s *uiImageStore) allocateID(messageID int64, index int) uint32 {
+	key := fmt.Sprintf("%d:%d", messageID, index)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id, ok := s.idFor[key]; ok {
+		return id
+	}
+	id := s.ids.Next()
+	s.idFor[key] = id
+	return id
+}
+
+// imageSetKey identifies a set of images so identical redraws do not re-upload.
+func (s *uiImageStore) imageSetKey(images []renderImage) string {
+	if len(images) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, im := range images {
+		fmt.Fprintf(&b, "%d:%d:%d;", im.id, im.placement.Cols, im.placement.Rows)
+	}
+	return b.String()
+}
+
+func uploadGeometry(im renderImage) string {
+	p := im.placement
+	return fmt.Sprintf("%d:%d:%d:%d", p.Cols, p.Rows, p.PixelWidth, p.PixelHeight)
+}
+
+// applyImages makes images the current view's set. Images the terminal
+// already holds at the same geometry are reused; the rest are queued for a
+// debounced background upload collected by takeUploadCmd. Nothing is encoded
+// or written here, so moving the cursor never blocks on image data.
+func (s *uiImageStore) applyImages(images []renderImage) {
+	if !s.graphics() {
+		return
+	}
+	key := s.imageSetKey(images)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if key == s.activeKey {
+		return
+	}
+	s.activeKey = key
+	s.activeIDs = nil
+	s.queued = nil
+	s.uploadSeq++
+	for _, im := range images {
+		if im.image == nil {
+			continue
+		}
+		s.activeIDs = append(s.activeIDs, im.id)
+		if r, ok := s.resident[im.id]; ok && r.geometry == uploadGeometry(im) {
+			s.useSeq++
+			r.lastUse = s.useSeq
+			continue
+		}
+		s.queued = append(s.queued, im)
+	}
+}
+
+// takeUploadCmd returns a command that waits for the cursor to settle, then
+// encodes the queued images off the event loop. It returns nil when nothing
+// is queued. A newer image set makes the command give up early.
+func (s *uiImageStore) takeUploadCmd() tea.Cmd {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	images, seq, delay := s.queued, s.uploadSeq, s.debounce
+	s.queued = nil
+	s.mu.Unlock()
+	if len(images) == 0 {
+		return nil
+	}
+	backend := s.backend
+	return func() tea.Msg {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		uploads := make([]imageUpload, 0, len(images))
+		for _, im := range images {
+			if !s.uploadCurrent(seq) {
+				return nil
+			}
+			p := im.placement
+			data, ok := backend.Transmit(im.id, im.image.Image, p.Cols, p.Rows, p.PixelWidth, p.PixelHeight)
+			if !ok {
+				continue
+			}
+			uploads = append(uploads, imageUpload{
+				id:       im.id,
+				geometry: uploadGeometry(im),
+				bytes:    max(1, p.PixelWidth) * max(1, p.PixelHeight) * 4,
+				data:     data,
+			})
+		}
+		return imageUploadMsg{seq: seq, uploads: uploads}
+	}
+}
+
+func (s *uiImageStore) uploadCurrent(seq uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return seq == s.uploadSeq
+}
+
+// applyUploads writes encoded images for the current set to the terminal and
+// evicts the least recently used images beyond the resident budget.
+func (s *uiImageStore) applyUploads(msg imageUploadMsg) {
+	if !s.graphics() {
+		return
+	}
+	var buf bytes.Buffer
+	s.mu.Lock()
+	if msg.seq != s.uploadSeq {
+		s.mu.Unlock()
+		return
+	}
+	for _, up := range msg.uploads {
+		if old, ok := s.resident[up.id]; ok {
+			s.residentBytes -= old.bytes
+		}
+		s.useSeq++
+		s.resident[up.id] = &residentImage{geometry: up.geometry, bytes: up.bytes, lastUse: s.useSeq}
+		s.residentBytes += up.bytes
+		buf.Write(up.data)
+	}
+	for _, id := range s.evictResidentLocked() {
+		buf.Write(s.backend.Delete(id))
+	}
+	s.mu.Unlock()
+	s.writeTTY(buf.Bytes())
+}
+
+// evictResidentLocked drops least recently used images, never the ones on
+// screen, until the resident set fits its budget.
+func (s *uiImageStore) evictResidentLocked() []uint32 {
+	var evicted []uint32
+	for len(s.resident) > maxResidentImages || s.residentBytes > maxResidentBytes {
+		var victim uint32
+		var oldest uint64
+		for id, r := range s.resident {
+			if slices.Contains(s.activeIDs, id) {
+				continue
+			}
+			if victim == 0 || r.lastUse < oldest {
+				victim, oldest = id, r.lastUse
+			}
+		}
+		if victim == 0 {
+			break
+		}
+		s.residentBytes -= s.resident[victim].bytes
+		delete(s.resident, victim)
+		evicted = append(evicted, victim)
+	}
+	return evicted
+}
+
+// deactivateImages marks that no images are on screen and cancels pending
+// uploads. Resident images stay in the terminal for a quick return.
+func (s *uiImageStore) deactivateImages() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activeIDs = nil
+	s.activeKey = ""
+	s.queued = nil
+	s.uploadSeq++
+}
+
+// clearImages removes every transmitted image from the terminal.
+func (s *uiImageStore) clearImages() {
+	if !s.graphics() {
+		return
+	}
+	s.mu.Lock()
+	ids := make([]uint32, 0, len(s.resident))
+	for id := range s.resident {
+		ids = append(ids, id)
+	}
+	s.resident = map[uint32]*residentImage{}
+	s.residentBytes = 0
+	s.activeIDs = nil
+	s.activeKey = ""
+	s.queued = nil
+	s.uploadSeq++
+	s.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	var buf bytes.Buffer
+	for _, id := range ids {
+		buf.Write(s.backend.Delete(id))
+	}
+	s.writeTTY(buf.Bytes())
+}
+
+// writeTTY writes an escape sequence straight to the controlling terminal.
+// The write holds termMu, the same lock Bubble Tea's stdout is wrapped in
+// (SerializedStdout), so the APC upload cannot be interleaved with a frame.
+func (s *uiImageStore) writeTTY(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sink != nil {
+		s.sink(data)
+		return
+	}
+	if s.tty == nil {
+		f, err := openTTY()
+		if err != nil {
+			return
+		}
+		s.tty = f
+	}
+	_, _ = writeLocked(s.tty, data)
+}
+
+// imageContext builds the per-message rendering context, or nil when raster
+// rendering is disabled or unsupported so the fallback path is used verbatim.
+func (m Model) imageContext(msg db.Message, width int) *imageRenderContext {
+	if m.images == nil || !m.images.graphics() {
+		return nil
+	}
+	// The retro/plain UI promises no escape sequences beyond plain text, so it
+	// always takes the text-placeholder path.
+	if m.styles.PlainUI {
+		return nil
+	}
+	// Text-only mail never touches the attachment store or the image caches.
+	if strings.TrimSpace(msg.BodyHTML) == "" {
+		return nil
+	}
+	messageID := msg.ID
+	store := m.images
+	var parts *richmail.PartStore
+	if !msg.HasAttachment {
+		// No MIME parts means no CID/data resolution is possible, so skip the
+		// database lookup entirely for the common text-only newsletter shell.
+		parts = richmail.NewPartStore(nil)
+	} else {
+		parts = store.partsFor(messageID, func() []richmail.Part {
+			if m.db == nil || messageID == 0 {
+				return nil
+			}
+			atts, err := m.db.GetImageParts(messageID)
+			if err != nil {
+				return nil
+			}
+			out := make([]richmail.Part, 0, len(atts))
+			for _, a := range atts {
+				out = append(out, richmail.Part{
+					ContentID:       a.ContentID,
+					ContentLocation: a.ContentLocation,
+					ContentType:     a.ContentType,
+					Data:            a.Data,
+				})
+			}
+			return out
+		})
+	}
+	return &imageRenderContext{
+		store:       store,
+		messageID:   messageID,
+		allowRemote: store.isAllowed(messageID),
+		availCols:   width,
+		cellGeom:    store.cellGeometry(),
+		parts:       parts,
+	}
+}
+
+// buildImagePlans resolves and lays out every image in a manifest. Images that
+// cannot be shown are simply absent from the map, so the markdown rule falls
+// back to the historic alt-text placeholder.
+func buildImagePlans(manifest *richmail.Manifest, ictx *imageRenderContext) map[int]imagePlan {
+	plans := map[int]imagePlan{}
+	if manifest == nil || ictx == nil {
+		return plans
+	}
+	for _, im := range manifest.Images {
+		if im.Tracking {
+			continue
+		}
+		plan := imagePlan{image: im, label: im.Label()}
+
+		switch im.Source.Kind {
+		case richmail.SourceRemote:
+			if ictx.parts.HasLocation(im.Source.Raw) {
+				plan = planEmbeddedImage(im, ictx, plan)
+			} else {
+				plan = planRemoteImage(im, ictx, plan)
+			}
+		case richmail.SourceCID, richmail.SourceData, richmail.SourceUnknown:
+			plan = planEmbeddedImage(im, ictx, plan)
+		default:
+			continue
+		}
+
+		if plan.emit || plan.blocked || plan.loading {
+			plans[im.Index] = plan
+		}
+	}
+	return plans
+}
+
+func planEmbeddedImage(im richmail.Image, ictx *imageRenderContext, plan imagePlan) imagePlan {
+	key := decodeCacheKey(ictx.messageID, im)
+	if d, ok := ictx.store.cachedDecode(key); ok {
+		plan.resolved = richmail.Resolved{Status: richmail.ResolveOK, Decoded: d}
+	} else {
+		plan.resolved = richmail.ResolveEmbedded(im, ictx.parts, ictx.store.limits)
+		if plan.resolved.Status == richmail.ResolveOK && plan.resolved.Decoded != nil {
+			ictx.store.storeDecode(key, plan.resolved.Decoded)
+		}
+	}
+	if plan.resolved.Status != richmail.ResolveOK || plan.resolved.Decoded == nil {
+		return plan
+	}
+	return finalizeImagePlan(im, ictx, plan, plan.resolved.Decoded)
+}
+
+func planRemoteImage(im richmail.Image, ictx *imageRenderContext, plan imagePlan) imagePlan {
+	if im.Decorative && !hasLargeHint(im) {
+		return plan
+	}
+	if !ictx.allowRemote {
+		plan.blocked = true
+		return plan
+	}
+	key := "remote:" + im.Source.URL
+	if d, ok := ictx.store.cachedDecode(key); ok {
+		plan.resolved = richmail.Resolved{Status: richmail.ResolveOK, Decoded: d}
+		return finalizeImagePlan(im, ictx, plan, d)
+	}
+	ictx.store.mu.Lock()
+	pending := ictx.store.pending[im.Source.URL]
+	ictx.store.mu.Unlock()
+	if pending {
+		plan.loading = true
+		return plan
+	}
+	entry, ok := ictx.store.remoteResult(im.Source.URL)
+	if !ok || !entry.done || entry.err != nil {
+		// An evicted result has no fetch running. Offer an explicit reload
+		// instead of leaving the reader waiting on a permanent spinner.
+		plan.blocked = true
+		return plan
+	}
+	plan.resolved = richmail.DecodeRemote(entry.data, ictx.store.limits)
+	if plan.resolved.Status != richmail.ResolveOK || plan.resolved.Decoded == nil {
+		return plan
+	}
+	ictx.store.storeDecode(key, plan.resolved.Decoded)
+	return finalizeImagePlan(im, ictx, plan, plan.resolved.Decoded)
+}
+
+// finalizeImagePlan decides whether a decoded image earns space in the pane and
+// computes its cell rectangle.
+func finalizeImagePlan(im richmail.Image, ictx *imageRenderContext, plan imagePlan, decoded *richmail.Decoded) imagePlan {
+	if im.Decorative && !largeDecoded(decoded) {
+		return plan
+	}
+	place, ok := richmail.Layout(richmail.Intrinsic{
+		PixelWidth:  decoded.Width,
+		PixelHeight: decoded.Height,
+		HintWidth:   im.HintWidth,
+		HintHeight:  im.HintHeight,
+		MaxWidth:    im.MaxWidth,
+		Align:       im.Align,
+	}, ictx.availCols, ictx.cellGeom)
+	if !ok {
+		return plan
+	}
+	plan.id = ictx.store.allocateID(ictx.messageID, im.Index)
+	plan.place = place
+	plan.emit = true
+	return plan
+}
+
+// largeDecoded reports whether a decoded image is large enough to be content
+// even if its alt text marked it as chrome.
+func largeDecoded(d *richmail.Decoded) bool {
+	if d == nil {
+		return false
+	}
+	return d.Width >= 48 || d.Height >= 48
+}
+
+func hasLargeHint(im richmail.Image) bool {
+	return im.HintWidth >= 48 || im.HintHeight >= 48
+}
+
+// imageMarker builds the sentinel for one plan kind and image index.
+func imageMarker(kind rune, index int) string {
+	return string([]rune{imageMarkerOpen, kind}) + strconv.Itoa(index) + string(imageMarkerClose)
+}
+
+// parseImageMarkerLine parses a line that consists solely of one marker. ANSI
+// styling added by glamour is stripped first, since the marker is just text to
+// the markdown renderer.
+func parseImageMarkerLine(line string) (kind rune, index int, ok bool) {
+	s := strings.TrimSpace(ansi.Strip(line))
+	runes := []rune(s)
+	if len(runes) < 4 || runes[0] != imageMarkerOpen || runes[len(runes)-1] != imageMarkerClose {
+		return 0, 0, false
+	}
+	kind = runes[1]
+	digits := string(runes[2 : len(runes)-1])
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 0 {
+		return 0, 0, false
+	}
+	return kind, n, true
+}
+
+// expandImageMarkers replaces marker lines with raster placeholder rows or
+// fallback text, returning the finished body and the images to upload.
+func expandImageMarkers(rendered string, plans map[int]imagePlan, ictx *imageRenderContext) (string, []renderImage) {
+	lines := strings.Split(rendered, "\n")
+	out := make([]string, 0, len(lines))
+	var images []renderImage
+	for _, line := range lines {
+		kind, index, ok := parseImageMarkerLine(line)
+		if !ok {
+			out = append(out, replaceInlineImageMarkers(line, plans))
+			continue
+		}
+		plan, found := plans[index]
+		if !found {
+			out = append(out, fallbackImageText(""))
+			continue
+		}
+		switch kind {
+		case imageMarkerImage:
+			rows := ictx.store.backend.PlaceholderRows(plan.id, plan.place.Cols, plan.place.Rows)
+			if len(rows) == 0 {
+				out = append(out, fallbackImageText(plan.label))
+				continue
+			}
+			pad := strings.Repeat(" ", plan.place.OffsetCols)
+			for _, row := range rows {
+				out = append(out, pad+row)
+			}
+			images = append(images, renderImage{
+				id:        plan.id,
+				messageID: ictx.messageID,
+				sourceCID: plan.image.Source.CID,
+				sourceLoc: richmail.LocationKey(plan.image.Source.Raw),
+				image:     plan.resolved.Decoded,
+				placement: plan.place,
+				label:     plan.label,
+				link:      plan.image.Link,
+			})
+		case imageMarkerBlock:
+			out = append(out, blockImageText(plan.label))
+		case imageMarkerLoad:
+			out = append(out, loadingImageText(plan.label))
+		default:
+			out = append(out, fallbackImageText(plan.label))
+		}
+	}
+	return strings.Join(out, "\n"), images
+}
+
+// replaceInlineImageMarkers handles the defensive case where glamour merged a
+// marker into surrounding prose: the marker becomes an ordinary text
+// placeholder so no text is lost.
+func replaceInlineImageMarkers(line string, plans map[int]imagePlan) string {
+	if !strings.ContainsRune(line, imageMarkerOpen) {
+		return line
+	}
+	var b strings.Builder
+	runes := []rune(line)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != imageMarkerOpen {
+			b.WriteRune(runes[i])
+			continue
+		}
+		j := i + 1
+		for j < len(runes) && runes[j] != imageMarkerClose {
+			j++
+		}
+		if j >= len(runes) {
+			b.WriteRune(runes[i])
+			continue
+		}
+		// An opening marker with nothing between it and the close (or only a
+		// lone kind rune) is malformed, not an image reference. Emitting the
+		// open rune and leaving i in place lets the loop write the close rune
+		// next iteration instead of slicing runes[i+2:j] out of bounds.
+		if j <= i+1 {
+			b.WriteRune(runes[i])
+			continue
+		}
+		label := ""
+		idxStr := string(runes[i+2 : j])
+		if idx, err := strconv.Atoi(idxStr); err == nil {
+			if p, ok := plans[idx]; ok {
+				label = p.label
+			}
+		}
+		b.WriteString(fallbackImageText(label))
+		i = j
+	}
+	return b.String()
+}
+
+func fallbackImageText(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return " "
+	}
+	return "[image: " + label + "]"
+}
+
+func blockImageText(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "[image: remote image blocked — press i to load]"
+	}
+	return "[image: " + label + " · remote image blocked — press i to load]"
+}
+
+func loadingImageText(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "[image: loading remote image…]"
+	}
+	return "[image: " + label + " · loading remote image…]"
+}
+
+// lineHasImagePlaceholder reports whether a rendered line contains raster
+// placeholder cells. Such lines must not be re-styled: re-rendering them would
+// strip the foreground color that carries the image id.
+func lineHasImagePlaceholder(line string) bool {
+	return strings.ContainsRune(line, placeholderRune)
+}
+
+// stripImagePlaceholders removes placeholder cells (the base rune and its
+// combining diacritics) from display/copy text so focus, selection and the
+// clipboard never see the protocol glyphs.
+func stripImagePlaceholders(s string) string {
+	if !strings.ContainsRune(s, placeholderRune) {
+		return s
+	}
+	runes := []rune(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(runes); i++ {
+		if runes[i] == placeholderRune {
+			j := i + 1
+			for j < len(runes) && unicode.Is(unicode.Mn, runes[j]) {
+				j++
+			}
+			i = j - 1
+			continue
+		}
+		b.WriteRune(runes[i])
+	}
+	return b.String()
+}
+
+// remoteFetchResult is one URL's outcome.
+type remoteFetchResult struct {
+	url   string
+	data  []byte
+	ctype string
+	err   error
+}
+
+// remoteImagesLoadedMsg reports completed remote image fetches.
+type remoteImagesLoadedMsg struct {
+	messageID int64
+	results   []remoteFetchResult
+}
+
+// fetchRemoteImagesCmd fetches a batch of remote images off the UI goroutine.
+// Failures are reported per URL rather than aborting the batch.
+func fetchRemoteImagesCmd(store *uiImageStore, messageID int64, urls []string) tea.Cmd {
+	if store == nil || len(urls) == 0 {
+		return nil
+	}
+	store.mu.Lock()
+	var pending []string
+	for _, u := range urls {
+		if !store.pending[u] {
+			store.pending[u] = true
+			pending = append(pending, u)
+		}
+	}
+	if len(pending) > 0 {
+		store.generation++
+	}
+	store.mu.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+	opts := store.remoteOpts
+	return func() tea.Msg {
+		results := make([]remoteFetchResult, 0, len(pending))
+		for _, u := range pending {
+			data, ctype, err := opts.Fetch(context.Background(), u)
+			results = append(results, remoteFetchResult{url: u, data: data, ctype: ctype, err: err})
+		}
+		return remoteImagesLoadedMsg{messageID: messageID, results: results}
+	}
+}
+
+// applyRemoteResults records fetch outcomes and reports whether the current view
+// must be re-rendered.
+func (s *uiImageStore) applyRemoteResults(msg remoteImagesLoadedMsg) bool {
+	if s == nil {
+		return false
+	}
+	for _, r := range msg.results {
+		s.recordRemote(r.url, &remoteEntry{data: r.data, ctype: r.ctype, err: r.err, done: true})
+	}
+	return true
+}
+
+// remoteURLs returns the distinct, non-decorative remote image URLs in an HTML
+// body, used when the reader presses i.
+func remoteURLs(html string, parts *richmail.PartStore) []string {
+	if strings.TrimSpace(html) == "" {
+		return nil
+	}
+	// Normalize first so hidden elements and tracking pixels never trigger a
+	// fetch even when the reader has consented to remote images.
+	doc, err := goqueryDocument(normalizeHTMLForRendering(html))
+	if err != nil {
+		return nil
+	}
+	manifest := richmail.ExtractImages(doc)
+	seen := map[string]bool{}
+	var urls []string
+	for _, im := range manifest.Images {
+		if im.Source.Kind != richmail.SourceRemote || im.Source.URL == "" {
+			continue
+		}
+		if im.Tracking || parts.HasLocation(im.Source.Raw) {
+			continue
+		}
+		if im.Decorative && !hasLargeHint(im) {
+			continue
+		}
+		if seen[im.Source.URL] {
+			continue
+		}
+		seen[im.Source.URL] = true
+		urls = append(urls, im.Source.URL)
+	}
+	return urls
+}
+
+// goqueryDocument parses HTML for manifest extraction.
+func goqueryDocument(html string) (*goquery.Document, error) {
+	return goquery.NewDocumentFromReader(strings.NewReader(html))
+}
+
+// applyViewportImages makes images the currently shown set. Missing images
+// upload in the background; see takeUploadCmd.
+func (m *Model) applyViewportImages(images []renderImage) {
+	if m.images == nil {
+		return
+	}
+	m.images.applyImages(images)
+}
+
+// clearViewportImages marks that no images are shown. Resident images stay
+// in the terminal, bounded by the resident budget.
+func (m *Model) clearViewportImages() {
+	m.images.deactivateImages()
+}
+
+// ReleaseTerminalImages deletes every image TideMail left in the terminal.
+// Call it once the program has exited.
+func (m Model) ReleaseTerminalImages() {
+	if m.images == nil {
+		return
+	}
+	m.images.clearImages()
+}
+
+// threadImageRenderKey folds per-message remote consent and the store
+// generation into an image cache key for a whole thread.
+func (m Model) threadImageRenderKey(thread messageThread) string {
+	if m.images == nil {
+		return "off"
+	}
+	if !m.images.graphics() {
+		return "none"
+	}
+	var b strings.Builder
+	for _, msg := range thread.Messages {
+		fmt.Fprintf(&b, "%d:%t,", msg.ID, m.images.isAllowed(msg.ID))
+	}
+	fmt.Fprintf(&b, "g%d", m.images.gen())
+	return b.String()
+}
+
+// currentViewMessages returns only the email displayed in the reader.
+func (m Model) currentViewMessages() []db.Message {
+	if msg := m.currentContentMessage(); msg != nil {
+		return []db.Message{*msg}
+	}
+	return nil
+}
+
+// Image consent applies only to the displayed email.
+func (m Model) imageConsentMessageIDs() []int64 {
+	seen := map[int64]bool{}
+	var ids []int64
+	for _, msg := range m.currentViewMessages() {
+		if msg.ID == 0 || seen[msg.ID] {
+			continue
+		}
+		seen[msg.ID] = true
+		ids = append(ids, msg.ID)
+	}
+	if m.contentMessageID != 0 && !seen[m.contentMessageID] {
+		ids = append(ids, m.contentMessageID)
+	}
+	return ids
+}
+
+// remoteImageURLsForCurrent collects the remote image URLs of whatever the
+// reading pane is showing, for the i key.
+func (m Model) remoteImageURLsForCurrent() []string {
+	var urls []string
+	for _, msg := range m.currentViewMessages() {
+		var parts *richmail.PartStore
+		if ctx := m.imageContext(msg, m.contentBodyWidth()); ctx != nil {
+			parts = ctx.parts
+		}
+		urls = append(urls, remoteURLs(msg.BodyHTML, parts)...)
+	}
+	return dedupeStrings(urls)
+}
+
+func countRemoteFailures(results []remoteFetchResult) int {
+	n := 0
+	for _, r := range results {
+		if r.err != nil {
+			n++
+		}
+	}
+	return n
+}
+
+func dedupeStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// renderedInlineKeys indexes the inline attachments actually drawn this view,
+// keyed by message plus Content-ID and Content-Location. Including the message
+// id means two messages that share a Content-ID cannot suppress each other's
+// attachment row.
+func renderedInlineKeys(images []renderImage) map[string]bool {
+	if len(images) == 0 {
+		return nil
+	}
+	keys := make(map[string]bool, len(images)*2)
+	for _, im := range images {
+		if k := richmail.CIDKey(im.sourceCID); k != "" {
+			keys[fmt.Sprintf("%d:cid:%s", im.messageID, k)] = true
+		}
+		if k := richmail.LocationKey(im.sourceLoc); k != "" {
+			keys[fmt.Sprintf("%d:loc:%s", im.messageID, k)] = true
+		}
+	}
+	return keys
+}
+
+// filterRenderedInline removes inline-image attachments that were drawn inline,
+// for the displayed attachment list only. An inline image that failed to
+// resolve, or that was never rendered because graphics were unavailable,
+// produces no renderImage and therefore stays listed. The caller keeps the full
+// list for saving, so hiding a rendered image here never removes access to it.
+func filterRenderedInline(atts []db.Attachment, images []renderImage) []db.Attachment {
+	rendered := renderedInlineKeys(images)
+	if len(rendered) == 0 {
+		return atts
+	}
+	var out []db.Attachment
+	for _, a := range atts {
+		if a.IsInlineImage() {
+			cid := richmail.CIDKey(a.ContentID)
+			loc := richmail.LocationKey(a.ContentLocation)
+			if (cid != "" && rendered[fmt.Sprintf("%d:cid:%s", a.MessageID, cid)]) ||
+				(loc != "" && rendered[fmt.Sprintf("%d:loc:%s", a.MessageID, loc)]) {
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}

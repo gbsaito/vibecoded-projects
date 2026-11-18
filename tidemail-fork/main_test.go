@@ -1,0 +1,176 @@
+package main
+
+import (
+	"errors"
+	"os"
+	"runtime/debug"
+	"strings"
+	"testing"
+
+	"github.com/allisonhere/tidemail/internal/config"
+)
+
+func TestResolvedVersionFromBuildInfoPrefersModuleVersion(t *testing.T) {
+	info := &debug.BuildInfo{
+		Main: debug.Module{
+			Version: "v1.3.2",
+		},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs.revision", Value: "abcdef1234567890"},
+			{Key: "vcs.modified", Value: "false"},
+		},
+	}
+
+	got := resolvedVersionFromBuildInfo(info)
+	if got != "v1.3.2" {
+		t.Fatalf("expected module version to win, got %q", got)
+	}
+}
+
+func TestFormatConfigLoadErrorNamesPathAndRecovery(t *testing.T) {
+	path := "/tmp/tidemail/config.toml"
+	got := formatConfigLoadError(path, errors.New("toml: expected value"), config.DefaultConfig())
+	for _, want := range []string{path, "expected value", "restart TideMail", "config parses"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("startup error %q does not contain %q", got, want)
+		}
+	}
+}
+
+func TestResolvedVersionFromBuildInfoFallsBackToRevision(t *testing.T) {
+	info := &debug.BuildInfo{
+		Main: debug.Module{
+			Version: "(devel)",
+		},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs.revision", Value: "abcdef1234567890"},
+			{Key: "vcs.modified", Value: "true"},
+		},
+	}
+
+	got := resolvedVersionFromBuildInfo(info)
+	if got != "abcdef1-dirty" {
+		t.Fatalf("expected short dirty revision fallback, got %q", got)
+	}
+}
+
+func TestParseStartupOptionsPrototypeForms(t *testing.T) {
+	opts := parseStartupOptions([]string{"--prototype-forms"})
+
+	if !opts.prototypeForms {
+		t.Fatal("expected --prototype-forms to enable prototype form mode")
+	}
+}
+
+func TestParseStartupOptionsUpdateProgressPreview(t *testing.T) {
+	opts := parseStartupOptions([]string{"--preview-update-progress"})
+
+	if !opts.previewUpdateProgress {
+		t.Fatal("expected --preview-update-progress to enable update progress preview")
+	}
+}
+
+func TestParseStartupOptionsDisableGoogleOAuth(t *testing.T) {
+	opts := parseStartupOptions([]string{"--disable-google-oauth"})
+
+	if !opts.disableGoogleOAuth {
+		t.Fatal("expected --disable-google-oauth to enable the runtime OAuth override")
+	}
+}
+
+func TestDisableGoogleOAuthOverrideIsRuntimeOnlyAndProviderSpecific(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.OAuth.GoogleClientID = "google-id"
+	cfg.OAuth.GoogleClientSecret = "google-secret"
+	cfg.OAuth.MSClientID = "microsoft-id"
+
+	applyStartupOverrides(&cfg, startupOptions{disableGoogleOAuth: true})
+
+	if cfg.OAuth.GoogleClientID != "" || cfg.OAuth.GoogleClientSecret != "" || !cfg.OAuth.GoogleDisabled {
+		t.Fatalf("expected Google OAuth credentials disabled, got %#v", cfg.OAuth)
+	}
+	if cfg.OAuth.MSClientID != "microsoft-id" {
+		t.Fatalf("Microsoft OAuth should be unchanged, got %q", cfg.OAuth.MSClientID)
+	}
+}
+
+func TestGoogleOAuthEnabledBySavedClient(t *testing.T) {
+	t.Setenv("TIDEMAIL_GOOGLE_CLIENT_ID", "")
+	t.Setenv("TIDEMAIL_GOOGLE_CLIENT_SECRET", "")
+	cfg := config.DefaultConfig()
+	cfg.OAuth.GoogleClientID = "google-id"
+	cfg.OAuth.GoogleClientSecret = "google-secret"
+
+	applyStartupOverrides(&cfg, startupOptions{})
+
+	if cfg.OAuth.GoogleDisabled {
+		t.Fatal("a saved whole client must enable Google OAuth without a flag")
+	}
+	if cfg.OAuth.GoogleClientID != "google-id" || cfg.OAuth.GoogleClientSecret != "google-secret" {
+		t.Fatalf("approval state must not rewrite saved credentials, got %#v", cfg.OAuth)
+	}
+}
+
+func TestGoogleOAuthStaysDisabledWithoutWholeClient(t *testing.T) {
+	t.Setenv("TIDEMAIL_GOOGLE_CLIENT_ID", "")
+	t.Setenv("TIDEMAIL_GOOGLE_CLIENT_SECRET", "")
+	cfg := config.DefaultConfig()
+
+	applyStartupOverrides(&cfg, startupOptions{})
+
+	if !cfg.OAuth.GoogleDisabled {
+		t.Fatal("expected Google OAuth disabled without a whole client")
+	}
+}
+
+func TestProgramOptionsKeepTerminalMouseSelectionAvailable(t *testing.T) {
+	opts := programOptions(config.DefaultConfig())
+	if len(opts) != 1 {
+		t.Fatalf("expected only alt-screen option by default so terminal mouse selection stays available, got %d options", len(opts))
+	}
+}
+
+func TestProgramOptionsEnableMouseWhenOptedIn(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.MouseSupport = true
+	opts := programOptions(cfg)
+	if len(opts) != 2 {
+		t.Fatalf("expected alt-screen + mouse option when mouse support is enabled, got %d options", len(opts))
+	}
+}
+
+func TestHeadlessHelpRouting(t *testing.T) {
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+	os.Args = []string{"tidemail", "send", "--help"}
+	code, restart := run()
+	if code != 0 || restart != "" {
+		t.Fatalf("headless help returned %d %q", code, restart)
+	}
+}
+
+func TestGoogleOAuthEnabledByDeveloperClientInEnvironment(t *testing.T) {
+	cases := []struct {
+		name         string
+		id, secret   string
+		disableFlag  bool
+		wantDisabled bool
+	}{
+		{"both set", "id.apps.googleusercontent.com", "secret", false, false},
+		{"id only", "id.apps.googleusercontent.com", "", false, true},
+		{"secret only", "", "secret", false, true},
+		{"blank values", " ", " ", false, true},
+		{"flag wins over the environment", "id.apps.googleusercontent.com", "secret", true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("TIDEMAIL_GOOGLE_CLIENT_ID", c.id)
+			t.Setenv("TIDEMAIL_GOOGLE_CLIENT_SECRET", c.secret)
+			cfg := config.DefaultConfig()
+			applyStartupOverrides(&cfg, startupOptions{disableGoogleOAuth: c.disableFlag})
+			if cfg.OAuth.GoogleDisabled != c.wantDisabled {
+				t.Fatalf("GoogleDisabled = %v, want %v", cfg.OAuth.GoogleDisabled, c.wantDisabled)
+			}
+		})
+	}
+}

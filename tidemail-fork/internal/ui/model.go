@@ -1,0 +1,5164 @@
+package ui
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/allisonhere/tidemail/internal/ai"
+	"github.com/allisonhere/tidemail/internal/auth"
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/allisonhere/tidemail/internal/db"
+	imapClient "github.com/allisonhere/tidemail/internal/imap"
+	"github.com/allisonhere/tidemail/internal/update"
+	"github.com/allisonhere/tideui"
+)
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+type pane int
+
+const (
+	paneAccounts pane = iota
+	paneMessages
+	paneContent
+)
+
+type sidebarRowKind int
+
+const (
+	rowKindUnified sidebarRowKind = iota
+	rowKindAccount
+	rowKindSysFolderHeader
+	rowKindPersonalFolderHeader
+	rowKindMailbox
+	// rowKindOutbox is a standing entry beside the Unified Inbox: outgoing mail
+	// spans accounts the same way. It exists mostly so the Outbox can be found
+	// at all — it used to be reachable only by knowing the "O" shortcut, so a
+	// message stuck there was invisible to anyone who did not.
+	rowKindOutbox
+	// rowKindNeedsYou is the standing Needs You entry beside the Unified
+	// Inbox: a virtual view of actionable inbox mail (see needs_you.go).
+	rowKindNeedsYou
+	// rowKindWaiting is the standing Waiting on Them entry: conversations
+	// awaiting someone else's reply (see waiting.go).
+	rowKindWaiting
+	// rowKindSnoozed is the standing Snoozed entry (see snooze.go).
+	rowKindSnoozed
+)
+
+type sidebarRow struct {
+	kind      sidebarRowKind
+	accountID int64
+	mailboxID int64
+	label     string // section header label (e.g. "System", "Labels"); a nested folder's title
+	count     int    // item count for section headers
+
+	// Folder tree (mailbox rows).
+	depth       int  // nesting level below the section header
+	hasChildren bool // folder has subfolders
+	collapsed   bool // subfolders hidden
+	hidden      bool // hidden by the user (only listed while hidden folders are shown)
+}
+
+type overlayMode int
+
+const (
+	overlayNone overlayMode = iota
+	overlayQuitConfirm
+	overlaySearch
+	overlayThemePicker
+	overlayAccountManager
+	overlayContactManager
+	overlayHelp
+	overlaySettings
+	overlayUpdateConfirm
+	overlayContentSearch
+	overlaySummary
+	overlayCompose
+	overlayCommandPalette
+	overlaySaveAttach
+	overlayMoveMessage
+	overlayGrammarPreview
+	overlayLogViewer
+	overlayFilterManager
+	overlayOutbox
+	overlayDraftCloseConfirm
+	overlayBulkDeleteConfirm
+	overlayUnsubscribeConfirm
+	overlayScheduleSend
+	overlayPlugins
+	overlayPluginPicker
+	overlayPluginResult
+	overlayPluginAnnotations
+	overlayPluginConfirm
+	overlayPluginSettings
+	overlaySnooze
+	overlayTagColors
+	overlayColorPicker
+	overlayClassification
+	overlayMailTags
+	overlaySyncAllConfirm
+	overlayFolderDeleteConfirm
+	overlayContextMenu
+	overlaySpellDictionary
+	overlayPluginCatalog
+	overlaySource
+)
+
+type commandPaletteContext int
+
+const (
+	commandPaletteMain commandPaletteContext = iota
+	commandPaletteCompose
+	commandPaletteSummary
+	commandPaletteSaveAttach
+)
+
+type updateState int
+
+type logEntry struct {
+	Time    time.Time
+	Message string
+	IsError bool
+}
+
+const (
+	updateStateIdle updateState = iota
+	updateStateChecking
+	updateStateAvailable
+	updateStateDownloading
+	updateStateInstalling
+	updateStateInstalled
+	updateStateNeedsElevation
+	updateStateError
+)
+
+// ── Model ────────────────────────────────────────────────────────────────────
+
+// Model keeps Bubble Tea's value-receiver Init/Update/View contract. Read-only
+// rendering and layout helpers use pointer receivers to avoid repeatedly copying
+// the large modal state stored here; those helpers must not mutate value fields.
+// The existing pointer-owned rendering caches are intentionally shared.
+type Model struct {
+	db *db.DB
+	// sessions pools one live IMAP connection per account; all background
+	// commands go through it instead of dialing, so bursts of operations
+	// can't exceed per-user server connection caps. Pointer-typed: shared
+	// across the value copies Bubble Tea makes of the model.
+	sessions *imapClient.SessionPool
+	cfg      config.Config
+
+	currentVersion string
+	updater        *update.Updater
+
+	width, height int
+	focused       pane
+
+	accounts      []db.Account
+	mailboxes     []db.Mailbox
+	sidebarRows   []sidebarRow
+	sidebarCursor int
+	sidebarOffset int
+	// folderSettleSeq is a final identity check for a settle command. The cancel
+	// function prevents superseded commands from producing a message at all.
+	folderSettleSeq    int
+	folderSettleCancel func()
+	// folderSettlePending remembers a settled folder whose passive refresh was
+	// deferred because another mailbox for the same account was already syncing.
+	// The completion handler rearms it only if the user is still on that folder.
+	folderSettlePending int64
+	collapsedAccounts   map[int64]bool
+	collapsedSections   map[string]bool // key: "system:<id>" or "personal:<id>"
+
+	messages         []db.Message
+	filteredMessages []db.Message
+	messageThreads   []messageThread
+	messageRows      []messageRow
+	expandedMessages map[int64]bool
+	expansionView    conversationView
+	drafts           []db.Draft
+	messageCursor    int
+	listOffset       int
+	lastClickAt      time.Time // double-click detection (mouse)
+	lastClickPane    pane
+	lastClickIdx     int
+	ctxMenu          contextMenu // right-click menu, valid while overlay == overlayContextMenu
+	spellDict        spellDictState
+	grammarVP        viewport.Model // scrollable body of the grammar preview
+	searchQuery      string
+	searchMode       bool
+	searchEditing    bool
+	showUnreadOnly   bool
+	starredFirst     bool
+	selectedMessages map[int64]bool
+	// heldReadID is a message marked read on open that keeps its unread
+	// position (Unread first) or stays listed (Unread only) until the reader
+	// loses focus or shows another message. See releaseHeldRead.
+	heldReadID int64
+
+	pendingDestructiveActions []pendingDestructiveAction
+	nextDestructiveActionID   uint64
+	confirmedDeleteCache      map[int64]MessageRef // remote success awaiting local cache cleanup
+	pendingUnreadExcluded     map[int64]bool       // archive/move IDs absent from the last SQL unread snapshot
+
+	pendingSends []pendingSend
+
+	// pendingUnsubscribe holds the message whose List-Unsubscribe action is
+	// awaiting the user's y/n in overlayUnsubscribeConfirm.
+	pendingUnsubscribe db.Message
+
+	// folderPrompt is the sidebar's inline new/rename folder prompt;
+	// pendingFolderDelete is the folder awaiting delete confirmation.
+	folderPrompt        folderPrompt
+	mailboxPrefs        map[int64]map[string]db.MailboxPref
+	showHiddenFolders   bool
+	pendingFolderDelete int64
+	// folderOpBusy is set while a folder rename, move or delete is running on
+	// the server, so a second one can't start from names that are about to change.
+	folderOpBusy bool
+
+	viewport          viewport.Model
+	contentLinks      []string
+	contentLinkLabels map[string]string
+	contentLinkRows   []int
+	contentLinkIdx    int
+	// Activation intent is separate from automatic focus/layout changes.
+	contentLinkContext  string
+	contentFocusedLink  string
+	contentMessageID    int64
+	contentDraftID      int64
+	contentFocusPending bool // viewport currently has no focusable line
+	contentFocusLine    int
+	contentLineCount    int
+	contentFocusable    []bool
+	readerMouse         readerMouseSelection
+	contentLines        []string
+	// contentLineLinks holds the hyperlink target for each contentLines entry,
+	// including explicit LINKS destinations when OSC 8 is unavailable. Body
+	// targets come from OSC 8 escapes stripped from the displayed text.
+	contentLineLinks       []string
+	contentSearchInput     textinput.Model
+	contentSearchQuery     string
+	contentSearchMatches   []int
+	contentSearchIdx       int
+	contentSelectionActive bool
+	contentSelectionAnchor int
+	contentSelectionAll    bool
+
+	contentAttachments     []db.Attachment
+	contentQuotesCollapsed bool
+	contentShowHeaders     bool
+
+	saveAttachPicker  filePicker
+	movePicker        movePicker
+	filterManager     filterManager
+	outboxItems       []db.OutboxItem
+	outboxCursor      int
+	outboxStatus      string
+	outboxConfirmID   int64
+	scheduleSendInput textinput.Model
+	schedulePicker    list.Model
+	scheduleCustom    bool
+	scheduleCalendar  time.Time
+	scheduleDate      time.Time
+
+	grammarOriginal    string
+	grammarCorrected   string
+	grammarQuoteSuffix string // quoted/forwarded text held aside during a grammar check
+
+	logBuffer []logEntry
+
+	needsYou       needsYouState  // see needs_you.go
+	waiting        waitingState   // see waiting.go
+	snooze         snoozeState    // see snooze.go
+	tagColors      tagColorEditor // see tag_colors.go
+	colorPicker    colorPicker    // see color_picker.go
+	mailTags       mailTagUI
+	classification classificationEditor
+
+	plugins pluginUI    // experimental; see plugins.go
+	pgp     pgpState    // decrypted messages, memory only; see pgp.go
+	catalog catalogUI   // available plugins; see plugin_catalog.go
+	source  sourceState // raw message source, memory only; see source.go
+
+	helpVP                viewport.Model
+	helpCat               int  // selected category in the two-pane help
+	helpRight             bool // keys scroll the right pane instead of choosing a category
+	helpSearchInput       textinput.Model
+	helpSearchActive      bool
+	overlay               overlayMode
+	searchInput           textinput.Model
+	commandInput          textinput.Model
+	commandCursor         int
+	commandPaletteOrigin  overlayMode
+	commandPaletteContext commandPaletteContext
+
+	confirmedTheme int
+	activeTheme    int
+	styles         Styles
+	themePicker    tideui.ThemePicker
+	// composeBackdrop owns display-keyed render stages behind compact compose.
+	// Pointer-owned so the render-time cache survives Model's value receivers.
+	composeBackdrop         *composeBackdropCache
+	composeDisplayRevision  uint64
+	readerPanes             *readerPaneCache
+	pendingReads            map[int64]pendingRead
+	pendingBulkReads        map[int64]uint64 // mailbox reservations for local mark-all-read
+	nextReadOperation       uint64
+	readVersion             uint64 // invalidates read-state snapshots captured before confirmation
+	readAnimationFrame      int
+	readAnimationRunning    bool
+	readAnimationGeneration uint64
+	readSession             readSessionFunc // optional session seam for deterministic read-operation tests
+
+	// bodyCache memoises rendered message bodies and viewportCache the
+	// finished reading-pane content. Held by pointer so writes survive
+	// Model's value receivers.
+	bodyCache     *boundedCache[bodyCacheKey, messageRenderResult]
+	viewportCache *boundedCache[viewportCacheKey, viewportContent]
+	// images owns the terminal graphics backend, decoded-image cache, and
+	// remote-fetch consent/state. Pointer-typed for the same reason as the
+	// caches: writes through Model's value receivers must persist.
+	images *uiImageStore
+	// draftCounts holds the sidebar drafts badge per mailbox. Computed on
+	// data change in rebuildSidebar, because working it out costs two SQLite
+	// queries and the renderer must not touch the database.
+	draftCounts map[int64]int64
+	// omarchySig is the last-seen Omarchy theme signature, used by the
+	// "match-omarchy" live-follow poll to detect desktop theme changes.
+	omarchySig string
+	// omarchyWatchGeneration identifies the current live-follow poll loop. A
+	// generation makes ticks from an old theme selection harmless and ensures
+	// selecting match-omarchy always starts a fresh loop.
+	omarchyWatchGeneration uint64
+
+	accountManager AccountManager
+	contactManager ContactManager
+	compose        ComposeModel
+	addressBook    []string
+
+	statusMsg string
+	statusErr bool
+	// statusPill draws statusMsg as a pill; setStatus sets it for every non-error
+	// message (errors get the red pill via statusErr).
+	statusPill bool
+	// pillFade blends the status pill in from pillFadeFrom over pillFadeDuration
+	// after a delete, archive or move finishes; a zero pillFadeStart means no
+	// fade. setStatus cancels it.
+	pillFadeFrom       alertPill
+	pillFadeStart      time.Time
+	pillFadeGeneration uint64
+
+	// browserReopen is the message whose browser export blocked remote images;
+	// pressing the open-in-browser key on it again reopens with images loaded.
+	browserReopen int64
+
+	syncing map[int64]bool
+	// syncVisible is the subset of syncing mailboxes that should animate in the
+	// sidebar/status line: only syncs the user explicitly requested. Background
+	// work (timers, IDLE, startup sweep, passive folder refreshes) stays out of
+	// it so it never lights up the status line or keeps the frame clock running.
+	syncVisible map[int64]bool
+	// olderExhausted records mailboxes whose server history has been paged all
+	// the way back, so scrolling to the bottom stops asking for more.
+	olderExhausted map[int64]bool
+	// initialLoading is true from startup until the first message load completes,
+	// so the message pane can show a spinner while accounts/messages load async.
+	initialLoading bool
+	spinner        spinner.Model
+	// spinnerRunning tracks whether the spinner's self-rescheduling tick loop is
+	// currently live. The loop only runs while something is loading (see
+	// spinnerActive); this flag prevents starting a second parallel loop, which
+	// would double the frame rate. See ensureSpinner and the spinner.TickMsg case.
+	spinnerRunning bool
+
+	// lastFolderRefresh throttles the per-account server folder LIST so it runs
+	// far less often than message sync. Keyed by account ID; zero value means
+	// "never refreshed", so the first auto-sync after launch picks up folders.
+	lastFolderRefresh map[int64]time.Time
+
+	// idleWatchers holds the per-account IMAP IDLE push watchers (keyed by
+	// account ID); see startIdleWatchers. The map is shared across Model copies.
+	idleWatchers map[int64]idleWatcherEntry
+
+	firstLoad              bool
+	pendingSelectMailboxID int64
+	pendingSelectMessageID int64
+	keys                   KeyMap
+
+	settings Settings
+
+	pendingBulkDelete []db.Message
+
+	updateState          updateState
+	updateInfo           update.ReleaseInfo
+	updateInfoFresh      bool
+	downloadedUpdate     *update.DownloadedAsset
+	updateInstall        update.InstallResult
+	updateErr            string
+	updateDismissed      bool
+	pendingUpdateInstall bool
+	updateProgress       int
+	updateInstallReady   bool
+	updateInstallErr     error
+	// restartExecPath, when non-empty, asks main to replace this process with
+	// the binary at that path AFTER the program exits — so BubbleTea has fully
+	// restored the terminal before the new version takes over (see
+	// settingsActionRestartAfterUpdate). Restarting from inside the running TUI
+	// would leave two processes fighting over the terminal.
+	restartExecPath string
+	quitActivated   bool
+
+	previewManualUpdateUI bool
+	// previewPackageOwner fakes the package that owns the binary, so
+	// --preview-manual-update can show the packaged wording on a machine that
+	// did not install TideMail from a package. Nil everywhere else.
+	previewPackageOwner *update.PackageInstall
+
+	summarizer        ai.Summarizer
+	summaryMessage    db.Message
+	summaryGenerating bool
+	summaryErr        string
+}
+
+// CloseSessions logs out all pooled IMAP connections and stops the IDLE push
+// watchers; called on shutdown.
+func (m Model) CloseSessions() {
+	m.stopIdleWatchers()
+	m.closePlugins()
+	m.stopSnoozeTimer()
+	if m.sessions != nil {
+		m.sessions.Close()
+	}
+}
+
+// RestartExecPath returns the binary main should exec after the program exits
+// to complete an in-app update restart, or "" when no restart was requested.
+// Exec-ing only after exit guarantees the terminal is fully restored first.
+func (m Model) RestartExecPath() string { return m.restartExecPath }
+
+// QuitActivated reports whether the user requested a normal app exit. Update
+// restarts also use tea.Quit, but should hand off without showing quit status.
+func (m Model) QuitActivated() bool { return m.quitActivated }
+
+func NewModel(database *db.DB, cfg config.Config, currentVersion string, previewManualUpdate bool) Model {
+	// Every account must carry its stable ID by the time the model joins config
+	// blocks to database rows. Load and Save both stamp them, but a Config
+	// assembled in code reaches here without passing through either.
+	config.EnsureAccountIDs(&cfg)
+	merged, themeIdx := MergedThemeFromConfig(cfg)
+
+	// Compose body editors pick up vim mode from config via this package var
+	// (read in newEditorArea), the same way the clipboard is injected.
+	setEditorVimMode(cfg.Display.ComposeVim)
+	setEditorSearchRegex(cfg.Display.ComposeSearchRegex)
+	setEditorWordWrap(cfg.Display.ComposeWordWrap)
+	setEditorSpell(cfg.Display.ComposeSpell, cfg.Display.ComposeSpellLang, loadSpellWords(database))
+	addSpellNames(accountSpellEntries(cfg))
+
+	si := textinput.New()
+	si.Placeholder = "search messages... (#tag for tags)"
+	si.CharLimit = 100
+
+	ci := textinput.New()
+	ci.Placeholder = "type a command..."
+	ci.CharLimit = 100
+
+	csi := textinput.New()
+	csi.Placeholder = "find in message..."
+	csi.CharLimit = 100
+
+	hsi := textinput.New()
+	hsi.Placeholder = "search help..."
+	hsi.CharLimit = 100
+
+	sp := spinner.New()
+	if ThemeUsesASCII(merged.Name) {
+		sp.Spinner = spinner.Line
+	} else {
+		sp.Spinner = spinner.Dot
+	}
+	sp.Style = lipgloss.NewStyle()
+
+	summarizer, _ := ai.New(cfg.AI)
+
+	m := Model{
+		db:                     database,
+		sessions:               imapClient.NewSessionPool(),
+		cfg:                    cfg,
+		currentVersion:         currentVersion,
+		previewManualUpdateUI:  previewManualUpdate,
+		updater:                update.New(),
+		focused:                paneAccounts,
+		confirmedTheme:         themeIdx,
+		activeTheme:            themeIdx,
+		omarchySig:             omarchySignature(),
+		omarchyWatchGeneration: 1,
+		styles:                 BuildStyles(merged, cfg.Display.Density, cfg.Display.PaneCorners),
+		composeBackdrop:        &composeBackdropCache{},
+		readerPanes:            &readerPaneCache{},
+		bodyCache:              newBoundedCache[bodyCacheKey, messageRenderResult](defaultBodyCacheLimit),
+		viewportCache:          newBoundedCache[viewportCacheKey, viewportContent](defaultViewportCacheLimit),
+		images:                 newUIImageStore(cfg.Display.Images),
+		accountManager:         NewAccountManager(database),
+		searchInput:            si,
+		helpSearchInput:        hsi,
+		commandInput:           ci,
+		spinner:                sp,
+		initialLoading:         true,
+		syncing:                make(map[int64]bool),
+		syncVisible:            make(map[int64]bool),
+		olderExhausted:         make(map[int64]bool),
+		lastFolderRefresh:      make(map[int64]time.Time),
+		idleWatchers:           make(map[int64]idleWatcherEntry),
+		collapsedAccounts:      map[int64]bool{},
+		collapsedSections:      map[string]bool{},
+		firstLoad:              true,
+		keys:                   DefaultKeys,
+		summarizer:             summarizer,
+		showUnreadOnly:         cfg.Display.DefaultUnreadOnly,
+		starredFirst:           cfg.Display.StarredFirst,
+		contentLinkIdx:         -1,
+		contentShowHeaders:     cfg.Display.ShowHeaders,
+		contentSearchInput:     csi,
+		contentSearchIdx:       -1,
+		selectedMessages:       make(map[int64]bool),
+		snooze:                 newSnoozeState(),
+	}
+	m.loadUpdateState()
+	m.restoreCachedUpdateState()
+	if previewManualUpdate {
+		m.applyManualUpdatePreview()
+	}
+	// Google can rotate refresh tokens on refresh; persist the rotated token to
+	// the keyring immediately so it survives crashes. (Injected func —
+	// internal/auth can't import internal/config.)
+	// accountKey is the caller's per-account cache key, which is
+	// AccountConfig.SessionKey() — the account's stable ID.
+	auth.PersistRefreshToken = func(accountKey, refreshToken string) error {
+		if !config.StoreOAuth2RefreshToken(accountKey, refreshToken) {
+			return fmt.Errorf("credential storage unavailable")
+		}
+		return nil
+	}
+	return m
+}
+
+func (m Model) Init() tea.Cmd {
+	// The spinner tick loop is started lazily by ensureSpinner when a loading
+	// state begins — not here. Kicking it at startup would re-render the idle TUI
+	// ~10×/sec forever (the spinner self-reschedules on every tick).
+	cmds := []tea.Cmd{m.loadAccountsCmd()}
+	if cmd := m.ensureSpinner(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if isMatchOmarchy(m.cfg.Theme) {
+		cmds = append(cmds, omarchyWatchCmd(m.omarchyWatchGeneration))
+	}
+	if !m.previewManualUpdateUI {
+		if cmd := m.maybeCheckForUpdatesCmd(false); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if m.updateInProgress() {
+		cmds = append(cmds, tickUpdateProgress())
+	}
+	if cmd := m.pluginEventListenCmd(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if cmd := loadNeedsYouCountCmd(m.db); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	if cmd := supportNudgeCmd(m.db, m.cfg.Display.SupportReminder, time.Now()); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	// Overdue snoozes (TideMail was closed past their time) end now.
+	if cmd := expireSnoozesCmd(m.db); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	return tea.Batch(cmds...)
+}
+
+// ── Update ───────────────────────────────────────────────────────────────────
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.handleUpdate(msg)
+	if nm, ok := next.(Model); ok && nm.heldReadID != 0 && !nm.readingHeldMessage() {
+		releaseCmd := nm.releaseHeldRead()
+		return nm, tea.Batch(cmd, releaseCmd)
+	}
+	return next, cmd
+}
+
+func (m Model) handleUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if !m.keepReaderSelectionView(msg) {
+		m.invalidateReaderSelectionView()
+	}
+	switch event := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.clearReaderMouseSelection()
+	case tea.KeyMsg:
+		if event.String() != "ctrl+c" {
+			m.clearReaderMouseSelection()
+		}
+	}
+	if m.readerPanes != nil {
+		m.readerPanes.navigationOnly = m.readerOnlyNavigation(msg)
+		if !m.readerPanes.navigationOnly {
+			m.readerPanes.valid = false
+		}
+	}
+
+	next, cmd := m.update(msg)
+	if updated, ok := next.(Model); ok {
+		if updated.overlay != overlayNone || !updated.cfg.Display.MouseSupport {
+			updated.clearReaderMouseSelection()
+		}
+		if updated.overlay == overlayCompose {
+			updated.sizeCompose()
+		}
+		// Validate display dependencies lazily in View; release artifacts on close.
+		if updated.overlay != overlayCompose && updated.composeBackdrop != nil && updated.composeBackdrop.valid {
+			updated.composeBackdrop.Invalidate()
+		}
+		next = updated
+	}
+
+	// Any update may change the images on screen. Their upload is collected
+	// here so no individual handler has to thread the command through.
+	if m.images != nil {
+		if upload := m.images.takeUploadCmd(); upload != nil {
+			cmd = tea.Batch(cmd, upload)
+		}
+	}
+	return next, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// update handles async results before key routing so completed commands cannot be swallowed by modal focus. -allie
+	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		offset := m.viewport.YOffset
+		m.width = msg.Width
+		m.height = msg.Height
+		m.clampMessageListViewport()
+		m.viewport = viewport.New(m.contentBodyWidth(), m.contentBodyHeight())
+		m.viewport.Style = lipgloss.NewStyle()
+		if m.images.refreshGeometry() {
+			m.bodyCache.clear()
+			m.viewportCache.clear()
+		}
+		if m.activeMessageRowCount() > 0 {
+			m.setViewportForCurrentRow()
+			if m.contentLinkIdx >= 0 {
+				m.revealContentLink()
+			} else {
+				m.viewport.SetYOffset(offset)
+				m.reconcileContentFocus(0)
+			}
+		}
+		if m.overlay == overlayHelp {
+			m.resetHelpVP()
+		}
+		if m.overlay == overlaySource {
+			m.layoutSource()
+		}
+		return m, nil
+
+	case readerSelectionTick:
+		return m.handleReaderSelectionTick(msg)
+
+	case tea.MouseMsg:
+		if !m.cfg.Display.MouseSupport {
+			// Defense in depth: the mouse ProgramOption isn't registered at
+			// all when this is off, so no tea.MouseMsg should normally arrive.
+			return m, nil
+		}
+		if m.overlay == overlayCompose {
+			return m.handleComposeMouse(msg, time.Now())
+		}
+		if handled, cmd := m.readerSelectionMouse(msg); handled {
+			return m, cmd
+		}
+		if tea.MouseEvent(msg).IsWheel() {
+			return m.handleMouseWheel(msg)
+		}
+		if msg.Action != tea.MouseActionPress {
+			// Release and motion events are ignored.
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseButtonLeft:
+			return m.handleMouseClick(msg)
+		case tea.MouseButtonRight:
+			return m.handleMouseRightClick(msg)
+		}
+		return m, nil
+
+	case spinner.TickMsg:
+		// The spinner self-perpetuates: Update returns a fresh Tick on every
+		// TickMsg. Only keep the loop alive while something is actually animating,
+		// otherwise an idle TUI would re-render ~10×/sec forever. Once nothing is
+		// loading, drop the tick and mark the loop stopped so ensureSpinner can
+		// restart it next time.
+		if !m.spinnerActive() {
+			m.spinnerRunning = false
+			return m, nil
+		}
+		// Reconcile the guard: Init starts this loop but its value receiver
+		// discards the spinnerRunning write, so mark it here to keep ensureSpinner
+		// from starting a second parallel loop.
+		m.spinnerRunning = true
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	case omarchyThemeTickMsg:
+		return m.handleOmarchyThemeTick(msg)
+
+	case SupportNudgeMsg:
+		return m.handleSupportNudge()
+
+	case StatusClearMsg:
+		m.compose.clearRoutedStatus()
+		m.statusMsg = ""
+		m.statusErr = false
+		m.statusPill = false
+		m.browserReopen = 0
+		return m, nil
+
+	case imageUploadMsg:
+		m.images.applyUploads(msg)
+		return m, nil
+
+	case remoteImagesLoadedMsg:
+		if m.images != nil {
+			m.images.applyRemoteResults(msg)
+		}
+		m.bodyCache.clear()
+		m.viewportCache.clear()
+		if m.contentMessageID != 0 || m.contentDraftID != 0 {
+			m.setViewportForCurrentRow()
+		}
+		if failed := countRemoteFailures(msg.results); failed > 0 {
+			m.setStatus(fmt.Sprintf("%d remote image(s) could not be loaded", failed), true)
+			return m, m.clearStatusCmd()
+		}
+		return m, nil
+
+	case CommitDestructiveActionMsg:
+		m.invalidateComposePanes()
+		commit := m.beginDestructiveCommit(msg.ID)
+		if commit == nil {
+			return m, nil
+		}
+		id := msg.ID
+		watchdog := tea.Tick(destructiveCommitTimeout, func(time.Time) tea.Msg { return DestructiveCommitTimeoutMsg{ID: id} })
+		return m, tea.Batch(commit, watchdog)
+
+	case DestructiveCommitTimeoutMsg:
+		m.invalidateComposePanes()
+		return m, m.failStuckDestructive(msg.ID)
+
+	case DestructiveActionResultMsg:
+		m.invalidateComposePanes()
+		cmd := m.handleDestructiveResult(msg)
+		// Archive, delete, and move can end or change a waiting conversation.
+		return m, tea.Batch(cmd, m.requestWaitingRefresh(), m.needsYouRefreshCmd())
+
+	case UpdateCheckedMsg:
+		m.updateErr = ""
+		m.cfg.Updates.LastCheckedUnix = time.Now().Unix()
+		if msg.Err != nil {
+			m.pendingUpdateInstall = false
+			m.updateState = updateStateError
+			m.updateErr = msg.Err.Error()
+			m.syncSettingsUpdateState()
+			_ = m.saveConfig()
+			if msg.Manual {
+				m.setStatus("update check failed: "+msg.Err.Error(), true)
+				return m, m.clearStatusCmd()
+			}
+			return m, nil
+		}
+
+		m.updateInfo = msg.Result.Latest
+		m.updateInfoFresh = true
+		m.updateDismissed = msg.Result.Latest.Version != "" && msg.Result.Latest.Version == m.cfg.Updates.DismissedVersion
+		if msg.Result.Available {
+			m.updateState = updateStateAvailable
+			m.cfg.Updates.AvailableVersion = msg.Result.Latest.Version
+			m.cfg.Updates.AvailableSummary = msg.Result.Latest.Summary
+			m.cfg.Updates.AvailablePublished = msg.Result.Latest.PublishedAt.Unix()
+			m.syncSettingsUpdateState()
+			_ = m.saveConfig()
+			if m.pendingUpdateInstall {
+				m.pendingUpdateInstall = false
+				// A manual check from Settings overrides any previous dismiss.
+				return m, m.beginUpdateInstall()
+			}
+			if !m.updateDismissed && (msg.Manual || update.IsStableVersion(m.currentVersion)) {
+				return m, nil
+			}
+			return m, nil
+		}
+
+		m.updateState = updateStateIdle
+		m.pendingUpdateInstall = false
+		m.updateDismissed = false
+		m.cfg.Updates.DismissedVersion = ""
+		m.clearCachedAvailableUpdate()
+		_ = m.saveConfig()
+		m.syncSettingsUpdateState()
+		if msg.Manual {
+			m.setStatus("Tide is up to date", false)
+			return m, m.clearStatusCmd()
+		}
+		return m, nil
+
+	case UpdateDownloadedMsg:
+		if msg.Err != nil {
+			m.updateInstallReady = true
+			m.updateInstallErr = fmt.Errorf("download failed: %w", msg.Err)
+			return m.finalizeUpdateInstall()
+		}
+		m.downloadedUpdate = &msg.Asset
+		m.updateState = updateStateInstalling
+		m.syncSettingsUpdateState()
+		return m, m.installUpdateCmd(msg.Asset)
+
+	case UpdateInstalledMsg:
+		if msg.Err != nil {
+			m.updateInstallReady = true
+			m.updateInstallErr = msg.Err
+			return m.finalizeUpdateInstall()
+		}
+		m.updateInstall = msg.Result
+		m.updateInstallReady = true
+		if m.updateProgress >= 100 {
+			return m.finalizeUpdateInstall()
+		}
+		m.syncSettingsUpdateState()
+		return m, nil
+
+	case UpdateProgressTickMsg:
+		if !m.updateInProgress() {
+			return m, nil
+		}
+		m.updateProgress = min(100, m.updateProgress+updateProgressStep)
+		if m.updateProgress < 100 {
+			return m, tickUpdateProgress()
+		}
+		if m.updateInstallReady {
+			return m.finalizeUpdateInstall()
+		}
+		return m, nil
+
+	case AccountsLoadedMsg:
+		if msg.ReadVersion < m.readVersion {
+			return m, m.loadAccountsCmd()
+		}
+		if msg.Err != nil && len(msg.Accounts) == 0 && len(msg.Mailboxes) == 0 {
+			m.initialLoading = false
+			m.accounts = nil
+			m.mailboxes = nil
+			m.rebuildSidebar()
+			m.clearMessages()
+			m.setStatus(msg.Err.Error(), true)
+			return m, m.clearStatusCmd()
+		}
+		prevKind, prevID := m.currentSidebarSelection()
+		m.accounts = msg.Accounts
+		m.mailboxes = msg.Mailboxes
+		statusCmd := tea.Cmd(nil)
+		if msg.Err != nil {
+			m.setStatus(msg.Err.Error(), true)
+			statusCmd = m.clearStatusCmd()
+		}
+		m.rebuildSidebar()
+		m.accountManager.setData(m.accounts, m.mailboxes, m.cfg.Accounts, m.cfg.OAuth, m.cfg.ExplicitDefaultAccountID())
+		openAccountManagerOnEmptyFirstLoad := m.firstLoad && msg.Err == nil && len(m.accounts) == 0
+		if m.firstLoad {
+			m.loadCollapseState()
+			m.loadMailboxPrefs()
+			m.rebuildSidebar()
+			statusCmd = tea.Batch(statusCmd, m.startSyncTimers(), m.syncInboxesNowCmd(), m.loadAddressBookCmd())
+			// One folder LIST per account at launch, independent of sync mode.
+			// refreshMailboxesCmd otherwise only runs off AutoSyncMsg, which a
+			// manual-only account never receives — so its folder tree would
+			// stay at whatever was stored last, or a bare INBOX for an account
+			// imported from the config file.
+			for _, acc := range m.accounts {
+				if cmd := m.refreshMailboxesCmd(acc.ID); cmd != nil {
+					m.lastFolderRefresh[acc.ID] = time.Now()
+					statusCmd = tea.Batch(statusCmd, cmd)
+				}
+			}
+			// If the keychain isn't readable, stored passwords/tokens came back
+			// empty — warn once up front so the failed syncs that follow aren't a
+			// mystery.
+			if usable, reason := config.KeyringStatus(); !usable && m.anyAccountNeedsKeychain() {
+				m.setStatus("system keychain unavailable: "+reason+" — saved passwords couldn't be loaded (unlock your login keychain, or re-enter with M)", true)
+				statusCmd = nil // sticky
+			}
+		}
+		if m.firstLoad {
+			statusCmd = tea.Batch(statusCmd, m.resumeOutbox())
+		}
+		// (Re)start the push watchers on every account load: it runs at startup
+		// and again whenever accounts are added, edited, or deleted, so watcher
+		// credentials and inbox targets never go stale.
+		statusCmd = tea.Batch(statusCmd, m.startIdleWatchers())
+		wasFirstLoad := m.firstLoad
+		m.firstLoad = false
+		if prevID == 0 && prevKind == rowKindMailbox {
+			m.sidebarCursor = 0
+		}
+		if m.pendingSelectMailboxID != 0 {
+			for i, row := range m.sidebarRows {
+				if row.kind == rowKindMailbox && row.mailboxID == m.pendingSelectMailboxID {
+					m.sidebarCursor = i
+					break
+				}
+			}
+			m.pendingSelectMailboxID = 0
+		} else if prevID != 0 {
+			m.restoreSidebarSelection(prevKind, prevID)
+		} else if wasFirstLoad && prevKind == rowKindMailbox {
+			// Startup lands on the default account's inbox — but only when one
+			// was explicitly chosen, so everybody else keeps opening on the
+			// unified inbox as before.
+			if row, ok := m.defaultAccountSidebarRow(); ok {
+				m.sidebarCursor = row
+			}
+		}
+		m.sidebarCursor = clamp(m.sidebarCursor, 0, max(0, len(m.sidebarRows)-1))
+		m.clampSidebarOffset()
+		if len(m.mailboxes) == 0 {
+			m.initialLoading = false
+			m.clearMessages()
+			if openAccountManagerOnEmptyFirstLoad {
+				m.overlay = overlayAccountManager
+				m.accountManager = m.newAccountManager()
+			}
+			if statusCmd != nil {
+				return m, statusCmd
+			}
+			return m, nil
+		}
+		cmds := []tea.Cmd{}
+		if !m.selectedWaiting() {
+			// Startup and account changes (identities) recompute waiting.
+			cmds = append(cmds, m.requestWaitingRefresh())
+		}
+		if cmd := m.virtualViewCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		} else if selected := m.selectedMailbox(); selected != nil {
+			cmds = append(cmds, m.loadMailboxMessagesCmd(selected.ID))
+			if m.selectedDraftsMailbox() {
+				cmds = append(cmds, m.loadDraftsCmd(selected.ID))
+			}
+			// A folder restored as the selection on startup fills in too.
+			cmds = append(cmds, m.scheduleFolderSettle())
+		} else {
+			m.clearMessages()
+		}
+		if statusCmd != nil {
+			cmds = append(cmds, statusCmd)
+		}
+		return m, tea.Batch(cmds...)
+
+	case MessagesLoadedMsg:
+		if msg.ReadVersion < m.readVersion {
+			cmd := m.reloadReadMessagesCmd(msg.ReadReloadIDs...)
+			return m, cmd
+		}
+		msg.Messages = m.reconcileConfirmedDeletes(msg.Messages)
+		m.initialLoading = false
+		if msg.Err == nil && m.db != nil && m.mailTags.operation > 0 {
+			if err := m.db.RefreshMailFlags(msg.Messages); err != nil {
+				msg.Err = err
+			}
+		}
+		if msg.Search {
+			if strings.TrimSpace(m.searchQuery) != strings.TrimSpace(msg.Query) {
+				return m, nil
+			}
+			if msg.MailTagVersion != m.mailTags.searchVersion {
+				return m, m.searchAllMessagesCmd(m.searchQuery)
+			}
+			if msg.Err != nil {
+				m.clearMessages()
+				m.setStatus(msg.Err.Error(), true)
+				return m, m.clearStatusCmd()
+			}
+			collapsed := m.preserveCollapsedReadSelection(msg.ReadReloadIDs)
+			currentID := int64(0)
+			if current := m.currentRowMessage(); current != nil {
+				currentID = current.ID
+			}
+			m.messages = msg.Messages
+			m.reloadMailTags()
+			m.refreshMailTagTarget(msg.Messages)
+			m.plugins.annotations = msg.Annotations
+			m.plugins.overrides = msg.Overrides
+			m.applyFilterPreservingCollapsed(collapsed)
+			if idx := m.indexOfMessageSelection(currentID, collapsed); idx >= 0 {
+				m.messageCursor = idx
+			} else {
+				m.messageCursor = clamp(m.messageCursor, 0, max(0, m.activeMessageRowCount()-1))
+			}
+			m.listOffset = clamp(m.listOffset, 0, max(0, m.activeMessageRowCount()-1))
+			if current := m.currentRowMessage(); current != nil {
+				m.setViewportForCurrentRow()
+			} else {
+				m.clearViewportMessage()
+			}
+			return m, nil
+		}
+		if m.searchActive() {
+			return m, nil
+		}
+		if msg.Err != nil {
+			if selected := m.selectedMailbox(); selected != nil && msg.MailboxID == selected.ID {
+				m.clearMessages()
+			}
+			m.setStatus(msg.Err.Error(), true)
+			return m, m.clearStatusCmd()
+		}
+		if (msg.NeedsYou && m.selectedNeedsYou()) || (msg.Waiting && m.selectedWaiting()) || (msg.Snoozed && m.selectedSnoozed()) || (!msg.NeedsYou && !msg.Waiting && !msg.Snoozed && msg.MailboxID == 0 && m.selectedUnifiedInbox()) || (!msg.NeedsYou && !msg.Waiting && !msg.Snoozed && func() bool {
+			selected := m.selectedMailbox()
+			return selected != nil && msg.MailboxID == selected.ID
+		}()) {
+			// Remember where the view was so a reload triggered by a delete (or a
+			// background sync) doesn't yank the list back to the top mid-triage.
+			prevCursor := m.messageCursor
+			prevOffset := m.listOffset
+			collapsed := m.preserveCollapsedReadSelection(msg.ReadReloadIDs)
+			var focusedID int64
+			if cur := m.currentRowMessage(); cur != nil && m.conversationView() == m.expansionView {
+				focusedID = cur.ID
+			}
+
+			m.messages = msg.Messages
+			m.reloadMailTags()
+			m.refreshMailTagTarget(msg.Messages)
+			m.plugins.annotations = msg.Annotations
+			m.plugins.overrides = msg.Overrides
+			if msg.NeedsYou || msg.Waiting || msg.Snoozed {
+				// Rows can leave a virtual view as their state changes.
+				m.pruneSelection()
+			}
+			m.applyFilterPreservingCollapsed(collapsed)
+
+			rowCount := m.activeMessageRowCount()
+			switch {
+			case m.pendingSelectMessageID != 0:
+				// An explicit "select this message" request wins over position.
+				if idx := m.indexOfFilteredMessage(m.pendingSelectMessageID); idx >= 0 {
+					m.messageCursor = idx
+				}
+				m.pendingSelectMessageID = 0
+				rowCount = m.activeMessageRowCount() // revealing a child can add rows
+				m.messageCursor = clamp(m.messageCursor, 0, max(0, rowCount-1))
+				m.listOffset = clamp(m.listOffset, 0, max(0, rowCount-1))
+			case focusedID != 0 && m.indexOfMessageSelection(focusedID, collapsed) >= 0:
+				// The focused row survived: keep it on the same screen line by
+				// shifting the scroll offset with it.
+				idx := m.indexOfMessageSelection(focusedID, collapsed)
+				shifted := prevOffset + (idx - prevCursor)
+				if prevOffset == 0 {
+					// Already at the top: mail that arrived above the focused
+					// row should come into view, not push the view down past
+					// it. Holding the offset costs the focused row its screen
+					// line, which is the point — it moves down as mail lands.
+					shifted = 0
+				}
+				m.listOffset = clamp(shifted, 0, max(0, rowCount-1))
+				m.messageCursor = idx
+			default:
+				// The focused row is gone (it was the deleted one). Hold the
+				// scroll position and let the cursor land on whatever now sits
+				// at that index.
+				m.messageCursor = clamp(prevCursor, 0, max(0, rowCount-1))
+				m.listOffset = clamp(prevOffset, 0, max(0, rowCount-1))
+			}
+
+			m.keepMessageCursorVisible()
+
+			if msg := m.currentRowMessage(); msg != nil {
+				m.setViewportForCurrentRow()
+			}
+		}
+		return m, nil
+
+	case FolderSettledMsg:
+		// Ignore a tick armed for a folder the cursor has since left.
+		if msg.Seq != m.folderSettleSeq {
+			return m, nil
+		}
+		selected := m.selectedMailbox()
+		if selected == nil || selected.ID != msg.MailboxID {
+			return m, nil
+		}
+		if !m.shouldAutoSyncFolder(*selected) {
+			return m, nil
+		}
+		// Do not put a passive refresh into the account's serialized IMAP queue.
+		// A slow fetch ahead of it can otherwise leave this mailbox marked as
+		// syncing (and, historically, animating) for minutes. Rearm it when the
+		// active mailbox finishes, provided the user is still here.
+		if m.accountHasSyncInFlight(selected.AccountID, selected.ID) {
+			m.folderSettlePending = selected.ID
+			return m, nil
+		}
+		m.folderSettlePending = 0
+		return m, m.syncPassiveFolderCmd(selected.ID)
+
+	case DraftsLoadedMsg:
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("load drafts failed: %v", msg.Err), true)
+			return m, m.clearStatusCmd()
+		}
+		if selected := m.selectedMailbox(); selected != nil && selected.ID == msg.MailboxID {
+			m.drafts = msg.Drafts
+			m.messageCursor = clamp(m.messageCursor, 0, max(0, len(m.drafts)-1))
+			m.listOffset = clamp(m.listOffset, 0, max(0, len(m.drafts)-1))
+			m.setViewportForCurrentRow()
+		}
+		return m, nil
+
+	case MailboxSyncedMsg:
+		m.invalidateComposePanes()
+		delete(m.syncing, msg.MailboxID)
+		delete(m.syncVisible, msg.MailboxID)
+		deferredFolderCmd := m.rearmDeferredFolderSettle()
+		if msg.Err != nil {
+			// Passive refreshes are tied to the folder the user rested on. If they
+			// have since moved away, keep the already-logged failure out of their
+			// current context.
+			if msg.Passive {
+				selected := m.selectedMailbox()
+				if selected == nil || selected.ID != msg.MailboxID {
+					return m, deferredFolderCmd
+				}
+			}
+			// A locked/unreadable keychain makes every stored secret come back
+			// empty, which surfaces as "empty username or password" / "no refresh
+			// token". Blaming the account's sign-in would be misleading.
+			if usable, reason := config.KeyringStatus(); !usable && looksLikeMissingCredential(msg.Err) {
+				m.setStatus("can't read saved passwords: "+reason+" — unlock your login keychain, or re-enter (M)", true)
+				return m, deferredFolderCmd
+			}
+			if auth.IsAuthFailure(msg.Err) || auth.IsTokenRevoked(msg.Err) {
+				name := "account"
+				if mb := m.mailboxByID(msg.MailboxID); mb != nil {
+					name = m.accountName(mb.AccountID)
+				}
+				// Sticky (no clearStatusCmd): an expired sign-in needs the user to
+				// re-authenticate, so a 2-second flash would just be missed.
+				m.setStatus(name+" sign-in expired — press M to re-authenticate", true)
+				return m, deferredFolderCmd
+			}
+			m.setStatus(fmt.Sprintf("sync failed: %v (%v)", msg.Err, msg.Total.Round(time.Millisecond)), true)
+			return m, tea.Batch(m.clearStatusCmd(), deferredFolderCmd)
+		}
+		if !msg.SyncedAt.IsZero() {
+			if mb := m.mailboxByID(msg.MailboxID); mb != nil {
+				mb.LastSynced = msg.SyncedAt
+			}
+		}
+		cmds := []tea.Cmd{m.loadAccountsCmd(), loadNeedsYouCountCmd(m.db)}
+		if cmd := m.virtualViewCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		} else if selected := m.selectedMailbox(); selected != nil && msg.MailboxID == selected.ID {
+			cmds = append(cmds, m.loadMailboxMessagesCmd(msg.MailboxID))
+		}
+		if mb := m.mailboxByID(msg.MailboxID); mb != nil && m.isDraftsMailbox(*mb) {
+			cmds = append(cmds, m.importRemoteDraftsCmd(msg.MailboxID))
+		}
+		if msg.Manual && msg.NewCount > 0 {
+			m.setStatus(fmt.Sprintf("synced: %d new", msg.NewCount), false)
+			cmds = append(cmds, m.clearStatusCmd())
+		} else if msg.Manual {
+			m.setStatus("up to date", false)
+			cmds = append(cmds, m.clearStatusCmd())
+		} else {
+			// Auto-sync: log to buffer silently (no status bar spam).
+			m.addToLog(fmt.Sprintf("auto-synced %d new (%v)", msg.NewCount, msg.Total.Round(time.Millisecond)), false)
+		}
+		if len(msg.NewMessages) > 0 && !msg.Manual && m.cfg.Display.Notifications {
+			cmds = append(cmds, m.notifyCmd(msg.MailboxID, msg.NewMessages))
+		}
+		// Genuinely new mail only; cold syncs are skipped inside.
+		m.enqueuePluginEvents(msg)
+		// Any sync (Inbox, Sent, Archive) can start or end a wait.
+		if cmd := m.requestWaitingRefresh(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if deferredFolderCmd != nil {
+			cmds = append(cmds, deferredFolderCmd)
+		}
+		if msg.Warning != nil {
+			m.setStatus("filter failed: "+msg.Warning.Error(), true)
+		}
+		if msg.More {
+			cmds = append(cmds, m.syncMailboxCmd(msg.MailboxID, false))
+		}
+		cmds = append(cmds, m.loadAddressBookCmd())
+		return m, tea.Batch(cmds...)
+
+	case OlderMessagesLoadedMsg:
+		m.invalidateComposePanes()
+		delete(m.syncing, msg.MailboxID)
+		delete(m.syncVisible, msg.MailboxID)
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("could not load older mail: %v", msg.Err), true)
+			return m, m.clearStatusCmd()
+		}
+		if msg.Exhausted {
+			m.olderExhausted[msg.MailboxID] = true
+		}
+		if msg.Count == 0 {
+			m.setStatus("no older mail on the server", false)
+			return m, m.clearStatusCmd()
+		}
+		m.setStatus(fmt.Sprintf("loaded %d older", msg.Count), false)
+		cmds := []tea.Cmd{m.clearStatusCmd()}
+		// Reload so the newly-cached page appears below the current row. The
+		// cursor is left where it is: the user was at the bottom, and the new
+		// messages land underneath them.
+		if selected := m.selectedMailbox(); selected != nil && selected.ID == msg.MailboxID {
+			cmds = append(cmds, m.loadMailboxMessagesCmd(msg.MailboxID))
+		}
+		return m, tea.Batch(cmds...)
+
+	case AccountSavedMsg:
+		m.accountManager.statusMsg = ""
+		if msg.Err != nil {
+			m.accountManager.busy = false
+			m.accountManager.busyMsg = ""
+			detail := m.accountManager.redactSensitiveWithAccounts(msg.Err.Error(), []config.AccountConfig{msg.AccountCfg})
+			m.accountManager.statusMsg = fmt.Sprintf("SAVE FAILED: %s", detail)
+			m.setStatus(fmt.Sprintf("save failed: %s", detail), true)
+			return m, m.clearStatusCmd()
+		}
+		previousCfg := m.cfg
+		nextCfg := m.cfg
+		nextCfg.Accounts = append([]config.AccountConfig(nil), m.cfg.Accounts...)
+		// Update config with the saved account, matched on its stable ID. Matching
+		// on the display name used to mean that saving an account under a name a
+		// peer already had overwrote that peer's whole block — host, user and
+		// password — and that renaming an account appended a duplicate instead of
+		// updating its own entry.
+		found := false
+		for i, a := range nextCfg.Accounts {
+			if a.ID == msg.AccountCfg.ID {
+				nextCfg.Accounts[i] = msg.AccountCfg
+				found = true
+				break
+			}
+		}
+		if !found {
+			nextCfg.Accounts = append(nextCfg.Accounts, msg.AccountCfg)
+		}
+		if err := m.persistConfig(nextCfg); err != nil {
+			m.accountManager.busy = false
+			m.accountManager.busyMsg = ""
+			detail := config.RedactSecrets(err.Error(), nextCfg)
+			m.accountManager.statusMsg = "SAVE FAILED: " + detail
+			m.setStatus("save failed: "+detail, true)
+			return m, m.clearStatusCmd()
+		}
+
+		m.accountManager.busy = true
+		m.accountManager.busyMsg = "SAVING..."
+		return m, saveAccountDatabaseCmd(m.db, msg, previousCfg, nextCfg)
+
+	case AccountDatabaseSavedMsg:
+		m.accountManager.busy = false
+		m.accountManager.busyMsg = ""
+		if msg.Err != nil {
+			// Save may already have moved credentials into the keychain. Remove
+			// the candidate generation first, then writing the previous config
+			// restores an edited account's prior credentials when it had any.
+			config.DeleteOAuth2Secrets(msg.AccountCfg.ID, "")
+			config.DeleteAccountPassword(msg.AccountCfg.ID, "")
+			rollbackErr := m.persistConfig(msg.PreviousCfg)
+			detail := config.RedactSecrets(msg.Err.Error(), msg.NextCfg)
+			if rollbackErr != nil {
+				detail += "; config rollback failed: " + config.RedactSecrets(rollbackErr.Error(), msg.PreviousCfg)
+			}
+			m.accountManager.statusMsg = "SAVE FAILED: " + detail
+			m.setStatus("save failed: "+detail, true)
+			return m, m.clearStatusCmd()
+		}
+		account := msg.Account
+		mailboxes := msg.Mailboxes
+		m.cfg = msg.NextCfg
+		// Also update in-memory accounts so scheduleNextSync can find it.
+		foundAcct := false
+		for i, a := range m.accounts {
+			if a.ID == account.ID {
+				m.accounts[i] = account
+				foundAcct = true
+				break
+			}
+		}
+		if !foundAcct {
+			m.accounts = append(m.accounts, account)
+		}
+		m.accountManager = m.newAccountManager()
+		m.accountManager.mode = amList
+		m.accountManager.statusMsg = fmt.Sprintf("SAVED: %s", strings.ToUpper(account.Name))
+		m.setStatus(fmt.Sprintf("saved: %s", account.Name), false)
+		if len(mailboxes) > 0 {
+			m.pendingSelectMailboxID = mailboxes[0].ID
+		}
+		return m, tea.Batch(m.loadAccountsCmd(), m.clearStatusCmd(), m.scheduleNextSync(account.ID))
+
+	case IdleEventMsg:
+		// Ignore events from a watcher that has since been replaced or stopped —
+		// re-arming a wait on it would leak a goroutine per stale event.
+		if msg.Stopped || m.idleWatchers[msg.AccountID].watcher != msg.Watcher {
+			return m, nil
+		}
+		// Re-arm the wait first, then sync the inbox the server nudged us about.
+		// The sync is the ordinary incremental one, so reconciliation, filters,
+		// and notifications all behave exactly as on a polling tick.
+		return m, tea.Batch(
+			waitIdleCmd(msg.Watcher, msg.AccountID, msg.MailboxID),
+			m.syncMailboxCmd(msg.MailboxID, false),
+		)
+
+	case AutoSyncMsg:
+		var cmds []tea.Cmd
+		// A timer that was already pending when the account was switched to
+		// manual-only can still fire once; it must not fetch.
+		if !m.syncsAutomatically(msg.AccountID) {
+			return m, nil
+		}
+		for _, mb := range m.mailboxes {
+			if mb.AccountID == msg.AccountID && isInboxMailbox(mb) {
+				cmds = append(cmds, m.syncMailboxCmd(mb.ID, false))
+			}
+		}
+		// Piggyback an account-level folder refresh on the auto-sync tick, but
+		// throttled far below the message sync cadence — the folder tree changes
+		// rarely and a LIST per minute would be wasteful. The first tick after
+		// launch always passes (zero-value timestamp).
+		if last := m.lastFolderRefresh[msg.AccountID]; time.Since(last) >= folderRefreshInterval {
+			if cmd := m.refreshMailboxesCmd(msg.AccountID); cmd != nil {
+				m.lastFolderRefresh[msg.AccountID] = time.Now()
+				cmds = append(cmds, cmd)
+			}
+		}
+		// Reschedule next auto-sync for this account — only one pending
+		// timer per account, avoiding the accumulation that causes
+		// "Too many simultaneous connections" errors.
+		if cmd := m.scheduleNextSync(msg.AccountID); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if len(cmds) > 0 {
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case MailboxesRefreshedMsg:
+		if msg.Err != nil {
+			// Non-fatal: log to the fetch log and move on. Folder refresh is a
+			// convenience, so don't intrude on the status line during routine
+			// auto-sync.
+			logFetch(fmt.Sprintf("account %d", msg.AccountID), "(folders)", 0, 0, 0, 0, msg.Err)
+			return m, nil
+		}
+		if len(msg.Mailboxes) == 0 && len(msg.Updated) == 0 && len(msg.Removed) == 0 {
+			return m, nil
+		}
+		// Capture the active folder before mutating so we can detect whether it
+		// was just pruned out from under the user.
+		var activeID int64
+		if sel := m.selectedMailbox(); sel != nil {
+			activeID = sel.ID
+		}
+		if len(msg.Mailboxes) > 0 {
+			m.mailboxes = append(m.mailboxes, msg.Mailboxes...)
+		}
+		if len(msg.Updated) > 0 {
+			// Refreshed flags/delimiter for folders we already had. Keep
+			// LastSynced and unread counts, which the LIST does not carry.
+			byID := make(map[int64]db.Mailbox, len(msg.Updated))
+			for _, mb := range msg.Updated {
+				byID[mb.ID] = mb
+			}
+			for i := range m.mailboxes {
+				if fresh, ok := byID[m.mailboxes[i].ID]; ok {
+					m.mailboxes[i].Flags = fresh.Flags
+					m.mailboxes[i].Delimiter = fresh.Delimiter
+					m.mailboxes[i].DisplayName = fresh.DisplayName
+				}
+			}
+		}
+		if len(msg.Removed) > 0 {
+			gone := make(map[int64]bool, len(msg.Removed))
+			for _, id := range msg.Removed {
+				gone[id] = true
+				// Drop any in-flight spinner state for the pruned mailbox.
+				// syncing is only cleared on MailboxSyncedMsg, which is keyed by
+				// mailbox ID — once the row is gone that message can never land,
+				// so the entry (and its status-line spinner) would leak forever.
+				delete(m.syncing, id)
+				delete(m.syncVisible, id)
+			}
+			kept := m.mailboxes[:0]
+			for _, mb := range m.mailboxes {
+				if !gone[mb.ID] {
+					kept = append(kept, mb)
+				}
+			}
+			m.mailboxes = kept
+			// If the folder being viewed was pruned, drop its now-orphaned
+			// message list so the content pane doesn't show stale rows.
+			if gone[activeID] {
+				m.clearMessages()
+			}
+		}
+		m.rebuildSidebar()
+		return m, nil
+
+	case CatalogLoadedMsg:
+		m.invalidateComposePanes()
+		return m.handleCatalogLoaded(msg)
+
+	case CatalogChangedMsg:
+		m.invalidateComposePanes()
+		return m.handleCatalogChanged(msg)
+
+	case PGPDecodedMsg:
+		return m.handlePGPDecoded(msg)
+
+	case AddressBookLoadedMsg:
+		if msg.Err == nil {
+			m.addressBook = msg.Addresses
+			addSpellNames(msg.Addresses)
+		}
+		return m, nil
+
+	case ServersDiscoveredMsg:
+		newAM, cmd, _ := m.accountManager.applyDiscovery(msg)
+		m.accountManager = newAM
+		return m, cmd
+
+	case PasswordDialogMsg:
+		m.accountManager = m.accountManager.applyPasswordDialog(msg)
+		return m, nil
+
+	case AccountTestedMsg:
+		m.accountManager.busy = false
+		m.accountManager.busyMsg = ""
+		if msg.Err != nil {
+			detail := m.accountManager.redactSensitive(msg.Err.Error())
+			m.accountManager.statusMsg = fmt.Sprintf("TEST FAILED: %s", detail)
+			return m, nil
+		}
+		m.accountManager.statusMsg = fmt.Sprintf("CONNECTED: %d MAILBOXES", msg.MailboxCount)
+		return m, nil
+
+	case AccountDeletedMsg:
+		m.accountManager.statusMsg = ""
+		if msg.Err != nil {
+			m.accountManager.busy = false
+			m.accountManager.busyMsg = ""
+			m.accountManager.statusMsg = fmt.Sprintf("DELETE FAILED: %v", msg.Err)
+			m.setStatus(fmt.Sprintf("delete failed: %v", msg.Err), true)
+			return m, m.clearStatusCmd()
+		}
+		// Drop the account from the config too, otherwise loadAccountsCmd's
+		// ensureConfiguredAccounts re-imports it straight back into the DB (and it
+		// would return again on the next launch). Only the deleted account's own
+		// entry goes: this used to drop every entry sharing its display name,
+		// which took a peer's credentials with it.
+		previousCfg := m.cfg
+		nextCfg := m.cfg
+		nextCfg.Accounts = make([]config.AccountConfig, 0, len(m.cfg.Accounts))
+		if id := strings.TrimSpace(msg.ConfigID); id != "" {
+			for _, a := range m.cfg.Accounts {
+				if a.ID != id {
+					nextCfg.Accounts = append(nextCfg.Accounts, a)
+				}
+			}
+			if nextCfg.DefaultAccountID == id {
+				// The default sender is going away; fall back to "first
+				// account" rather than leaving a dangling ID behind.
+				nextCfg.DefaultAccountID = ""
+			}
+			if err := m.persistConfig(nextCfg); err != nil {
+				m.accountManager.busy = false
+				m.accountManager.busyMsg = ""
+				m.accountManager.statusMsg = "DELETE FAILED: " + err.Error()
+				m.setStatus("delete failed: "+err.Error(), true)
+				return m, m.clearStatusCmd()
+			}
+		}
+		m.accountManager.busy = true
+		m.accountManager.busyMsg = "DELETING..."
+		return m, deleteAccountDatabaseCmd(m.db, msg, previousCfg, nextCfg)
+
+	case AccountOrderChangedMsg:
+		return m.persistAccountConfigChange(
+			func(c *config.Config) { c.ReorderAccounts(msg.OrderedIDs) },
+			"account order saved",
+			msg.FocusConfigID,
+		)
+
+	case AccountDefaultChangedMsg:
+		return m.persistAccountConfigChange(
+			func(c *config.Config) { c.SetDefaultAccount(msg.ConfigID) },
+			"default sender: "+msg.Name,
+			msg.ConfigID,
+		)
+
+	case AccountDatabaseDeletedMsg:
+		m.accountManager.busy = false
+		m.accountManager.busyMsg = ""
+		if msg.Err != nil {
+			rollbackErr := m.persistConfig(msg.PreviousCfg)
+			detail := msg.Err.Error()
+			if rollbackErr != nil {
+				detail += "; config rollback failed: " + rollbackErr.Error()
+			}
+			m.accountManager.statusMsg = "DELETE FAILED: " + detail
+			m.setStatus("delete failed: "+detail, true)
+			return m, m.clearStatusCmd()
+		}
+		m.cfg = msg.NextCfg
+		legacyName := msg.AccountName
+		for _, survivor := range msg.NextCfg.Accounts {
+			if survivor.Name == msg.AccountName {
+				legacyName = ""
+				break
+			}
+		}
+		config.DeleteOAuth2Secrets(msg.ConfigID, legacyName)
+		config.DeleteAccountPassword(msg.ConfigID, legacyName)
+		for i, a := range m.accounts {
+			if a.ID == msg.AccountID {
+				m.accounts = append(m.accounts[:i], m.accounts[i+1:]...)
+				break
+			}
+		}
+		m.sidebarCursor = 0
+		m.sidebarOffset = 0
+		m.messageCursor = 0
+		m.clearMessages()
+		m.accountManager = m.newAccountManager()
+		m.accountManager.mode = amList
+		m.accountManager.statusMsg = "DELETED ACCOUNT"
+		return m, m.loadAccountsCmd()
+
+	case pillFadeTickMsg:
+		cmd := m.pillFadeTick(msg)
+		return m, cmd
+
+	case readAnimationTickMsg:
+		if !m.readAnimationRunning || msg.Generation != m.readAnimationGeneration {
+			return m, nil
+		}
+		if len(m.pendingReads) == 0 && !m.deleteFeedbackActive() {
+			m.readAnimationRunning = false
+			return m, nil
+		}
+		m.readAnimationFrame = (m.readAnimationFrame + 1) % len(readAnimationFrames)
+		return m, readAnimationTick(m.readAnimationGeneration)
+	case readRemoteCompletedMsg:
+		cmd := m.finishReadChanges(msg)
+		return m, cmd
+
+	case MessageStarredUpdatedMsg:
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("star failed: %v", msg.Err), true)
+			return m, m.clearStatusCmd()
+		}
+		for i := range m.messages {
+			if m.messages[i].ID == msg.MessageID {
+				m.messages[i].Starred = msg.Starred
+				break
+			}
+		}
+		var currentID int64
+		if cur := m.currentRowMessage(); cur != nil {
+			currentID = cur.ID
+		}
+		m.applyFilter()
+		if idx := m.indexOfFilteredMessage(currentID); idx >= 0 {
+			m.messageCursor = idx
+		} else {
+			m.messageCursor = clamp(m.messageCursor, 0, max(0, m.activeMessageRowCount()-1))
+		}
+		if m.activeMessageRowCount() > 0 {
+			m.setViewportForCurrentRow()
+		}
+		return m, nil
+
+	case pluginResultMsg:
+		m.invalidateComposePanes()
+		return m.handlePluginResult(msg)
+
+	case reportSavedMsg:
+		return m.handleReportSaved(msg)
+	case reportPrintedMsg:
+		return m.handleReportPrinted(msg)
+	case pluginReportMsg:
+		return m.handlePluginReport(msg)
+
+	case pluginBulkStepMsg:
+		m.invalidateComposePanes()
+		return m.handleBulkStep(msg)
+
+	case pluginAnnotationCountsMsg, pluginAnnotationsClearedMsg:
+		m.invalidateComposePanes()
+		return m.handlePluginCleanupMsg(msg)
+
+	case pluginEventMsg:
+		m.invalidateComposePanes()
+		return m.handlePluginEvent(msg)
+
+	case pluginAnnotationsRefreshedMsg:
+		m.invalidateComposePanes()
+		return m.handlePluginAnnotationsRefreshed(msg)
+
+	case pluginSecretPresenceMsg, pluginSecretSavedMsg, pluginTestResultMsg:
+		return m.handlePluginSettingsMsg(msg)
+
+	case mailTagChangedMsg:
+		m.invalidateComposePanes()
+		return m.handleMailTagChanged(msg)
+
+	case classificationOverrideMsg:
+		m.invalidateComposePanes()
+		return m.handleClassificationMsg(msg)
+
+	case needsYouCountMsg, needsYouDismissMsg:
+		return m.handleNeedsYouMsg(msg)
+
+	case waitingLoadedMsg, waitingStopMsg:
+		m.invalidateComposePanes()
+		return m.handleWaitingMsg(msg)
+
+	case snoozeLoadedMsg, snoozeAppliedMsg:
+		m.invalidateComposePanes()
+		return m.handleSnoozeMsg(msg)
+
+	case snoozeTickMsg:
+		return m.handleSnoozeTick(msg)
+
+	case FolderRenamedMsg:
+		return m.handleFolderRenamed(msg)
+
+	case FolderDeletedMsg:
+		return m.handleFolderDeleted(msg)
+
+	case FolderCreatedMsg:
+		m.folderOpBusy = false
+		if msg.Err != nil {
+			m.setStatus("create folder failed: "+msg.Err.Error(), true)
+			return m, m.clearStatusCmd()
+		}
+		if m.mailboxByID(msg.MailboxID) == nil {
+			m.mailboxes = append(m.mailboxes, db.Mailbox{
+				ID:          msg.MailboxID,
+				AccountID:   msg.AccountID,
+				Name:        msg.Name,
+				DisplayName: displayNameForDelimiter(msg.Name, msg.Delimiter),
+				Delimiter:   msg.Delimiter,
+			})
+		}
+		m.rebuildSidebar()
+		if m.overlay == overlayMoveMessage {
+			m.movePicker.creating = false
+			m.movePicker.currentPath = msg.Name
+			m.movePicker.cursor = 0
+			m.refreshMovePickerEntries()
+		}
+		m.setStatus("folder created: "+msg.Name, false)
+		return m, m.clearStatusCmd()
+
+	case FilterGeneratedMsg:
+		if m.overlay == overlayFilterManager {
+			if msg.Err != nil {
+				m.filterManager.mode = fmInput
+				m.filterManager.input.Focus()
+				m.filterManager.status = "generate failed: " + msg.Err.Error()
+				return m, nil
+			}
+			m.filterManager.draft = msg.Rule
+			m.filterManager.mode = fmReview
+			m.filterManager.status = ""
+		}
+		return m, nil
+
+	case FilterFoldersPreparedMsg:
+		m.filterManager.saving = false
+		for _, mailbox := range msg.Mailboxes {
+			if m.mailboxByID(mailbox.ID) == nil {
+				m.mailboxes = append(m.mailboxes, mailbox)
+			}
+		}
+		if len(msg.Mailboxes) > 0 {
+			m.rebuildSidebar()
+		}
+		if msg.Err != nil {
+			m.filterManager.status = "save failed: " + msg.Err.Error()
+			return m, nil
+		}
+		return m.finishSaveDraftRule(msg.Intent)
+
+	case FilterRunMsg:
+		if msg.Err != nil {
+			m.filterManager.status = "error: " + msg.Err.Error()
+			m.setStatus("filter run error: "+msg.Err.Error(), true)
+		} else if msg.DryRun {
+			m.filterManager.status = fmt.Sprintf("test: %d message(s) would match", msg.Matched)
+		} else {
+			m.filterManager.status = fmt.Sprintf("applied to %d of %d matched", msg.Applied, msg.Matched)
+		}
+		cmds := []tea.Cmd{m.clearStatusCmd()}
+		if !msg.DryRun && msg.Applied > 0 {
+			cmds = append(cmds, m.loadAccountsCmd())
+		}
+		return m, tea.Batch(cmds...)
+
+	case MessagesDeletedMsg:
+		for _, ref := range msg.Deleted {
+			if m.removeMessageFromMemory(ref.ID) {
+				m.adjustMailboxUnreadCount(ref.MailboxID, -1)
+			}
+		}
+		switch {
+		case msg.Failed > 0 && len(msg.Deleted) == 0:
+			m.setStatus(fmt.Sprintf("delete failed: %v", msg.Err), true)
+		case msg.Failed > 0:
+			m.setStatus(fmt.Sprintf("deleted %d; %d failed and kept: %v", len(msg.Deleted), msg.Failed, msg.Err), true)
+		case len(msg.Deleted) > 1:
+			m.setStatus(fmt.Sprintf("deleted %d", len(msg.Deleted)), false)
+		default:
+			m.setStatus("deleted", false)
+		}
+		return m, m.clearStatusCmd()
+
+	case GrammarCheckedMsg:
+		if msg.Request == nil || msg.Request != m.compose.grammarRequest || m.overlay != overlayCompose {
+			return m, nil
+		}
+		msg.Request.cancel()
+		m.compose.grammarRequest = nil
+		m.compose.busy = false
+		if msg.Err != nil {
+			m.compose.statusMsg = grammarFailedStatus(msg.Err)
+			m.compose.isErr = true
+		} else {
+			m.grammarOriginal = m.compose.bodyInput.Value()
+			m.grammarCorrected = msg.Corrected
+			m.openGrammarPreview()
+		}
+		return m, nil
+
+	case MailboxReadUpdatedMsg:
+		m.invalidateComposePanes()
+		matched := false
+		for _, id := range msg.ReservedMailboxIDs {
+			if token, ok := m.pendingBulkReads[id]; ok && token == msg.Token {
+				delete(m.pendingBulkReads, id)
+				matched = true
+			}
+		}
+		if !matched {
+			return m, nil
+		}
+		if len(msg.MailboxIDs) > 0 {
+			m.readVersion++
+			m.markMailboxesReadInMemory(msg.MailboxIDs)
+			for _, id := range msg.MailboxIDs {
+				if err := m.recountMailboxUnread(id); err != nil && msg.Err == nil {
+					msg.Err = err
+				}
+			}
+		}
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("mark read failed: %v", msg.Err), true)
+			return m, m.clearStatusCmd()
+		}
+		return m, nil
+
+	case UnsubscribeResultMsg:
+		if msg.Err != nil {
+			// One-click failed; hand the confirmation page to the browser so
+			// the user can still finish the unsubscribe.
+			m.setStatus(fmt.Sprintf("one-click failed (%v) — opening in browser", msg.Err), true)
+			return m, tea.Batch(m.openBrowserCmd(msg.FallbackURL), m.clearStatusCmd())
+		}
+		m.setStatus("unsubscribed", false)
+		return m, m.clearStatusCmd()
+
+	case SendQueuedMsg:
+		if m.compose.saving {
+			m.compose.sendAfterSave = &msg
+			m.compose.busy = true
+			return m, nil
+		}
+		if msg.Sign || msg.Encrypt {
+			return m.protectOutgoing(msg)
+		}
+		return m.handleSendQueued(msg)
+
+	case OutgoingProtectedMsg:
+		return m.handleOutgoingProtected(msg)
+
+	case CommitSendMsg:
+		m.invalidateComposePanes()
+		return m, m.commitPendingSend(msg.ID)
+
+	case MessageSentMsg:
+		return m.handleOutboxSent(msg)
+
+	case DraftSavedMsg:
+		return m.handleDraftSaved(msg)
+
+	case DraftDeletedMsg:
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("draft delete failed: %v", msg.Err), true)
+			// The list row was removed optimistically; the draft still exists, so
+			// reload to bring it back rather than hiding it until the next refresh.
+			cmds := []tea.Cmd{m.clearStatusCmd()}
+			if mb := m.selectedMailbox(); mb != nil && m.isDraftsMailbox(*mb) {
+				cmds = append(cmds, m.loadDraftsCmd(mb.ID))
+			}
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case AISummaryFetchedMsg:
+		m.summaryGenerating = false
+		if msg.Err != nil {
+			m.summaryErr = msg.Err.Error()
+			return m, nil
+		}
+		if err := m.db.SaveSummary(msg.MessageID, msg.Summary); err != nil {
+			fmt.Fprintf(os.Stderr, "save summary failed (message %d): %v\n", msg.MessageID, err)
+			m.setStatus(fmt.Sprintf("summary not saved: %v", err), true)
+		}
+		var markReadMsg *db.Message
+		for i := range m.messages {
+			if m.messages[i].ID == msg.MessageID {
+				m.messages[i].Summary = msg.Summary
+				if m.cfg.AI.MarkReadOnSummarize && !m.messages[i].Read {
+					cp := m.messages[i]
+					markReadMsg = &cp
+				}
+			}
+		}
+		m.applyFilter()
+		if m.summaryMessage.ID == msg.MessageID {
+			m.summaryMessage.Summary = msg.Summary
+		}
+		if markReadMsg != nil {
+			cmd := m.setMessageReadCmd(*markReadMsg, true, false)
+			return m, cmd
+		}
+		return m, nil
+
+	case SummarySavedMsg:
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("save failed: %v", msg.Err), true)
+		} else {
+			m.setStatus("saved → "+msg.Path, false)
+		}
+		return m, m.clearStatusCmd()
+
+	case emailBrowserOpenedMsg:
+		switch {
+		case msg.err != nil:
+			m.setStatus("View in browser: "+msg.err.Error(), true)
+		case msg.blocked > 0:
+			m.browserReopen = msg.msgID
+			m.setStatus(fmt.Sprintf("opened in browser, %d remote images blocked — %s again to load them", msg.blocked, m.keyHint(m.keys.OpenInBrowser)), false)
+		case msg.images:
+			m.setStatus("opened in browser (images loaded)", false)
+		default:
+			m.setStatus("opened in browser", false)
+		}
+		return m, m.clearStatusCmd()
+
+	case SourceFetchedMsg:
+		return m.handleSourceFetched(msg)
+
+	case ClipboardCopiedMsg:
+		if msg.Err != nil {
+			m.setComposeStatus("copy failed: "+msg.Err.Error(), true)
+		} else {
+			m.setComposeStatus("copied to clipboard", false)
+		}
+		return m, m.clearStatusCmd()
+
+	case BrowserOpenedMsg:
+		if msg.Err != nil {
+			m.setStatus("Could not open your browser — "+msg.URL, true)
+		} else {
+			m.setStatus("opened in browser", false)
+		}
+		return m, m.clearStatusCmd()
+
+	case ClipboardReadMsg:
+		if msg.Err != nil {
+			m.setComposeStatus("paste failed: "+msg.Err.Error(), true)
+			return m, m.clearStatusCmd()
+		}
+		if m.overlay == overlayCompose && msg.Text != "" {
+			sanitized := sanitizePaste(msg.Text)
+			if !m.compose.maximized {
+				m.setStatus(fmt.Sprintf("pasted %d chars", len(sanitized)), false)
+			}
+			return m.handleCompose(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(sanitized), Paste: true})
+		}
+		return m, nil
+
+	case AttachmentsSavedMsg:
+		if msg.Err != nil {
+			m.setStatus(fmt.Sprintf("save attachments failed: %v", msg.Err), true)
+		} else {
+			m.setStatus(fmt.Sprintf("saved %d attachment(s) to %s", msg.Count, msg.Path), false)
+		}
+		return m, m.clearStatusCmd()
+
+	case ErrMsg:
+		m.setStatus(msg.Err.Error(), true)
+		return m, m.clearStatusCmd()
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+
+	default:
+		if m.overlay == overlayAccountManager {
+			return m.handleAccountManager(msg)
+		}
+		if m.overlay == overlayContactManager {
+			return m.handleContactManager(msg)
+		}
+		if m.overlay == overlaySettings {
+			return m.handleSettings(msg)
+		}
+		if m.overlay == overlayCompose {
+			return m.handleCompose(msg)
+		}
+	}
+
+	return m, nil
+}
+
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The "reopen with images" offer lasts only until the next other key.
+	if !keyMatches(msg, m.keys.OpenInBrowser) {
+		m.browserReopen = 0
+	}
+	// Modal overlays get first claim on keys so main-pane shortcuts cannot leak through dialogs. -allie
+	// Overlay / window takes priority
+	if m.overlay != overlayNone {
+		return m.handleOverlayKey(msg)
+	}
+	return m.handleMainKey(msg)
+}
+
+func (m Model) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.folderPrompt.active {
+		return m.handleFolderPromptKey(msg)
+	}
+	// Search mode editing intercept — capture typed characters for the query.
+	if m.searchMode && m.searchEditing {
+		switch {
+		case keyMatches(msg, m.keys.Cancel):
+			return m.exitSearchMode()
+		case keyMatches(msg, m.keys.Confirm):
+			m.searchEditing = false
+			m.searchInput.Blur()
+			return m, nil
+		// Build on the box's own text, not searchQuery: the query is trimmed, so
+		// appending to it would drop a space typed between words.
+		case keyMatches(msg, m.keys.Backspace):
+			return m.handleSearchCharacter(deleteLastRune(m.searchInput.Value()))
+		default:
+			if msg.String() != "" && len(msg.Runes) > 0 {
+				return m.handleSearchCharacter(m.searchInput.Value() + string(msg.Runes))
+			}
+		}
+		return m, nil
+	}
+
+	// Esc exits search mode when not editing.
+	if m.searchMode && keyMatches(msg, m.keys.Cancel) {
+		return m.exitSearchMode()
+	}
+
+	switch {
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.NewFolder):
+		return m.startNewFolder()
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.RenameFolder):
+		return m.startRenameFolder()
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.DeleteFolder):
+		return m.startDeleteFolder()
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.HideFolder):
+		return m.toggleHideSelectedFolder()
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.MoveAccountUp) && m.selectedMailbox() != nil:
+		return m.moveSelectedFolder(-1)
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.MoveAccountDown) && m.selectedMailbox() != nil:
+		return m.moveSelectedFolder(1)
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.IndentFolder) && m.selectedMailbox() != nil:
+		return m.indentSelectedFolder()
+	case m.focused == paneAccounts && keyMatches(msg, m.keys.OutdentFolder) && m.selectedMailbox() != nil:
+		return m.outdentFolderKey()
+	case keyMatches(msg, m.keys.NeedsYouDismiss) && m.selectedNeedsYou() && m.focused != paneAccounts:
+		// Dismiss from Needs You. Only here: elsewhere X does nothing.
+		return m.dismissCurrent()
+	case keyMatches(msg, m.keys.NeedsYouDismiss) && m.selectedWaiting() && m.focused != paneAccounts:
+		return m.stopWaitingCurrent()
+	case keyMatches(msg, m.keys.Snooze) && m.focused != paneAccounts:
+		return m.handleSnoozeKeyPress()
+	case keyMatches(msg, m.keys.RunPlugin) && m.focused != paneAccounts && m.pluginsVisible():
+		return m.executePluginCommand("plugin-run")
+	case keyMatches(msg, m.keys.PGPDecode) && m.focused != paneAccounts && !m.selectedDraftsMailbox():
+		if cur := m.commandMessage(); cur != nil {
+			return m.startPGPDecode(*cur)
+		}
+		return m, nil
+	case keyMatches(msg, m.keys.EditTags) && m.focused != paneAccounts && !m.selectedDraftsMailbox():
+		return m.openClassificationEditor()
+
+	case keyMatches(msg, m.keys.Undo):
+		// A queued send is the most recent (and most urgent) thing to take
+		// back; fall through to message-action undo when none is pending.
+		if m.undoLatestPendingSend() {
+			return m, m.clearStatusCmd()
+		}
+		if cmd, ok := m.undoNeedsYouDismissal(); ok {
+			return m, cmd
+		}
+		if cmd, ok := m.undoStopWaiting(); ok {
+			return m, cmd
+		}
+		return m, m.undoLatestDestructive()
+
+	case keyMatches(msg, m.keys.Quit):
+		if !m.cfg.Display.ConfirmQuit {
+			m.quitActivated = true
+			return m, tea.Quit
+		}
+		m.overlay = overlayQuitConfirm
+		return m, nil
+
+	case keyMatches(msg, m.keys.Help):
+		m.overlay = overlayHelp
+		m.helpCat, m.helpRight = 0, false
+		m.resetHelpVP()
+		return m, nil
+
+	case keyMatches(msg, m.keys.Outbox):
+		m.openOutbox()
+		return m, nil
+	case keyMatches(msg, m.keys.AccountManager):
+		m.overlay = overlayAccountManager
+		m.accountManager = m.newAccountManager()
+		return m, nil
+
+	case keyMatches(msg, m.keys.ContactManager):
+		m.overlay = overlayContactManager
+		m.contactManager = NewContactManager(m.db)
+		return m, nil
+
+	case keyMatches(msg, m.keys.ThemePicker):
+		m.openThemePicker()
+		return m, nil
+
+	case keyMatches(msg, m.keys.Search):
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			m.overlay = overlayContentSearch
+			m.contentSearchInput.Reset()
+			m.contentSearchInput.Focus()
+			return m, nil
+		}
+		if m.searchMode {
+			// Already in search mode — re-enter editing.
+			m.searchEditing = true
+			m.searchInput.SetValue(m.searchQuery)
+			m.searchInput.Focus()
+			return m, nil
+		}
+		// Enter persistent search mode.
+		m.searchMode = true
+		m.searchEditing = true
+		m.searchInput.SetValue(m.searchQuery)
+		m.searchInput.Focus()
+		return m, nil
+
+	case keyMatches(msg, m.keys.Command):
+		m.openCommandPalette(overlayNone, commandPaletteMain)
+		return m, nil
+
+	case keyMatches(msg, m.keys.UnreadOnly):
+		if m.focused == paneAccounts {
+			return m, nil
+		}
+		m.showUnreadOnly = !m.showUnreadOnly
+		var currentID int64
+		if msg := m.currentRowMessage(); msg != nil {
+			currentID = msg.ID
+		}
+		m.applyFilter()
+		if idx := m.indexOfFilteredMessage(currentID); idx >= 0 {
+			m.messageCursor = idx
+		} else {
+			m.messageCursor = clamp(m.messageCursor, 0, max(0, m.activeMessageRowCount()-1))
+		}
+		if m.showUnreadOnly {
+			m.setStatus("showing unread only", false)
+		} else {
+			m.setStatus("showing all messages", false)
+		}
+		if m.activeMessageRowCount() > 0 {
+			m.setViewportForCurrentRow()
+		} else {
+			m.clearViewportMessage()
+		}
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.StarredFirst):
+		if m.focused == paneAccounts {
+			return m, nil
+		}
+		m.starredFirst = !m.starredFirst
+		var currentID int64
+		if msg := m.currentRowMessage(); msg != nil {
+			currentID = msg.ID
+		}
+		m.applyFilter()
+		if idx := m.indexOfFilteredMessage(currentID); idx >= 0 {
+			m.messageCursor = idx
+		} else {
+			m.messageCursor = clamp(m.messageCursor, 0, max(0, m.activeMessageRowCount()-1))
+		}
+		if m.starredFirst {
+			m.setStatus("starred first", false)
+		} else {
+			m.setStatus("normal order", false)
+		}
+		// Persist so the sort survives restarts (mirrors the Settings toggle).
+		m.cfg.Display.StarredFirst = m.starredFirst
+		_ = m.saveConfig()
+		if m.activeMessageRowCount() > 0 {
+			m.setViewportForCurrentRow()
+		} else {
+			m.clearViewportMessage()
+		}
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.ToggleThreads):
+		if m.focused == paneAccounts || m.selectedDraftsMailbox() {
+			return m, nil
+		}
+		var currentID int64
+		if msg := m.currentRowMessage(); msg != nil {
+			currentID = msg.ID
+		}
+		m.cfg.Display.ThreadedConversations = !m.cfg.Display.ThreadedConversations
+		m.applyFilter()
+		if idx := m.indexOfFilteredMessage(currentID); idx >= 0 {
+			m.messageCursor = idx
+		} else {
+			m.messageCursor = clamp(m.messageCursor, 0, max(0, m.activeMessageRowCount()-1))
+		}
+		if m.activeMessageRowCount() > 0 {
+			m.setViewportForCurrentRow()
+		} else {
+			m.clearViewportMessage()
+		}
+		_ = m.saveConfig()
+		if m.cfg.Display.ThreadedConversations {
+			m.setStatus("threaded conversations on", false)
+		} else {
+			m.setStatus("threaded conversations off", false)
+		}
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.NextPane):
+		return m.focusPane(pane((int(m.focused) + 1) % 3))
+
+	case keyMatches(msg, m.keys.PrevPane):
+		return m.focusPane(pane((int(m.focused) + 2) % 3))
+
+	case keyMatches(msg, m.keys.ResizeAccountsNarrow):
+		m.resizeAccountsPane(-accountsPaneStepPercent)
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.ResizeAccountsWide):
+		m.resizeAccountsPane(accountsPaneStepPercent)
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.ResizeMessagesShorter):
+		m.resizeMessagesPane(-messagesPaneStepPercent)
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.ResizeMessagesTaller):
+		m.resizeMessagesPane(messagesPaneStepPercent)
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.Left):
+		if m.focused == paneAccounts {
+			prev := m.sidebarCursor
+			if m.collapseOrJumpToParentFolder() {
+				if m.sidebarCursor == prev {
+					return m, nil
+				}
+				return m, m.loadSelectedFolderCmd()
+			}
+		}
+		if m.focused > paneAccounts {
+			return m.focusPane(m.focused - 1)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Right):
+		if m.focused == paneAccounts {
+			expand := false
+			if m.sidebarCursor >= 0 && m.sidebarCursor < len(m.sidebarRows) {
+				if row := m.sidebarRows[m.sidebarCursor]; row.kind == rowKindMailbox && row.collapsed && m.setSelectedFolderCollapsed(&expand) {
+					return m, nil
+				}
+			}
+		}
+		if m.focused < paneContent {
+			return m.focusPane(m.focused + 1)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Up):
+		return m.handleUp()
+
+	case keyMatches(msg, m.keys.Down):
+		return m.handleDown()
+
+	case keyMatches(msg, m.keys.VisualSelect):
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			m.startContentSelection()
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.VisualLine):
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			m.selectAllContentLines()
+		}
+		return m, nil
+
+	case msg.String() == "y" || msg.String() == "ctrl+c":
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			text := m.readerMouseText()
+			if !m.readerMouse.moved {
+				text = m.contentSelectionText(msg.String() == "ctrl+c")
+			}
+			if text == "" {
+				m.setStatus("nothing to copy", false)
+				return m, m.clearStatusCmd()
+			}
+			m.clearContentSelection()
+			return m, clipboardWriteCmd(text)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Enter):
+		if m.focused == paneAccounts {
+			if m.selectedOutboxRow() {
+				m.openOutbox()
+				return m, nil
+			}
+			if m.toggleSelectedAccount() {
+				return m, nil
+			}
+			if m.toggleSelectedSection() {
+				return m, nil
+			}
+			if m.toggleSelectedFolder() {
+				return m, nil
+			}
+			// Neither toggle applied, so the cursor is on a folder row: Enter
+			// means "fetch this folder now". Explicit, so it skips the settle
+			// debounce and the passive gates — a manual-only account syncs on
+			// request, which is what manual-only means.
+			if selected := m.selectedMailbox(); selected != nil {
+				// Supersede any armed settle so it cannot fire a second sync.
+				m.cancelFolderSettle()
+				return m, m.syncMailboxCmd(selected.ID, true)
+			}
+		}
+		if m.focused == paneMessages && m.toggleCurrentConversation() {
+			return m, nil
+		}
+		if m.focused == paneMessages && (m.activeMessageRowCount() > 0 || (m.selectedDraftsMailbox() && len(m.drafts) > 0)) {
+			return m.focusPane(paneContent)
+		}
+		// In the content pane Enter opens the focused link, the same resolution
+		// the `o` key uses. Overlays never reach here — they are routed to
+		// handleOverlayKey and bind keys.Confirm instead.
+		if cmd, ok := m.openContentLinkCmd(); ok {
+			return m, cmd
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Back):
+		if m.focused == paneContent {
+			if m.contentSelectionActive {
+				m.clearContentSelection()
+				return m, nil
+			}
+			m.focused = paneMessages
+			m.setViewportForCurrentRow()
+			return m, nil
+		}
+		if m.focused == paneMessages && m.hasSelection() {
+			m.clearSelection()
+			return m, nil
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Sync):
+		if m.selectedUnifiedInbox() || m.selectedNeedsYou() || m.selectedWaiting() {
+			// Sync all inboxes when 'f' is pressed on Unified Inbox
+			var cmds []tea.Cmd
+			for _, mb := range m.mailboxes {
+				if isInboxMailbox(mb) || (m.selectedWaiting() && db.IsSentMailbox(mb)) {
+					cmds = append(cmds, m.syncMailboxCmd(mb.ID, true))
+				}
+			}
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
+			}
+		}
+		if selected := m.selectedMailbox(); selected != nil {
+			return m, m.syncMailboxCmd(selected.ID, true)
+		}
+		// A keypress that silently does nothing reads as the app being broken —
+		// the same rule syncMailboxCmd already applies to a refused sync.
+		m.setStatus("no folder selected — pick one in the sidebar, or "+
+			m.keyHint(m.keys.SyncAll)+" syncs every folder", false)
+		return m, m.clearStatusCmd()
+
+	case keyMatches(msg, m.keys.SyncAll):
+		return m.requestSyncAll()
+
+	case keyMatches(msg, m.keys.MarkRead):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() {
+			m.setStatus("this action is unavailable for drafts", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.focused == paneMessages && m.activeMessageRowCount() > 0 {
+			msgs := m.selectedActionMessages()
+			if len(msgs) == 0 {
+				return m, nil
+			}
+			if m.hasSelection() {
+				cmd := m.setSelectedMessagesReadCmd(msgs)
+				m.clearSelection()
+				return m, cmd
+			}
+			thread := m.currentParentThread()
+			if m.currentConversationCollapsed() {
+				if m.rowReadPending(thread.Representative, *thread) {
+					return m, nil
+				}
+				read := thread.UnreadCount > 0
+				return m, m.acceptReadChanges(thread.Messages, &read, read)
+			}
+			msg2 := msgs[0]
+			return m, m.setMessageReadCmd(msg2, !msg2.Read, !msg2.Read)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.ToggleStar):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() {
+			m.setStatus("this action is unavailable for drafts", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.focused == paneMessages && m.activeMessageRowCount() > 0 {
+			msgs := m.selectedActionMessages()
+			if len(msgs) == 0 {
+				return m, nil
+			}
+			var cmds []tea.Cmd
+			if !m.hasSelection() {
+				// Toggle relative to the first message: if any is unstarred, star all.
+				starred := false
+				for _, msg2 := range msgs {
+					if !msg2.Starred {
+						starred = true
+						break
+					}
+				}
+				for _, msg2 := range msgs {
+					cmds = append(cmds, m.setMessageStarredCmd(msg2, starred))
+				}
+				return m, tea.Batch(cmds...)
+			}
+			for _, msg2 := range msgs {
+				cmds = append(cmds, m.setMessageStarredCmd(msg2, !msg2.Starred))
+			}
+			m.clearSelection()
+			return m, tea.Batch(cmds...)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.SelectAll):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() {
+			m.setStatus("this action is unavailable for drafts", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.focused == paneMessages && m.activeMessageRowCount() > 0 {
+			for _, msg2 := range m.filteredMessages {
+				m.selectedMessages[msg2.ID] = true
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Archive):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() {
+			m.setStatus("this action is unavailable for drafts", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.focused != paneAccounts && m.activeMessageRowCount() > 0 {
+			msgs := m.selectedActionMessages()
+			if m.hasSelection() {
+				m.clearSelection()
+			}
+			return m, m.scheduleArchive(msgs)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Move):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() {
+			m.setStatus("this action is unavailable for drafts", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.focused != paneAccounts && m.activeMessageRowCount() > 0 {
+			m.openMovePicker(m.movePickerMessages())
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Delete):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() && (m.focused != paneMessages || len(m.drafts) == 0) {
+			return m, nil
+		}
+		if m.focused == paneMessages && m.selectedDraftsMailbox() && len(m.drafts) > 0 {
+			idx := clamp(m.messageCursor, 0, len(m.drafts)-1)
+			id := m.drafts[idx].ID
+			m.drafts = append(m.drafts[:idx], m.drafts[idx+1:]...)
+			m.messageCursor = clamp(m.messageCursor, 0, max(0, len(m.drafts)-1))
+			return m, m.deleteDraftCmd(id)
+		}
+		if m.focused != paneAccounts && m.activeMessageRowCount() > 0 {
+			selected := m.selectedActionMessages()
+			if len(selected) > 0 {
+				if len(selected) > 1 && m.hasSelection() {
+					m.pendingBulkDelete = append([]db.Message(nil), selected...)
+					m.overlay = overlayBulkDeleteConfirm
+					return m, nil
+				}
+				m.pendingBulkDelete = nil
+				m.clearSelection()
+				return m, m.scheduleDelete(selected)
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Reply):
+		var cur *db.Message
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			cur = m.currentContentMessage()
+		} else if m.focused == paneMessages {
+			cur = m.currentRowMessage()
+		}
+		if cur != nil {
+			acfg, err := m.accountCfgForMailbox(cur.MailboxID)
+			if err != nil {
+				m.setStatus("reply failed: "+err.Error(), true)
+				return m, m.clearStatusCmd()
+			}
+			m.compose = NewReply(*cur, acfg, m.cfg.Accounts, m.addressBook)
+			m.overlay = overlayCompose
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.ReplyAll):
+		var cur *db.Message
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			cur = m.currentContentMessage()
+		} else if m.focused == paneMessages {
+			cur = m.currentRowMessage()
+		}
+		if cur != nil {
+			acfg, err := m.accountCfgForMailbox(cur.MailboxID)
+			if err != nil {
+				m.setStatus("reply all failed: "+err.Error(), true)
+				return m, m.clearStatusCmd()
+			}
+			m.compose = NewReplyAll(*cur, acfg, m.cfg.Accounts, m.addressBook)
+			m.overlay = overlayCompose
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Forward):
+		var cur *db.Message
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			cur = m.currentContentMessage()
+		} else if m.focused == paneMessages {
+			cur = m.currentRowMessage()
+		}
+		if cur != nil {
+			acfg, err := m.accountCfgForMailbox(cur.MailboxID)
+			if err != nil {
+				m.setStatus("forward failed: "+err.Error(), true)
+				return m, m.clearStatusCmd()
+			}
+			m.compose = NewForward(m.forwardSource(*cur), acfg, m.cfg.Accounts, m.addressBook)
+			m.overlay = overlayCompose
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Compose):
+		acfg, _ := m.cfg.DefaultAccount()
+		m.compose = NewCompose(acfg, m.cfg.Accounts, m.addressBook)
+		m.overlay = overlayCompose
+		return m, nil
+
+	case keyMatches(msg, m.keys.MarkAllRead):
+		if mailbox := m.selectedMailbox(); mailbox != nil {
+			return m, m.markMailboxReadCmd(mailbox.ID)
+		}
+		if accountID, ok := m.selectedAccountID(); ok {
+			return m, m.markAccountReadCmd(accountID)
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.OpenBrowser):
+		if cmd, ok := m.openContentLinkCmd(); ok {
+			return m, cmd
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Unsubscribe):
+		if m.focused == paneContent {
+			if cur := m.currentContentMessage(); cur != nil {
+				return m.handleUnsubscribe(*cur)
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.NextLink):
+		if m.focused == paneContent && m.actionableLinksEnabled() {
+			m.stepContentLink(1)
+			if m.activeMessageRowCount() > 0 {
+				m.setViewportForCurrentRow()
+				m.revealContentLink()
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.PrevLink):
+		if m.focused == paneContent && m.actionableLinksEnabled() {
+			m.stepContentLink(-1)
+			if m.activeMessageRowCount() > 0 {
+				m.setViewportForCurrentRow()
+				m.revealContentLink()
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.SaveAttach):
+		if m.focused == paneContent && m.contentMessageID != 0 && len(m.contentAttachments) > 0 {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return m, saveAttachmentsCmd(m.db, m.contentAttachments)
+			}
+			m.openSaveAttachPicker(filepath.Join(home, "Downloads"))
+			m.overlay = overlaySaveAttach
+			return m, nil
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Summary):
+		if m.focused != paneAccounts && m.activeMessageRowCount() > 0 {
+			return m.openSummary()
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.ContentSearch):
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			m.overlay = overlayContentSearch
+			m.contentSearchInput.Reset()
+			m.contentSearchInput.Focus()
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.ToggleHeaders):
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			m.contentShowHeaders = !m.contentShowHeaders
+			m.setViewportForCurrentRow()
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.OpenInBrowser):
+		if m.focused != paneAccounts && !m.selectedDraftsMailbox() {
+			if cur := m.commandMessage(); cur != nil {
+				allowImages := m.browserReopen == cur.ID
+				m.browserReopen = 0
+				return m.openEmailInBrowser(*cur, allowImages)
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.ViewSource):
+		if m.focused != paneAccounts && !m.selectedDraftsMailbox() {
+			if cur := m.commandMessage(); cur != nil {
+				return m.openSource(*cur)
+			}
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.ToggleQuote):
+		if m.focused == paneContent && m.contentMessageID != 0 {
+			m.contentQuotesCollapsed = !m.contentQuotesCollapsed
+			m.setViewportForCurrentRow()
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Settings):
+		m.settings = newSettings(m.cfg, m.settingsUpdateState())
+		m.settings.pluginsAvailable = m.pluginsVisible()
+		m.overlay = overlaySettings
+		return m, nil
+
+	case msg.String() == "U":
+		if m.showAvailableUpdatePrompt() {
+			m.overlay = overlayUpdateConfirm
+			return m, nil
+		}
+		return m, nil
+
+	case msg.String() == "i":
+		// An available-update prompt keeps its existing i-to-dismiss meaning.
+		if m.showAvailableUpdatePrompt() {
+			return m, m.dismissAvailableUpdate()
+		}
+		// Otherwise, in the reading pane, i loads the remote images the sender
+		// embedded but TideMail blocked by default.
+		if m.focused == paneContent && m.contentMessageID != 0 && m.images != nil && m.images.graphics() {
+			if !m.images.enabled {
+				m.setStatus("image display is off in config ([display] images = \"auto\")", true)
+				return m, m.clearStatusCmd()
+			}
+			// Consent covers only the selected email displayed in the reader.
+			for _, id := range m.imageConsentMessageIDs() {
+				m.images.allow(id)
+			}
+			m.bodyCache.clear()
+			m.viewportCache.clear()
+			urls := m.remoteImageURLsForCurrent()
+			fetch := fetchRemoteImagesCmd(m.images, m.contentMessageID, urls)
+			m.setViewportForCurrentRow()
+			if len(urls) > 0 {
+				m.setStatus(fmt.Sprintf("loading %d remote image(s)…", len(urls)), false)
+				return m, tea.Batch(m.clearStatusCmd(), fetch)
+			}
+			m.setStatus("remote images loaded", false)
+			return m, m.clearStatusCmd()
+		}
+		return m, nil
+
+	case keyMatches(msg, m.keys.Space):
+		if m.focused != paneAccounts && m.selectedDraftsMailbox() {
+			m.setStatus("this action is unavailable for drafts", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.focused == paneAccounts {
+			if m.selectedOutboxRow() {
+				m.openOutbox()
+				return m, nil
+			}
+			if m.toggleSelectedAccount() {
+				return m, nil
+			}
+			if m.toggleSelectedSection() {
+				return m, nil
+			}
+			if m.toggleSelectedFolder() {
+				return m, nil
+			}
+		}
+		if m.focused == paneMessages && m.activeMessageRowCount() > 0 {
+			m.toggleCurrentRowSelection()
+			// Auto-advance cursor for rapid multi-select
+			if m.messageCursor < m.activeMessageRowCount()-1 {
+				m.messageCursor++
+				visible := max(1, m.articleRowsVisible())
+				if m.messageCursor >= m.listOffset+visible {
+					m.listOffset = m.messageCursor - visible + 1
+				}
+			}
+			// Preview the now-focused message, just like cursor navigation, so the
+			// user sees what they're advancing through while multi-selecting.
+			if !m.selectedDraftsMailbox() {
+				if msg2 := m.currentRowMessage(); msg2 != nil {
+					m.setViewportForCurrentRow()
+					cmd := m.focusedMessageChangedCmd(*msg2)
+					return m, cmd
+				}
+			}
+			return m, nil
+		}
+		return m, nil
+	}
+
+	if m.focused == paneContent {
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+	}
+
+	return m, nil
+}
+
+func (m Model) focusPane(next pane) (tea.Model, tea.Cmd) {
+	wasMessages := m.focused == paneMessages
+	if m.focused == paneContent && next != paneContent {
+		m.clearContentSelection()
+	}
+	m.focused = next
+	if wasMessages && next == paneContent && m.selectedDraftsMailbox() && len(m.drafts) > 0 {
+		idx := clamp(m.messageCursor, 0, len(m.drafts)-1)
+		m.compose = NewComposeFromDraft(m.drafts[idx], m.cfg.Accounts, m.addressBook)
+		m.overlay = overlayCompose
+		m.focused = paneMessages
+		return m, nil
+	}
+	// No re-render on a focus change. The body is identical in both focus
+	// states — the focus-dependent chrome (rails, focus line) is drawn from
+	// m.focused at render time — so Tab does not repeat HTML rendering.
+	if wasMessages && next == paneContent {
+		if msg := m.currentRowMessage(); msg != nil {
+			cmd := m.openedMessageCmd(*msg)
+			return m, cmd
+		}
+	}
+	if !wasMessages && next == paneMessages {
+		if msg := m.currentRowMessage(); msg != nil {
+			cmd := m.focusedMessageChangedCmd(*msg)
+			return m, cmd
+		}
+	}
+	return m, nil
+}
+
+// selectSidebarRow jumps the sidebar cursor directly to idx and runs the same
+// side effects as a single Up/Down step landing there: cancels any pending
+// folder-settle, keeps the scroll offset in view, and (outside search) loads
+// the newly selected mailbox. It focuses paneAccounts first if it wasn't
+// already focused, via focusPane, so a caller never needs to do both
+// separately. handleUp/handleDown call this with idx = cursor±1; a mouse
+// click calls it with the clicked row's absolute index, jumping directly
+// instead of stepping through every row in between.
+func (m Model) selectSidebarRow(idx int) (tea.Model, tea.Cmd) {
+	if m.focused != paneAccounts {
+		next, _ := m.focusPane(paneAccounts)
+		m = next.(Model)
+	}
+	if idx < 0 || idx >= len(m.sidebarRows) || idx == m.sidebarCursor {
+		return m, nil
+	}
+	m.cancelFolderSettle()
+	m.sidebarCursor = idx
+	m.clampSidebarOffset()
+	if m.searchActive() {
+		return m, nil
+	}
+	if cmd := m.virtualViewCmd(); cmd != nil {
+		return m, cmd
+	}
+	if selected := m.selectedMailbox(); selected != nil {
+		cmd := m.loadMailboxMessagesCmd(selected.ID)
+		if m.selectedDraftsMailbox() {
+			cmd = tea.Batch(cmd, m.loadDraftsCmd(selected.ID))
+		}
+		// Fill the folder from the server too, once the cursor settles.
+		return m, tea.Batch(cmd, m.scheduleFolderSettle())
+	}
+	m.clearMessages()
+	return m, nil
+}
+
+// selectMessageRow jumps the message-list cursor directly to idx and runs
+// the same side effects as a single Up/Down step landing there: keeps the
+// scroll offset in view and loads the newly focused message. It focuses
+// paneMessages first if it wasn't already focused, via focusPane, so a
+// caller never needs to do both separately. handleUp/handleDown call this
+// with idx = cursor±1; a mouse click calls it with the clicked row's
+// absolute index, jumping directly instead of stepping through every row in
+// between.
+func (m Model) selectMessageRow(idx int) (tea.Model, tea.Cmd) {
+	if m.focused != paneMessages {
+		next, _ := m.focusPane(paneMessages)
+		m = next.(Model)
+	}
+	count := m.activeMessageRowCount()
+	if m.selectedDraftsMailbox() {
+		count = len(m.drafts)
+	}
+	if idx < 0 || idx >= count || idx == m.messageCursor {
+		return m, nil
+	}
+	m.messageCursor = idx
+	visible := max(1, m.articleRowsVisible())
+	if m.messageCursor < m.listOffset {
+		m.listOffset = m.messageCursor
+	} else if m.messageCursor >= m.listOffset+visible {
+		m.listOffset = m.messageCursor - visible + 1
+	}
+	if m.selectedDraftsMailbox() {
+		m.setViewportForCurrentRow()
+		return m, nil
+	}
+	if msg2 := m.currentRowMessage(); msg2 != nil {
+		m.setViewportForCurrentRow()
+		cmd := m.focusedMessageChangedCmd(*msg2)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m Model) handleUp() (tea.Model, tea.Cmd) {
+	switch m.focused {
+	case paneAccounts:
+		if m.sidebarCursor > 0 {
+			return m.selectSidebarRow(m.sidebarCursor - 1)
+		}
+	case paneMessages:
+		if m.messageCursor > 0 {
+			return m.selectMessagePrefetch(m.messageCursor - 1)
+		}
+	case paneContent:
+		if m.cfg.Display.FocusLine {
+			m.moveContentFocusLine(-1)
+		} else {
+			m.scrollContentWithoutFocus(-1)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleDown() (tea.Model, tea.Cmd) {
+	switch m.focused {
+	case paneAccounts:
+		if m.sidebarCursor < len(m.sidebarRows)-1 {
+			return m.selectSidebarRow(m.sidebarCursor + 1)
+		}
+	case paneMessages:
+		count := m.activeMessageRowCount()
+		if m.selectedDraftsMailbox() {
+			count = len(m.drafts)
+		}
+		if m.messageCursor < count-1 {
+			return m.selectMessagePrefetch(m.messageCursor + 1)
+		}
+		// At the last row: page further back into server history. The initial
+		// sync only caches the most recent window, so without this the archive
+		// just stops. Search results and the unified inbox span mailboxes and
+		// have no single paging cursor, so they are left alone.
+		if !m.searchActive() && !m.selectedUnifiedInbox() && !m.selectedNeedsYou() && !m.selectedWaiting() && !m.selectedSnoozed() && !m.selectedDraftsMailbox() {
+			if selected := m.selectedMailbox(); selected != nil {
+				return m, m.loadOlderMessagesCmd(selected.ID)
+			}
+		}
+	case paneContent:
+		if m.cfg.Display.FocusLine {
+			m.moveContentFocusLine(1)
+		} else {
+			m.scrollContentWithoutFocus(1)
+		}
+	}
+	return m, nil
+}
+
+// handleMouseClick resolves a left-click's absolute terminal coordinates to
+// whichever pane, row, or link they land on. It recomputes the same layout
+// View() computes on every render — there is no stored per-pane origin
+// anywhere — so this must be kept in sync with View()'s composition by hand.
+// It is reached only when Display.MouseSupport is on and the event is a
+// left-button press (see the tea.MouseMsg case in update).
+func (m Model) handleMouseClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.overlay == overlayContextMenu {
+		return m.handleContextMenuClick(msg)
+	}
+	if m.overlay != overlayNone {
+		// Phase 1 scope: a click while any overlay (Settings, Account
+		// Manager, confirm dialogs, etc.) is open is a no-op. Clicking
+		// controls inside an overlay is a separate follow-up.
+		return m, nil
+	}
+
+	target, y, paneTop, ok := m.paneAt(msg.X, msg.Y)
+	if !ok {
+		// The status bar row.
+		return m, nil
+	}
+	switch target {
+	case paneAccounts:
+		return m.handleSidebarClick(y)
+	case paneMessages:
+		return m.handleMessagesClick(y)
+	}
+	return m.handleContentClick(msg.X, y, paneTop)
+}
+
+// paneAt resolves absolute terminal coordinates to the pane under them. It
+// returns the pane, the Y coordinate (unchanged), the Y where that pane's top
+// border starts, and false for the status bar row. Shared by click, wheel,
+// and right-click handling so they all agree on the layout.
+func (m Model) paneAt(x, y int) (pane, int, int, bool) {
+	if y >= m.mainHeight() {
+		return paneAccounts, y, 0, false
+	}
+	if x < m.feedsPaneWidth() {
+		return paneAccounts, y, 0, true
+	}
+	if messagesH := m.articlesPaneOuterHeight(); y >= messagesH {
+		return paneContent, y, messagesH, true
+	}
+	return paneMessages, y, 0, true
+}
+
+// isDoubleClick records this click and reports whether it repeats the
+// previous click on the same pane and row within the double-click window.
+func (m *Model) isDoubleClick(p pane, idx int) bool {
+	now := time.Now()
+	double := !m.lastClickAt.IsZero() && m.lastClickPane == p && m.lastClickIdx == idx &&
+		now.Sub(m.lastClickAt) <= doubleClickWindow
+	if double {
+		m.lastClickAt = time.Time{} // a third click starts a new sequence
+	} else {
+		m.lastClickAt, m.lastClickPane, m.lastClickIdx = now, p, idx
+	}
+	return double
+}
+
+// openOnDoubleClick runs the Enter key's action for the focused pane, so a
+// double-click does exactly what pressing Enter on that row does.
+func (m Model) openOnDoubleClick() (tea.Model, tea.Cmd) {
+	return m.handleMainKey(tea.KeyMsg{Type: tea.KeyEnter})
+}
+
+const (
+	doubleClickWindow = 400 * time.Millisecond
+	wheelStepRows     = 3
+)
+
+// handleMouseWheel scrolls the pane under the pointer without changing
+// focus: the sidebar and message list move their selection (same side effects
+// as Up/Down) and the reading pane scrolls its viewport.
+func (m Model) handleMouseWheel(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.overlay != overlayNone {
+		return m, nil
+	}
+	target, _, _, ok := m.paneAt(msg.X, msg.Y)
+	if !ok {
+		return m, nil
+	}
+	if target == paneContent {
+		m.clearContentLinkSelection()
+	}
+	dir := 1
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		dir = -1
+	case tea.MouseButtonWheelDown:
+	default:
+		return m, nil // horizontal wheel
+	}
+	switch target {
+	case paneAccounts:
+		idx := clamp(m.sidebarCursor+dir*wheelStepRows, 0, max(0, len(m.sidebarRows)-1))
+		return m.selectSidebarKeepFocus(idx)
+	case paneMessages:
+		count := m.activeMessageRowCount()
+		if m.selectedDraftsMailbox() {
+			count = len(m.drafts)
+		}
+		idx := clamp(m.messageCursor+dir*wheelStepRows, 0, max(0, count-1))
+		return m.selectMessageKeepFocus(idx)
+	}
+	if dir < 0 {
+		m.viewport.ScrollUp(wheelStepRows)
+	} else {
+		m.viewport.ScrollDown(wheelStepRows)
+	}
+	m.reconcileContentFocus(dir)
+	return m, nil
+}
+
+// selectSidebarKeepFocus / selectMessageKeepFocus run the row-selection side
+// effects but leave keyboard focus where it was, since scrolling over a pane
+// shouldn't steal focus.
+func (m Model) selectSidebarKeepFocus(idx int) (tea.Model, tea.Cmd) {
+	prev := m.focused
+	next, cmd := m.selectSidebarRow(idx)
+	nm := next.(Model)
+	nm.focused = prev
+	return nm, cmd
+}
+
+func (m Model) selectMessageKeepFocus(idx int) (tea.Model, tea.Cmd) {
+	prev := m.focused
+	next, cmd := m.selectMessageRow(idx)
+	nm := next.(Model)
+	nm.focused = prev
+	if msg := nm.currentRowMessage(); msg != nil {
+		cmd = tea.Batch(cmd, nm.prefetchMessageContentCmd(*msg))
+	}
+	return nm, cmd
+}
+
+// selectMessagePrefetch moves the selection to idx and warms the reading-pane
+// render cache for the newly selected message on a background task, so cursor
+// navigation onto a message that has not been rendered yet pays the cold
+// HTML→ANSI conversion off the UI thread instead of inside the selection update.
+func (m Model) selectMessagePrefetch(idx int) (tea.Model, tea.Cmd) {
+	next, cmd := m.selectMessageRow(idx)
+	nm, ok := next.(Model)
+	if !ok {
+		return next, cmd
+	}
+	if msg := nm.currentRowMessage(); msg != nil {
+		cmd = tea.Batch(cmd, nm.prefetchMessageContentCmd(*msg))
+	}
+	return next, cmd
+}
+
+// handleMouseRightClick selects the row under the pointer and opens a context
+// menu there with only the actions that apply to it (see context_menu.go). A
+// right-click while a menu is already open moves it to the new position.
+func (m Model) handleMouseRightClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.overlay == overlayContextMenu {
+		m.closeContextMenu()
+	}
+	if m.overlay != overlayNone {
+		return m, nil
+	}
+	target, y, _, ok := m.paneAt(msg.X, msg.Y)
+	if !ok {
+		return m, nil
+	}
+	var model tea.Model
+	var cmd tea.Cmd
+	switch target {
+	case paneAccounts:
+		if idx, ok := m.sidebarRowAt(y); ok {
+			model, cmd = m.selectSidebarRow(idx)
+		} else {
+			model, _ = m.focusPane(paneAccounts)
+		}
+	case paneMessages:
+		if idx, ok := m.messageRowAt(y); ok {
+			model, cmd = m.selectMessageRow(idx)
+		} else {
+			model, _ = m.focusPane(paneMessages)
+		}
+	default:
+		model, _ = m.focusPane(paneContent)
+	}
+	nm := model.(Model)
+	nm.lastClickAt = time.Time{} // a right-click never starts a double-click
+	nm.openContextMenu(msg.X, msg.Y, nm.contextMenuItems(target))
+	return nm, cmd
+}
+
+// handleSidebarClick maps a click's Y coordinate (already known to be inside
+// the sidebar's column) to a sidebar row and selects it, reusing
+// selectSidebarRow so the side effects match a keyboard Up/Down landing on
+// the same row.
+func (m Model) handleSidebarClick(y int) (tea.Model, tea.Cmd) {
+	idx, ok := m.sidebarRowAt(y)
+	if !ok {
+		return m.focusPane(paneAccounts)
+	}
+	double := m.isDoubleClick(paneAccounts, idx)
+	next, cmd := m.selectSidebarRow(idx)
+	if !double {
+		return next, cmd
+	}
+	// Double-click acts like Enter on the row (toggle account/section/folder,
+	// or sync the folder).
+	nm := next.(Model)
+	next, enterCmd := nm.openOnDoubleClick()
+	return next, tea.Batch(cmd, enterCmd)
+}
+
+// sidebarRowAt maps a click's Y to a sidebar row index. It reports false for
+// the header, empty space past the last row, or while the folder prompt is
+// active (it inserts a row whose height isn't accounted for below).
+func (m Model) sidebarRowAt(y int) (int, bool) {
+	interiorTop := 1 + m.paneHeaderHeight() // +1 for the pane's top border
+	if y < interiorTop || m.folderPrompt.active {
+		return 0, false
+	}
+	idx := m.sidebarOffset + (y-interiorTop)/m.styles.ListItemLineStride()
+	if idx < 0 || idx >= len(m.sidebarRows) {
+		return 0, false
+	}
+	return idx, true
+}
+
+// messageRowAt maps a click's Y to a message-list row index, reporting false
+// for the header, the search row, or empty space past the last row.
+func (m Model) messageRowAt(y int) (int, bool) {
+	interiorTop := 1 + m.paneHeaderHeight() + m.messageSearchRowHeight()
+	if y < interiorTop {
+		return 0, false
+	}
+	idx := m.listOffset + (y-interiorTop)/m.styles.ListItemLineStride()
+	count := m.activeMessageRowCount()
+	if m.selectedDraftsMailbox() {
+		count = len(m.drafts)
+	}
+	if idx < 0 || idx >= count {
+		return 0, false
+	}
+	return idx, true
+}
+
+// handleMessagesClick maps a click's Y coordinate (already known to be
+// inside the messages pane) to a message row and selects it, reusing
+// selectMessageRow so the side effects match a keyboard Up/Down landing on
+// the same row. A click on the search row (visible only in search mode)
+// re-enters search editing; a double-click on a row opens it like Enter.
+func (m Model) handleMessagesClick(y int) (tea.Model, tea.Cmd) {
+	if m.searchMode && y == 1+m.paneHeaderHeight() {
+		next, cmd := m.focusPane(paneMessages)
+		nm := next.(Model)
+		nm.searchEditing = true
+		nm.searchInput.SetValue(nm.searchQuery)
+		nm.searchInput.Focus()
+		return nm, cmd
+	}
+	idx, ok := m.messageRowAt(y)
+	if !ok {
+		return m.focusPane(paneMessages)
+	}
+	double := m.isDoubleClick(paneMessages, idx)
+	next, cmd := m.selectMessageRow(idx)
+	if !double {
+		return next, cmd
+	}
+	nm := next.(Model)
+	opened, openCmd := nm.openOnDoubleClick()
+	return opened, tea.Batch(cmd, openCmd)
+}
+
+// Content clicks never open URLs. Only text in a known LINKS footer entry
+// can establish selection; body clicks merely position the reader.
+func (m Model) handleContentClick(x, y, paneTop int) (tea.Model, tea.Cmd) {
+	m.clearContentLinkSelection()
+	interiorTop := paneTop + 1 + m.paneHeaderHeight()
+	if y < interiorTop {
+		return m.focusPane(paneContent)
+	}
+	if m.focused != paneContent {
+		next, _ := m.focusPane(paneContent)
+		m = next.(Model)
+	}
+	line := m.viewport.YOffset + (y - interiorTop)
+	if line >= 0 && line < m.contentLineCount && y < m.mainHeight()-1 {
+		m.contentFocusLine = line
+		m.contentFocusPending = false
+		if x > m.feedsPaneWidth() && x < m.width-1 && m.contentLinkTextHit(line, x) {
+			m.selectContentLinkAt(line)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleOverlayKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.overlay == overlayCompose && ((m.compose.focusedField == composeFieldBody && m.compose.bodyInput.ed.SearchActive()) || (m.compose.tmplOpen && m.compose.tmplEditing && m.compose.tmplEd.ed.SearchActive())) {
+		return m.handleCompose(msg)
+	}
+	// Ctrl+P opens the palette while composing. A literal ':' always reaches
+	// the editor so normal email text remains writable; Vim compose mode also
+	// uses it for commands such as :w and :q. Outside compose, ':' remains a
+	// palette key.
+	if keyMatches(msg, m.keys.Command) && (msg.String() != ":" || m.overlay != overlayCompose) {
+		switch m.overlay {
+		case overlayCompose:
+			if !m.compose.picker.active {
+				m.openCommandPalette(overlayCompose, commandPaletteCompose)
+				return m, nil
+			}
+		case overlaySummary:
+			m.openCommandPalette(overlaySummary, commandPaletteSummary)
+			return m, nil
+		case overlaySaveAttach:
+			m.openCommandPalette(overlaySaveAttach, commandPaletteSaveAttach)
+			return m, nil
+		}
+	}
+
+	switch m.overlay {
+	case overlayQuitConfirm:
+		switch {
+		case keyMatches(msg, m.keys.Yes), keyMatches(msg, m.keys.Confirm):
+			m.quitActivated = true
+			return m, tea.Quit
+		case keyMatches(msg, m.keys.No), keyMatches(msg, m.keys.Cancel):
+			m.overlay = overlayNone
+		}
+		return m, nil
+
+	case overlaySyncAllConfirm:
+		return m.handleSyncAllConfirmKey(msg)
+
+	case overlayFolderDeleteConfirm:
+		return m.handleFolderDeleteConfirmKey(msg)
+
+	case overlayUnsubscribeConfirm:
+		switch {
+		case keyMatches(msg, m.keys.Yes), keyMatches(msg, m.keys.Confirm):
+			m.overlay = overlayNone
+			return m.performUnsubscribe(m.pendingUnsubscribe)
+		case keyMatches(msg, m.keys.No), keyMatches(msg, m.keys.Cancel):
+			m.overlay = overlayNone
+			m.pendingUnsubscribe = db.Message{}
+		}
+		return m, nil
+
+	case overlayDraftCloseConfirm:
+		switch {
+		case keyMatches(msg, m.keys.Yes), keyMatches(msg, m.keys.Confirm):
+			return m.closeComposeSavingDraft()
+		case keyMatches(msg, m.keys.DiscardDraft, m.keys.No):
+			return m.discardComposeDraft()
+		case keyMatches(msg, m.keys.Cancel):
+			m.overlay = overlayCompose
+			return m, nil
+		}
+		return m, nil
+
+	case overlayBulkDeleteConfirm:
+		switch {
+		case keyMatches(msg, m.keys.Yes), keyMatches(msg, m.keys.Confirm):
+			selected := append([]db.Message(nil), m.pendingBulkDelete...)
+			m.pendingBulkDelete = nil
+			m.overlay = overlayNone
+			m.clearSelection()
+			if len(selected) == 0 {
+				return m, nil
+			}
+			return m, m.scheduleDelete(selected)
+		case keyMatches(msg, m.keys.No), keyMatches(msg, m.keys.Cancel):
+			m.pendingBulkDelete = nil
+			m.overlay = overlayNone
+			return m, nil
+		}
+		return m, nil
+
+	case overlayThemePicker:
+		return m.handleThemePickerKey(msg)
+
+	case overlayAccountManager:
+		return m.handleAccountManager(msg)
+
+	case overlayContactManager:
+		return m.handleContactManager(msg)
+
+	case overlayCompose:
+		return m.handleCompose(msg)
+
+	case overlaySaveAttach:
+		return m.handleSaveAttachPicker(msg)
+
+	case overlayMoveMessage:
+		return m.handleMovePicker(msg)
+
+	case overlayContextMenu:
+		return m.handleContextMenuKey(msg)
+
+	case overlaySpellDictionary:
+		return m.handleSpellDictionaryKey(msg)
+
+	case overlayPluginCatalog:
+		return m.handleCatalogKey(msg)
+
+	case overlayPlugins, overlayPluginPicker, overlayPluginResult, overlayPluginAnnotations, overlayPluginConfirm, overlayPluginSettings:
+		return m.handlePluginKey(msg)
+
+	case overlaySnooze:
+		return m.handleSnoozeKey(msg)
+
+	case overlayTagColors:
+		return m.handleTagColorsKey(msg)
+
+	case overlayColorPicker:
+		return m.handleColorPickerKey(msg)
+
+	case overlayMailTags:
+		return m.handleMailTagKey(msg)
+	case overlayClassification:
+		return m.handleClassificationKey(msg)
+
+	case overlayOutbox:
+		return m.handleOutboxKey(msg)
+	case overlayScheduleSend:
+		return m.handleScheduleSend(msg)
+	case overlayFilterManager:
+		return m.handleFilterManager(msg)
+
+	case overlayGrammarPreview:
+		return m.handleGrammarPreviewKey(msg)
+
+	case overlayLogViewer:
+		if keyMatches(msg, m.keys.Cancel, m.keys.Back) {
+			m.overlay = overlaySettings
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.helpVP, cmd = m.helpVP.Update(msg)
+		return m, cmd
+
+	case overlayHelp:
+		if m.helpSearchActive {
+			switch {
+			case keyMatches(msg, m.keys.Cancel):
+				m.helpSearchActive = false
+				m.helpSearchInput.SetValue("")
+				m.helpSearchInput.Blur()
+				m.helpCat = 0
+				m.resetHelpVP()
+			case keyMatches(msg, m.keys.Confirm):
+				// Stop editing but keep the filter so the list stays scrollable.
+				m.helpSearchActive = false
+				m.helpSearchInput.Blur()
+			default:
+				var cmd tea.Cmd
+				m.helpSearchInput, cmd = m.helpSearchInput.Update(msg)
+				m.helpCat = 0
+				m.resetHelpVP()
+				return m, cmd
+			}
+			return m, nil
+		}
+		switch {
+		case keyMatches(msg, m.keys.Search):
+			m.helpSearchActive = true
+			m.helpSearchInput.Focus()
+			return m, nil
+		case keyMatches(msg, m.keys.Back, m.keys.Help, m.keys.Quit):
+			// esc/q/? first clear an applied filter, then close.
+			if m.helpSearchInput.Value() != "" && keyMatches(msg, m.keys.Back) {
+				m.helpSearchInput.SetValue("")
+				m.helpCat = 0
+				m.resetHelpVP()
+				return m, nil
+			}
+			m.overlay = overlayNone
+			m.helpSearchActive = false
+			m.helpSearchInput.SetValue("")
+			return m, nil
+		case keyMatches(msg, m.keys.Left) || msg.String() == "shift+tab":
+			m.helpRight = false
+			return m, nil
+		case keyMatches(msg, m.keys.Right, m.keys.Tab, m.keys.Enter):
+			m.helpRight = true
+			return m, nil
+		case !m.helpRight && keyMatches(msg, m.keys.Up, m.keys.Down):
+			n := len(m.helpSectionsFiltered())
+			if keyMatches(msg, m.keys.Up) {
+				m.helpCat = max(0, m.helpCat-1)
+			} else {
+				m.helpCat = min(max(0, n-1), m.helpCat+1)
+			}
+			m.resetHelpVP()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.helpVP, cmd = m.helpVP.Update(msg)
+		return m, cmd
+
+	case overlaySettings:
+		return m.handleSettings(msg)
+
+	case overlayUpdateConfirm:
+		if m.updateState == updateStateInstalled {
+			if keyMatches(msg, m.keys.Confirm) {
+				return m, tea.Quit
+			}
+			if keyMatches(msg, m.keys.Cancel) {
+				m.overlay = overlayNone
+			}
+			return m, nil
+		}
+		if m.updateState == updateStateNeedsElevation || m.manualUpdateRequired() {
+			// Deliberately ahead of the default branch below, which treats enter
+			// as "begin install" — there is nothing to install on this path.
+			// renderSoftHints lowercases what it shows, so the hint reads "c
+			// copy" while CopyText is bound to "C". Accept both, as the
+			// settings field does, rather than advertise a key that misses.
+			if keyMatches(msg, m.keys.CopyText) || msg.String() == "c" {
+				if cmd := strings.TrimSpace(m.updateManualCommand()); cmd != "" {
+					return m, clipboardWriteCmd(cmd)
+				}
+				return m, nil
+			}
+			if keyMatches(msg, m.keys.Confirm, m.keys.Cancel) {
+				m.overlay = overlayNone
+			}
+			return m, nil
+		}
+		if m.updateInProgress() {
+			if m.previewManualUpdateUI && keyMatches(msg, m.keys.Cancel, m.keys.Quit) {
+				m.overlay = overlayNone
+				m.updateState = updateStateIdle
+			}
+			return m, nil
+		}
+		switch {
+		case keyMatches(msg, m.keys.Confirm):
+			if m.updateInfo.DownloadURL == "" {
+				m.pendingUpdateInstall = true
+				m.updateState = updateStateChecking
+				m.syncSettingsUpdateState()
+				return m, m.checkForUpdatesCmd(true)
+			}
+			return m, m.beginUpdateInstall()
+		case keyMatches(msg, m.keys.Cancel):
+			m.overlay = overlayNone
+			return m, nil
+		}
+		return m, nil
+
+	case overlaySummary:
+		return m.handleSummaryKey(msg)
+
+	case overlaySource:
+		return m.handleSourceKey(msg)
+
+	case overlayContentSearch:
+		switch {
+		case keyMatches(msg, m.keys.Cancel):
+			m.clearContentSearch()
+			return m, nil
+		case keyMatches(msg, m.keys.Confirm):
+			m.cycleContentSearchMatch(1)
+			return m, nil
+		case keyMatches(msg, m.keys.Up):
+			m.cycleContentSearchMatch(-1)
+			return m, nil
+		case keyMatches(msg, m.keys.Down):
+			m.cycleContentSearchMatch(1)
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.contentSearchInput, cmd = m.contentSearchInput.Update(msg)
+			m.applyContentSearch()
+			return m, cmd
+		}
+
+	case overlayCommandPalette:
+		return m.handleCommandPaletteKey(msg)
+	}
+
+	return m, nil
+}
+
+func (m Model) updateSettings(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Settings previews theme changes live, but only commits them to config when the overlay finishes with Save. -allie
+	prevThemeIdx := m.settings.themeIdx
+	prevMouseSupport := m.cfg.Display.MouseSupport
+	newS, cmd, done := m.settings.Update(msg, m.keys)
+	m.settings = newS
+	tickChanged := m.settings.themeIdx != prevThemeIdx
+	_, cfgThemeIdx := ThemeByName(m.cfg.Theme)
+	previewingTheme := m.settings.themeIdx != cfgThemeIdx
+	if tickChanged && !done {
+		m.setStyles(BuildStyles(MergedBuiltinThemeAtIndex(m.cfg, m.settings.themeIdx), m.cfg.Display.Density, m.cfg.Display.PaneCorners))
+		if m.activeMessageRowCount() > 0 {
+			m.setViewportForCurrentRow()
+		}
+		cmd = tea.Batch(cmd, m.termColorsCmd(m.styles.Theme.Fg, m.styles.Theme.Bg))
+	}
+	action := m.settings.takeAction()
+	switch action {
+	case settingsActionCheckUpdates:
+		if m.previewManualUpdateUI {
+			m.setStatus("preview: check updates disabled", false)
+			return m, m.clearStatusCmd()
+		}
+		m.pendingUpdateInstall = false
+		m.updateState = updateStateChecking
+		m.updateErr = ""
+		m.syncSettingsUpdateState()
+		return m, m.checkForUpdatesCmd(true)
+	case settingsActionInstallUpdate:
+		if m.previewManualUpdateUI {
+			m.setStatus("preview: install disabled", false)
+			return m, m.clearStatusCmd()
+		}
+		if m.updateInfo.DownloadURL != "" && update.IsNewerVersion(m.updateInfo.Version, m.currentVersion) {
+			m.pendingUpdateInstall = false
+			return m, m.beginUpdateInstall()
+		}
+		m.pendingUpdateInstall = true
+		m.updateState = updateStateChecking
+		m.updateErr = ""
+		m.syncSettingsUpdateState()
+		return m, m.checkForUpdatesCmd(true)
+	case settingsActionDismissVersion:
+		return m, m.dismissAvailableUpdate()
+	case settingsActionRestartAfterUpdate:
+		if m.updateInstall.Restartable && m.updateInstall.ExecutablePath != "" {
+			// Record the target and quit. main execs it once the program has
+			// exited and BubbleTea has restored the terminal — a clean handoff
+			// with no second process competing for the terminal.
+			m.restartExecPath = m.updateInstall.ExecutablePath
+			return m, tea.Quit
+		}
+		return m, nil
+	case settingsActionOpenRepo, settingsActionOpenIssues:
+		if url := settingsActionURL(action); url != "" {
+			return m, m.openBrowserCmd(url)
+		}
+		return m, nil
+	case settingsActionViewLogs:
+		m.overlay = overlayLogViewer
+		return m, nil
+	case settingsActionSpellDictionary:
+		m.openSpellDictionary()
+		return m, nil
+	case settingsActionMailTags:
+		return m.openMailTagSettings()
+	case settingsActionTagColors:
+		return m.openTagColors(overlaySettings)
+	case settingsActionCopyManualInstall:
+		cmd := strings.TrimSpace(m.settings.update.manualCommand)
+		if cmd == "" {
+			return m, nil
+		}
+		return m, clipboardWriteCmd(cmd)
+	case settingsActionOpenSupport, settingsActionCopySupport:
+		index := m.settings.supportLinkIndex
+		if index < 0 || index >= len(supportLinks) {
+			return m, nil
+		}
+		link := supportLinks[index]
+		if action == settingsActionCopySupport {
+			return m, clipboardWriteCmd(link.URL)
+		}
+		return m, m.openBrowserCmd(link.URL)
+	}
+	if done {
+		if m.settings.shouldSave {
+			if msg := m.currentRowMessage(); msg != nil {
+				m.pendingSelectMessageID = msg.ID
+			}
+			m.cfg = m.settings.ApplyTo(m.cfg)
+			m.applyImageSetting()
+			m.showUnreadOnly = m.cfg.Display.DefaultUnreadOnly
+			m.starredFirst = m.cfg.Display.StarredFirst
+			// ctrl+e is a session-scoped override; a settings save is the
+			// authoritative point to re-sync it from config.
+			m.contentShowHeaders = m.cfg.Display.ShowHeaders
+			// Apply the vim toggle to future compose editors (read in newEditorArea).
+			setEditorVimMode(m.cfg.Display.ComposeVim)
+			setEditorSearchRegex(m.cfg.Display.ComposeSearchRegex)
+			setEditorWordWrap(m.cfg.Display.ComposeWordWrap)
+			setEditorSpell(m.cfg.Display.ComposeSpell, m.cfg.Display.ComposeSpellLang, loadSpellWords(m.db))
+			merged, _ := MergedThemeFromConfig(m.cfg)
+			m.setStyles(BuildStyles(merged, m.cfg.Display.Density, m.cfg.Display.PaneCorners))
+			if ThemeUsesASCII(merged.Name) {
+				m.spinner.Spinner = spinner.Line
+			} else {
+				m.spinner.Spinner = spinner.Dot
+			}
+			_ = m.saveConfig()
+			omarchyCmd := m.startOmarchyWatchIfNeeded()
+			summarizer, _ := ai.New(m.cfg.AI)
+			m.summarizer = summarizer
+			if m.activeMessageRowCount() > 0 {
+				m.setViewportForCurrentRow()
+			} else {
+				m.clearViewportMessage()
+			}
+			m.overlay = overlayNone
+			m.clearMessages()
+			cmds := []tea.Cmd{m.loadAccountsCmd(), omarchyCmd, m.termColorsCmd(m.styles.Theme.Fg, m.styles.Theme.Bg)}
+			// A view just hidden can't stay open; fall back to the Unified
+			// Inbox, always the first sidebar row.
+			if prevKind, _ := m.currentSidebarSelection(); (prevKind == rowKindNeedsYou && !m.cfg.Display.ShowNeedsYou) || (prevKind == rowKindWaiting && !m.cfg.Display.ShowWaiting) {
+				m.rebuildSidebar()
+				m.sidebarCursor = 0
+				m.clampSidebarOffset()
+				cmds = append(cmds, m.virtualViewCmd())
+			}
+			// The mouse ProgramOption is only set once at startup; flip the
+			// terminal's live mouse-capture mode too so the toggle doesn't
+			// need a restart to take effect.
+			if m.cfg.Display.MouseSupport != prevMouseSupport {
+				if m.cfg.Display.MouseSupport {
+					cmds = append(cmds, tea.EnableMouseCellMotion)
+				} else {
+					cmds = append(cmds, tea.DisableMouse)
+				}
+			}
+			return m, tea.Batch(cmds...)
+		}
+		m.overlay = overlayNone
+		if previewingTheme {
+			merged, _ := MergedThemeFromConfig(m.cfg)
+			m.setStyles(BuildStyles(merged, m.cfg.Display.Density, m.cfg.Display.PaneCorners))
+			if m.activeMessageRowCount() > 0 {
+				m.setViewportForCurrentRow()
+			}
+			return m, m.termColorsCmd(m.styles.Theme.Fg, m.styles.Theme.Bg)
+		}
+		return m, nil
+	}
+	if aiMsg, ok := msg.(AIValidateDoneMsg); ok && aiMsg.Err == nil {
+		m.setStatus("AI provider connection OK", false)
+		cmd = tea.Batch(cmd, m.clearStatusCmd())
+	}
+	return m, cmd
+}
+
+func (m Model) handleSummaryKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case keyMatches(msg, m.keys.Back), keyMatches(msg, m.keys.Summary):
+		m.overlay = overlayNone
+		return m, nil
+	case keyMatches(msg, m.keys.CopyText):
+		if !m.summaryGenerating && m.summaryErr == "" && m.summaryMessage.Summary != "" {
+			return m, clipboardWriteCmd(m.summaryMessage.Summary)
+		}
+	case keyMatches(msg, m.keys.SaveMD):
+		if !m.summaryGenerating && m.summaryErr == "" && m.summaryMessage.Summary != "" {
+			return m, saveSummaryMDCmd(m.summaryMessage, m.summaryMessage.Summary, m.cfg.AI.SavePath)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleAccountManager(msg tea.Msg) (tea.Model, tea.Cmd) {
+	am := m.accountManager
+	newAM, cmd, exit := am.Update(msg, m.keys)
+	m.accountManager = newAM
+	if exit {
+		m.overlay = overlayNone
+		return m, m.loadAccountsCmd()
+	}
+	return m, cmd
+}
+
+func (m Model) handleContactManager(msg tea.Msg) (tea.Model, tea.Cmd) {
+	newCM, cmd, exit := m.contactManager.Update(msg, m.keys)
+	m.contactManager = newCM
+	if len(m.contactManager.composeTo) > 0 {
+		acfg, _ := m.cfg.DefaultAccount()
+		to := strings.Join(m.contactManager.composeTo, ", ")
+		m.contactManager.composeTo = nil
+		m.contactManager.clearMarks()
+		m.compose = NewCompose(acfg, m.cfg.Accounts, m.addressBook)
+		m.compose.toInput.SetValue(to)
+		m.overlay = overlayCompose
+		return m, nil
+	}
+	if exit {
+		m.overlay = overlayNone
+		// Refresh autocomplete: edits in the manager change suggestions.
+		return m, m.loadAddressBookCmd()
+	}
+	return m, cmd
+}
+
+// sizeCompose keeps stored input geometry identical to the rendered layout.
+func (m *Model) sizeCompose() {
+	if m.width <= 0 || m.height <= 0 {
+		return
+	}
+	w, h := m.compose.overlayDimensions(m.width, m.height)
+	m.compose.SetWidth(w)
+	_, bw, bh, _ := m.compose.composeLayout(w, h, m.styles)
+	m.compose.bodyInput.SetSize(bw, bh)
+}
+
+func (m Model) handleCompose(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if km, ok := msg.(tea.KeyMsg); ok && m.compose.grammarRequest != nil {
+		if keyMatches(km, m.keys.Cancel) || km.String() == "ctrl+c" || km.String() == "ctrl+q" {
+			m.compose.grammarRequest.cancel()
+			m.compose.grammarRequest = nil
+			m.compose.busy = false
+			m.compose.statusMsg = "grammar check canceled"
+			if km.String() == "ctrl+c" || km.String() == "ctrl+q" {
+				return m.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+			}
+			return m, nil
+		}
+	}
+
+	_, m.compose.pgpAvailable = m.pgpComposePlugin()
+	if km, ok := msg.(tea.KeyMsg); ok && keyMatches(km, m.keys.MaximizeCompose) {
+		m.compose.clearRoutedStatus()
+		m.compose.maximized = !m.compose.maximized
+		return m, nil
+	}
+	m.sizeCompose()
+	searching := (m.compose.focusedField == composeFieldBody && m.compose.bodyInput.ed.SearchActive()) ||
+		(m.compose.tmplOpen && m.compose.tmplEditing && m.compose.tmplEd.ed.SearchActive())
+	// Intercept grammar check key before compose gets it
+	if km, ok := msg.(tea.KeyMsg); ok && !m.compose.busy && !searching && keyMatches(km, m.keys.GrammarCheck) {
+		// Only check the reply the user wrote, not the quoted/forwarded original.
+		reply, quote := splitReplyAndQuote(m.compose.bodyInput.Value())
+		if strings.TrimSpace(reply) == "" {
+			m.compose.statusMsg = "nothing to check"
+		} else if m.summarizer == nil {
+			m.compose.statusMsg = "AI not configured — press S to open settings"
+		} else {
+			m.compose.busy = true
+			m.compose.statusMsg = "checking grammar..."
+			m.grammarQuoteSuffix = quote
+			cmd := m.grammarCheckCmd(reply)
+			return m, cmd
+		}
+	}
+	if km, ok := msg.(tea.KeyMsg); ok && !searching && keyMatches(km, m.keys.PasteText) && !m.compose.picker.active {
+		return m, clipboardReadCmd()
+	}
+	// Sanitize system paste to prevent textarea corruption from combining marks.
+	if km, ok := msg.(tea.KeyMsg); ok && km.Paste && !searching {
+		sanitized := sanitizePaste(string(km.Runes))
+		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(sanitized), Paste: true}
+	}
+	before := m.compose
+	newC, cmd, exit := m.compose.Update(msg, m.keys)
+	m.compose = newC
+	m.persistSpellWords()
+	if km, ok := msg.(tea.KeyMsg); ok && km.Paste && !searching {
+		m.setComposeStatus(fmt.Sprintf("pasted %d chars", len(km.Runes)), false)
+		m.compose.dirty = true
+	}
+	if composeChanged(before, m.compose) {
+		m.compose.dirty = true
+		if m.compose.hasContent() || m.compose.draftID != 0 || m.compose.saving {
+			save := m.saveDraftCmd()
+			// Preserve any command the edit produced (e.g. cut's clipboard
+			// write) — autosaving must not swallow it.
+			if cmd != nil {
+				return m, tea.Batch(cmd, save)
+			}
+			return m, save
+		}
+	}
+	if exit {
+		if m.compose.hasContent() {
+			m.overlay = overlayDraftCloseConfirm
+			return m, nil
+		}
+		return m.discardComposeDraft()
+	}
+	return m, cmd
+}
+
+func composeChanged(a, b ComposeModel) bool {
+	if a.toInput.Value() != b.toInput.Value() || a.ccInput.Value() != b.ccInput.Value() || a.bccInput.Value() != b.bccInput.Value() || a.subjectInput.Value() != b.subjectInput.Value() || a.bodyInput.Value() != b.bodyInput.Value() {
+		return true
+	}
+	if a.accountIndex != b.accountIndex || len(a.attachments) != len(b.attachments) {
+		return true
+	}
+	for i := range a.attachments {
+		if a.attachments[i].Name != b.attachments[i].Name || a.attachments[i].Path != b.attachments[i].Path || string(a.attachments[i].Data) != string(b.attachments[i].Data) {
+			return true
+		}
+	}
+	return false
+}
+
+// ── Save-attachment folder picker ────────────────────────────────────────
+
+type commandItem struct {
+	id      string
+	label   string
+	enabled bool
+}
+
+func (m Model) commandMessage() *db.Message {
+	if msg := m.currentContentMessage(); msg != nil {
+		return msg
+	}
+	return m.currentRowMessage()
+}
+
+// ── View ─────────────────────────────────────────────────────────────────────
+
+func (m Model) View() string {
+	if m.width == 0 {
+		return ""
+	}
+
+	if m.overlay == overlayCompose && m.compose.maximized {
+		return m.renderOverlay("")
+	}
+
+	if m.overlay == overlayNone && m.cfg.Display.MouseSupport && m.readerMouse.view != nil && (m.readerMouse.dragging || m.readerMouse.moved) {
+		return m.renderReaderSelectionView()
+	}
+
+	if m.overlay == overlayCompose && m.composeBackdrop != nil {
+		return m.viewCachedCompose()
+	}
+	var accounts, messages string
+	cacheReader := m.overlay == overlayNone && m.readerPanes != nil && (m.focused == paneContent || m.readerPanes.navigationOnly)
+	if cacheReader && m.readerPanes.valid {
+		accounts, messages = m.readerPanes.accounts, m.readerPanes.messages
+	} else {
+		accounts, messages = m.renderAccountsPane(), m.renderMessagesPane()
+		if cacheReader {
+			m.readerPanes.accounts, m.readerPanes.messages = accounts, messages
+			m.readerPanes.valid = true
+		}
+	}
+	right := lipgloss.JoinVertical(lipgloss.Left, messages, m.renderContentPane())
+	main := lipgloss.JoinHorizontal(lipgloss.Top, accounts, right)
+	view := lipgloss.JoinVertical(lipgloss.Left, main, m.renderStatusBar())
+
+	if m.overlay != overlayNone {
+		view = m.renderOverlay(view)
+	}
+	view = clampView(view, m.width, m.height, m.styles.Theme.Bg)
+	view = lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		Background(m.styles.Theme.Bg).
+		Render(view)
+	if m.cfg.Display.Transparent {
+		view = transparentBackground(view, m.styles.Theme.Bg)
+	}
+	return view
+}
+
+// ── Pane renderers ────────────────────────────────────────────────────────────
+
+func (m *Model) renderPaneHeader(p pane, label string, focused bool, width int) string {
+	return m.renderPaneHeaderWithAccent(p, label, focused, width, m.styles.PaneHeaderActive)
+}
+
+func (m *Model) renderPaneHeaderWithAccent(p pane, label string, focused bool, width int, activeStyle lipgloss.Style) string {
+	style := m.styles.PaneHeaderInactive
+	prefix := "    "
+	title := m.headerLabel(label)
+	if focused {
+		style = activeStyle
+		prefix = "> "
+	}
+	hint := m.renderPaneHint(p)
+	return style.Width(width).Render(renderPaneHeaderRow(prefix, title, hint, width))
+}
+
+func (m Model) renderPaneHint(p pane) string {
+	var hint string
+	switch p {
+	case paneAccounts:
+		hint = m.keyHint(m.keys.Up) + "/" + m.keyHint(m.keys.Down) + " move  " +
+			m.keyHint(m.keys.Enter) + " toggle/sync  " + m.keyHint(m.keys.Sync) + " sync"
+		if m.selectedMailbox() != nil {
+			hint += "  " + m.keyHint(m.keys.NewFolder) + " new  " + m.keyHint(m.keys.RenameFolder) + " rename  " +
+				m.keyHint(m.keys.DeleteFolder) + " delete  " + m.keyHint(m.keys.HideFolder) + " hide"
+		}
+	case paneMessages:
+		if m.selectedOutboxRow() {
+			// None of the folder verbs apply to a queued message, and the
+			// pane is a preview of the Outbox rather than a list it can act
+			// on, so offer the one key that does something.
+			return m.keyHint(m.keys.Enter) + " open Outbox  " + m.keyHint(m.keys.Command) + " command"
+		}
+		hint = m.keyHint(m.keys.Up) + "/" + m.keyHint(m.keys.Down) + " move  " +
+			m.keyHint(m.keys.Space) + " select  " +
+			m.keyHint(m.keys.EditTags) + " tags  " +
+			m.keyHint(m.keys.MarkRead) + " read  " +
+			m.keyHint(m.keys.ToggleStar) + " star  " +
+			m.keyHint(m.keys.Archive) + " archive  " + m.keyHint(m.keys.Move) + " move  " + m.keyHint(m.keys.Delete) + " delete  " +
+			m.keyHint(m.keys.Sync) + " sync  " +
+			m.keyHint(m.keys.Command) + " command"
+		if thread := m.currentParentThread(); thread != nil && thread.Count > 1 {
+			hint = m.keyHint(m.keys.Enter) + " expand/collapse  " + m.keyHint(m.keys.Right) + " read  " + hint
+		}
+		if m.pgpHintApplies() {
+			hint += "  " + m.keyHint(m.keys.PGPDecode) + " decrypt"
+		}
+	case paneContent:
+		progress := ""
+		if m.contentLineCount > 0 {
+			pct := min(100, (m.viewport.YOffset+m.viewport.Height)*100/m.contentLineCount)
+			progress = fmt.Sprintf("%d%%  ", pct)
+		}
+		hint = progress + m.keyHint(m.keys.Up) + "/" + m.keyHint(m.keys.Down) + " line  " +
+			m.keyHint(m.keys.VisualSelect) + "/" + m.keyHint(m.keys.VisualLine) + " select  " +
+			m.keyHint(m.keys.EditTags) + " tags  " +
+			"y/ctrl+c copy  " +
+			m.keyHint(m.keys.Reply) + " reply  " + m.keyHint(m.keys.ReplyAll) + " all  " + m.keyHint(m.keys.Forward) + " fwd  " +
+			m.keyHint(m.keys.Search) + " find  " +
+			m.keyHint(m.keys.ToggleHeaders) + " headers  " +
+			m.keyHint(m.keys.ViewSource) + " source  " +
+			m.keyHint(m.keys.Back) + " back"
+		if m.images != nil && m.images.graphics() {
+			hint += "  " + m.keyHint(m.keys.ToggleImages) + " images"
+		}
+		if m.actionableLinksEnabled() && len(m.contentLinks) > 0 {
+			hint += "  " + m.keyHint(m.keys.PrevLink) + "/" + m.keyHint(m.keys.NextLink) + " links"
+		}
+		if m.pgpHintApplies() {
+			hint += "  " + m.keyHint(m.keys.PGPDecode) + " decrypt"
+		}
+	}
+	if hint == "" {
+		return ""
+	}
+	return hint
+}
+
+func (m *Model) keyHint(binding key.Binding) string {
+	k := strings.TrimSpace(binding.Help().Key)
+	if k == "" {
+		return "?"
+	}
+	return k
+}
+
+// statusBarJoin concatenates status bar segments with a styled separator so gaps
+// keep the status bar background (raw spaces between lipgloss blocks would not).
+func (m Model) statusBarJoin(parts ...string) string {
+	sep := m.styles.StatusBarJoiner.Render(m.styles.StatusBarSepText())
+	var nonEmpty []string
+	for _, p := range parts {
+		if p != "" {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	if len(nonEmpty) == 0 {
+		return ""
+	}
+	return strings.Join(nonEmpty, sep)
+}
+
+// statusBarInlineText wraps plain segments with a status bar style (no padding) so they share
+// the same background as lipgloss-rendered parts when joined; raw text would otherwise show gaps.
+func (m Model) statusBarInlineText(style lipgloss.Style, s string) string {
+	if s == "" {
+		return ""
+	}
+	return style.UnsetPadding().Render(s)
+}
+
+func (m Model) statusBarKeyHintStrip() string {
+	k := m.keys
+	seg := func(b key.Binding) string {
+		help := b.Help()
+		keyStr := strings.TrimSpace(help.Key)
+		desc := strings.TrimSpace(help.Desc)
+		if keyStr == "" {
+			keyStr = "?"
+		}
+		return m.styles.StatusHint.Render(keyStr + " " + desc)
+	}
+	parts := []string{seg(k.Command), seg(k.AccountManager), seg(k.Settings), seg(k.Search), seg(k.Help)}
+	if m.pgpHintApplies() {
+		parts = append([]string{seg(k.PGPDecode)}, parts...)
+	}
+	return m.statusBarJoin(parts...)
+}
+
+func (m Model) statusBarContextHintStrip() string {
+	if m.cfg.Display.ShowPaneHeaders {
+		return m.statusBarKeyHintStrip()
+	}
+	if m.searchMode && m.searchEditing {
+		return m.statusBarJoin(
+			m.statusBarInlineText(m.styles.StatusBar, "Search"),
+			m.styles.StatusHint.Render("type search  enter finish  esc exit  backspace erase"),
+		)
+	}
+	parts := []string{
+		m.statusBarInlineText(m.styles.StatusBar, m.focusedPaneTitle()),
+		m.styles.StatusHint.Render(m.renderPaneHint(m.focused)),
+	}
+	if m.focused == paneAccounts {
+		parts = append(parts, m.statusBarKeyHintStrip())
+	}
+	return m.statusBarJoin(parts...)
+}
+
+func (m Model) focusedPaneTitle() string {
+	switch m.focused {
+	case paneAccounts:
+		return "Accounts"
+	case paneMessages:
+		return m.messagesPaneTitle()
+	case paneContent:
+		return "Content"
+	default:
+		return ""
+	}
+}
+
+func (m *Model) currentContentMessage() *db.Message {
+	for i := range m.filteredMessages {
+		if m.filteredMessages[i].ID == m.contentMessageID {
+			return &m.filteredMessages[i]
+		}
+	}
+	return nil
+}
+
+func (m *Model) ensureContentFocusVisible() {
+	if m.contentLineCount <= 0 || m.contentFocusPending {
+		return
+	}
+	bodyH := max(1, m.contentBodyHeight())
+	top := m.viewport.YOffset
+	bottom := top + bodyH - 1
+	switch {
+	case m.contentFocusLine < top:
+		if !hasFocusableBefore(m.contentFocusable, m.contentFocusLine) {
+			// Nothing focusable above: the lines before it are the header.
+			m.viewport.SetYOffset(0)
+			return
+		}
+		m.viewport.SetYOffset(m.contentFocusLine)
+	case m.contentFocusLine > bottom:
+		m.viewport.SetYOffset(m.contentFocusLine - bodyH + 1)
+	}
+}
+
+// openContentLinkCmd accepts only explicit LINKS selection or keyboard focus.
+// Automatic focus, ordinary body clicks and wheel scrolling never arm a handler.
+func (m *Model) openContentLinkCmd() (tea.Cmd, bool) {
+	if len(m.filteredMessages) == 0 || m.focused != paneContent {
+		return nil, false
+	}
+	if link, ok := m.currentContentLink(); ok && m.contentLinkIdx < len(m.contentLinkRows) && m.contentLineVisible(m.contentLinkRows[m.contentLinkIdx]) {
+		return m.openReaderLink(link), true
+	}
+	if m.contentFocusedLink != "" && m.contentLineVisible(m.contentFocusLine) {
+		if link, ok := m.focusedLineLink(); ok && link == m.contentFocusedLink {
+			return m.openReaderLink(link), true
+		}
+	}
+	return nil, false
+}
+
+func (m Model) contentLineVisible(line int) bool {
+	return line >= m.viewport.YOffset && line < m.viewport.YOffset+m.contentBodyHeight()
+}
+
+func (m Model) currentContentLink() (string, bool) {
+	if len(m.contentLinks) == 0 || m.contentLinkIdx < 0 || m.contentLinkIdx >= len(m.contentLinks) {
+		return "", false
+	}
+	return m.contentLinks[m.contentLinkIdx], true
+}
+
+func (m *Model) renderStatusBar() string {
+	w := m.width
+	updateInfoPart := m.statusUpdateInfoPart()
+	updateActionPart := m.statusUpdateActionPart()
+	linkPart := ""
+	if m.actionableLinksEnabled() && len(m.contentLinks) > 0 {
+		// Nothing is armed until a link is deliberately selected, so don't claim "link 0/N".
+		text := fmt.Sprintf("%d links", len(m.contentLinks))
+		if len(m.contentLinks) == 1 {
+			text = "1 link"
+		}
+		if m.contentLinkIdx >= 0 {
+			text = fmt.Sprintf("link %d/%d", m.contentLinkIdx+1, len(m.contentLinks))
+		}
+		linkPart = m.statusBarInlineText(m.styles.StatusBar, text)
+	}
+	if prompt := m.destructiveUndoPrompt(); prompt != "" {
+		style := m.styles.StatusBar
+		parts := []string{m.gaugePillText(prompt, time.Until(m.latestUndoableDestructive().Deadline))}
+		if updateInfoPart != "" {
+			parts = append(parts, updateInfoPart)
+		}
+		if linkPart != "" {
+			parts = append(parts, linkPart)
+		}
+		parts = append(parts, m.statusBarContextHintStrip())
+		return style.Width(w).Render(m.statusLine(m.statusBarJoin(parts...), updateActionPart))
+	}
+	if working := m.destructiveWorkingPrompt(); working != "" {
+		// Past its undo window and waiting on the server: the undo pill refills
+		// to bright yellow, then fades into the result when it arrives.
+		style := m.styles.StatusBar
+		parts := []string{m.pillTextWith(working, alertPillYellow)}
+		if updateInfoPart != "" {
+			parts = append(parts, updateInfoPart)
+		}
+		if linkPart != "" {
+			parts = append(parts, linkPart)
+		}
+		parts = append(parts, m.statusBarContextHintStrip())
+		return style.Width(w).Render(m.statusLine(m.statusBarJoin(parts...), updateActionPart))
+	}
+
+	if m.statusMsg != "" {
+		style := m.styles.StatusBar
+		if m.statusErr {
+			style = m.styles.StatusError
+		}
+		parts := []string{m.statusBarInlineText(style, m.statusMsg)}
+		switch {
+		case m.statusErr && !m.styles.PlainUI:
+			parts[0] = m.pillTextWith(m.statusMsg, alertPillRed)
+		case m.statusPill && !m.statusErr:
+			parts[0] = m.statusPillText()
+		}
+		if updateInfoPart != "" && !m.statusMsgCoversUpdateState() {
+			parts = append(parts, updateInfoPart)
+		}
+		if linkPart != "" {
+			parts = append(parts, linkPart)
+		}
+		parts = append(parts, m.statusBarContextHintStrip())
+		return style.Width(w).Render(m.statusLine(m.statusBarJoin(parts...), updateActionPart))
+	}
+
+	// Build status from current state
+	sb := m.styles.StatusBar
+	parts := []string{}
+
+	// First, so it survives truncation: statusLine clamps the left side to the
+	// terminal width by dropping what does not fit off the end.
+	if outboxPart := m.outboxTroublePart(); outboxPart != "" {
+		parts = append(parts, outboxPart)
+	}
+	if updateInfoPart != "" {
+		parts = append(parts, updateInfoPart)
+	}
+	if linkPart != "" {
+		parts = append(parts, linkPart)
+	}
+
+	if m.cfg.Display.ShowPaneHeaders && len(m.mailboxes) > 0 {
+		if m.selectedSnoozed() {
+			parts = append(parts, m.statusBarInlineText(sb, "Snoozed"))
+		} else if m.selectedWaiting() {
+			parts = append(parts, m.statusBarInlineText(sb, "Waiting on Them"))
+		} else if m.selectedNeedsYou() {
+			parts = append(parts, m.statusBarInlineText(sb, "Needs You"))
+		} else if m.selectedUnifiedInbox() {
+			parts = append(parts, m.statusBarInlineText(sb, "Unified Inbox"))
+			if unread := m.unifiedUnreadCount(); unread > 0 {
+				parts = append(parts, m.statusBarInlineText(sb, fmt.Sprintf("%d unread", unread)))
+			}
+		} else if mb := m.selectedMailbox(); mb != nil {
+			parts = append(parts, m.statusBarInlineText(sb, displayNameForDelimiter(mb.Name, mb.Delimiter)))
+			if unread := m.displayMailboxUnreadCount(*mb); unread > 0 {
+				parts = append(parts, m.statusBarInlineText(sb, fmt.Sprintf("%d unread", unread)))
+			}
+			if !mb.LastSynced.IsZero() && mb.LastSynced.Unix() > 0 {
+				parts = append(parts, m.statusBarInlineText(sb, "synced "+m.formatTime(mb.LastSynced)))
+			}
+		} else if accountID, ok := m.selectedAccountID(); ok {
+			parts = append(parts, m.statusBarInlineText(sb, m.accountName(accountID)))
+			if unread := m.accountUnreadCount(accountID); unread > 0 {
+				parts = append(parts, m.statusBarInlineText(sb, fmt.Sprintf("%d unread", unread)))
+			}
+		}
+	}
+
+	if len(m.syncVisible) > 0 {
+		parts = append(parts, m.styles.StatusSpinner.Render(
+			m.spinner.View()+" syncing..."),
+		)
+	}
+
+	parts = append(parts, m.statusBarContextHintStrip())
+
+	return m.styles.StatusBar.Width(w).Render(m.statusLine(m.statusBarJoin(parts...), updateActionPart))
+}
+
+// outboxTroublePart is the standing counterpart to the four-second "send
+// failed" toast: it stays up for as long as something in the Outbox needs a
+// person, which the toast never did. Red is reserved for "you have to act" —
+// a retry still in flight is reported in the ordinary bar style.
+// Failed and uncertain are never merged under one word. An uncertain entry may
+// well have been delivered — that is the whole reason it is not retried
+// automatically — so calling it a failed send would tell someone their mail
+// did not go out when it probably did.
+func (m Model) outboxTroublePart() string {
+	t := m.summarizeOutbox()
+	// Read the key through the binding: it is rebindable, and a hint naming a
+	// key the reader does not have is worse than no hint.
+	key := m.keys.Outbox.Help().Key
+	text := ""
+	switch {
+	case t.failed > 0 && t.uncertain > 0:
+		// Two different problems needing two different actions. Rather than
+		// pick one word for both, count them together and let the Outbox say
+		// which is which.
+		text = fmt.Sprintf("%d sends need attention in Outbox", t.needsAttention())
+	case t.failed > 0:
+		text = countOf(t.failed, "failed send") + " in Outbox"
+	case t.uncertain > 0:
+		text = countOf(t.uncertain, "unconfirmed send") + " in Outbox"
+	case t.retrying > 0:
+		// Still in flight and handled automatically: worth saying, not worth
+		// alarming about, and its age is not news.
+		return m.statusBarInlineText(m.styles.StatusBar, fmt.Sprintf("retrying %d in Outbox  %s", t.retrying, key))
+	default:
+		return ""
+	}
+	// How long it has been waiting. Without this the warning appears the
+	// moment a "message sent" toast clears and reads as though it were about
+	// that send, which is how a day-old failure gets mistaken for a fresh one.
+	if !t.since.IsZero() {
+		if age := m.formatTime(t.since); age != "" {
+			text += " (" + age + ")"
+		}
+	}
+	return m.statusBarInlineText(m.styles.StatusError, text+"  "+key)
+}
+
+// countOf renders "1 failed send" / "2 failed sends".
+func countOf(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+func (m Model) statusUpdateInfoPart() string {
+	switch m.updateState {
+	case updateStateChecking:
+		return m.styles.StatusSpinner.Render(m.spinner.View() + " checking Tide updates...")
+	case updateStateAvailable:
+		return ""
+	case updateStateInstalled:
+		if m.updateInstall.Version != "" {
+			msg := "restart to use Tide " + m.updateInstall.Version
+			return m.statusBarInlineText(m.styles.StatusBar, msg)
+		}
+	}
+	return ""
+}
+
+// manualUpdateRequired reports that this install cannot replace its own binary —
+// a distro package owns it, or the install path is not writable — so updating
+// means running a command outside TideMail.
+func (m Model) manualUpdateRequired() bool {
+	return strings.TrimSpace(m.effectiveManualCommand()) != ""
+}
+
+func (m Model) statusUpdateActionPart() string {
+	if !m.showAvailableUpdatePrompt() {
+		return ""
+	}
+	// One offer for both install types. U used to be hidden when an update had
+	// to be applied by hand, which left package-managed users with no signal
+	// that a path existed at all. "update" rather than "install" because the
+	// packaged path hands over a command instead of installing anything.
+	return m.styles.StatusNotice.Render("App update available  U update  i ignore")
+}
+
+func (m Model) statusMsgCoversUpdateState() bool {
+	msg := strings.ToLower(m.statusMsg)
+	switch m.updateState {
+	case updateStateChecking:
+		return strings.Contains(msg, "checking update")
+	case updateStateAvailable:
+		return strings.Contains(msg, "app update")
+	case updateStateInstalled:
+		return strings.Contains(msg, "restart") || strings.Contains(msg, "tide updated to")
+	default:
+		return false
+	}
+}
+
+func (m Model) showAvailableUpdatePrompt() bool {
+	return m.updateState == updateStateAvailable && m.updateInfo.Version != "" && !m.updateDismissed
+}
+
+// ── Save-attachment folder picker rendering ──────────────────────────────
+
+// ── Commands ─────────────────────────────────────────────────────────────────
+
+// notifyCmd fires a desktop notification for new mail from an auto-sync.
+
+// startSyncTimers kicks off initial auto-sync timers for all accounts.
+
+// logFetch writes a one-line fetch summary to the log file. Errors are
+// silently ignored — logging is best-effort and must never fail a sync.
+
+func (m *Model) clearStatusCmd() tea.Cmd {
+	return tea.Tick(4*time.Second, func(time.Time) tea.Msg {
+		return StatusClearMsg{}
+	})
+}
+
+// spinnerActive reports whether any state that displays the spinner is in
+// flight. It is the single gate for the spinner tick loop: when this is false
+// the loop stops (see the spinner.TickMsg case) so the idle TUI does no work.
+// Keep this in exact sync with every call site that renders m.spinner.View()
+// (sidebar sync indicator, status bar "syncing…", update check, AI summary) —
+// a state shown there but missing here leaves that spinner frozen.
+func (m Model) spinnerActive() bool {
+	return m.initialLoading ||
+		len(m.syncVisible) > 0 ||
+		m.updateState == updateStateChecking ||
+		m.summaryGenerating
+}
+
+// ensureSpinner starts the spinner tick loop if a loading state is active and
+// the loop isn't already running. It returns nil when no tick should be
+// scheduled, so callers can safely batch it into their returned command (a nil
+// Cmd is dropped by tea.Batch). Call it wherever a state in spinnerActive
+// begins.
+func (m *Model) ensureSpinner() tea.Cmd {
+	if !m.spinnerActive() || m.spinnerRunning {
+		return nil
+	}
+	m.spinnerRunning = true
+	return m.spinner.Tick
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// refreshDraftCounts recomputes the sidebar drafts badges. It runs on data
+// change rather than during rendering: each count is two SQLite queries, one
+// of them a correlated subquery, and the pool is a single connection — so
+// doing this per frame put database round-trips on the draw path.
+func (m *Model) refreshDraftCounts() {
+	m.invalidateComposePanes()
+	if m.db == nil {
+		m.draftCounts = nil
+		return
+	}
+	counts := make(map[int64]int64, 4)
+	for _, mb := range m.mailboxes {
+		if !m.isDraftsMailbox(mb) {
+			continue
+		}
+		if n := m.draftsSidebarCount(mb); n > 0 {
+			counts[mb.ID] = n
+		}
+	}
+	m.draftCounts = counts
+}
+
+// setStyles swaps the active styles and drops the render caches. Their keys
+// carry the theme name, but a theme can change without changing its name —
+// the Omarchy live-follow rebuilds colours under a fixed name — so the name
+// alone cannot catch it, and density or corner changes reshape layout too.
+func (m *Model) setStyles(s Styles) {
+	m.invalidateComposePanes()
+	m.invalidateReaderSelectionView()
+	if m.readerPanes != nil {
+		m.readerPanes.valid = false
+	}
+	m.styles = s
+	m.bodyCache.clear()
+	m.viewportCache.clear()
+}
+
+// sameSidebarRow reports whether two rows stand for the same thing: the same
+// folder, account, section header or standing entry.
+func sameSidebarRow(a, b sidebarRow) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case rowKindMailbox:
+		return a.mailboxID == b.mailboxID
+	case rowKindAccount:
+		return a.accountID == b.accountID
+	case rowKindSysFolderHeader, rowKindPersonalFolderHeader:
+		return a.accountID == b.accountID && a.label == b.label
+	}
+	return true
+}
+
+func (m *Model) rebuildSidebar() {
+	m.invalidateComposePanes()
+	// config.toml order is the one order everything shows; the database's
+	// position column is only insertion order.
+	m.accounts = sortAccountsByConfigOrder(m.accounts, m.cfg.Accounts)
+	var selected *sidebarRow
+	if m.sidebarCursor >= 0 && m.sidebarCursor < len(m.sidebarRows) {
+		row := m.sidebarRows[m.sidebarCursor]
+		selected = &row
+	}
+	m.sidebarRows = buildSidebarRows(m.accounts, m.mailboxes, m.collapsedAccounts, m.collapsedSections, folderView{prefs: m.mailboxPrefs, showHidden: m.showHiddenFolders, hideNeedsYou: !m.cfg.Display.ShowNeedsYou, hideWaiting: !m.cfg.Display.ShowWaiting})
+	m.refreshDraftCounts()
+	// Rows come and go (folders created, pruned, hidden). Keep the highlight on
+	// the same row rather than the same position, or it slides onto a different
+	// folder while the old folder's messages stay on screen.
+	if selected != nil {
+		for i, row := range m.sidebarRows {
+			if sameSidebarRow(*selected, row) {
+				m.sidebarCursor = i
+				break
+			}
+		}
+	}
+	m.sidebarCursor = clamp(m.sidebarCursor, 0, max(0, len(m.sidebarRows)-1))
+	m.clampSidebarOffset()
+}
+
+func (m *Model) sidebarVisibleRows() int {
+	bodyLines := max(0, m.accountsPaneContentHeight()-m.paneHeaderHeight()-m.styles.ListItemLineStride())
+	return max(1, bodyLines/m.styles.ListItemLineStride())
+}
+
+func (m *Model) clampSidebarOffset() {
+	visible := m.sidebarVisibleRows()
+	if m.sidebarCursor < m.sidebarOffset {
+		m.sidebarOffset = m.sidebarCursor
+	}
+	if m.sidebarCursor >= m.sidebarOffset+visible {
+		m.sidebarOffset = m.sidebarCursor - visible + 1
+	}
+	m.sidebarOffset = clamp(m.sidebarOffset, 0, max(0, len(m.sidebarRows)-visible))
+}
+
+// cleanDisplayName strips common IMAP namespace prefixes and tidies
+// casing for display in the sidebar. The raw Name is preserved for IMAP
+// SELECT commands; this is purely cosmetic.
+
+func (m Model) newAccountManager() AccountManager {
+	am := NewAccountManager(m.db)
+	am.mode = amList
+	am.setData(m.accounts, m.mailboxes, m.cfg.Accounts, m.cfg.OAuth, m.cfg.ExplicitDefaultAccountID())
+	am.oauthBrowser = m.cfg.Display.Browser
+	return am
+}
+
+func (m *Model) clearMessages() {
+	m.messages = nil
+	m.filteredMessages = nil
+	m.messageThreads = nil
+	m.messageRows = nil
+	m.expandedMessages = nil
+	m.drafts = nil
+	m.messageCursor = 0
+	m.listOffset = 0
+	m.clearViewportMessage()
+	m.clearSelection()
+}
+
+func (m Model) exitSearchMode() (tea.Model, tea.Cmd) {
+	m.searchMode = false
+	m.searchEditing = false
+	m.searchQuery = ""
+	m.searchInput.Reset()
+	return m, m.visibleMessagesCmd()
+}
+
+func (m Model) handleSearchCharacter(newValue string) (tea.Model, tea.Cmd) {
+	m.searchInput.SetValue(newValue)
+	m.searchInput.CursorEnd()
+	m.searchQuery = strings.TrimSpace(newValue)
+	m.messageCursor = 0
+	m.listOffset = 0
+	m.messages = nil
+	m.filteredMessages = nil
+	m.messageThreads = nil
+	m.messageRows = nil
+	m.expandedMessages = nil
+	m.clearSelection()
+	if m.searchQuery == "" {
+		return m, nil
+	}
+	return m, m.searchAllMessagesCmd(m.searchQuery)
+}
+
+// effectiveManualCommand is the command shown in Settings (real install result, or suggested script when an update is available but the install path is not writable).
+
+// restoreSidebarSelection puts the cursor back on the row that was selected
+// before the sidebar was rebuilt, matching on the identity of the row rather
+// than its index.
+func (m *Model) restoreSidebarSelection(kind sidebarRowKind, id int64) {
+	for i, row := range m.sidebarRows {
+		if row.kind != kind {
+			continue
+		}
+		switch kind {
+		case rowKindUnified, rowKindOutbox, rowKindNeedsYou, rowKindWaiting, rowKindSnoozed:
+			m.sidebarCursor = i
+			return
+		case rowKindMailbox:
+			if row.mailboxID == id {
+				m.sidebarCursor = i
+				return
+			}
+		case rowKindAccount, rowKindSysFolderHeader, rowKindPersonalFolderHeader:
+			if row.accountID == id {
+				m.sidebarCursor = i
+				return
+			}
+		}
+	}
+}
+
+// defaultAccountRow resolves the account row for the explicitly configured
+// default sender, joining on the stable config ID.
+func (m Model) defaultAccountRow() (db.Account, bool) {
+	id := m.cfg.ExplicitDefaultAccountID()
+	if id == "" {
+		return db.Account{}, false
+	}
+	for _, acc := range m.accounts {
+		acfg, err := m.accountConfigFor(acc)
+		if err == nil && acfg.ID == id {
+			return acc, true
+		}
+	}
+	return db.Account{}, false
+}
+
+// defaultAccountSidebarRow is the index of the default account's INBOX row,
+// falling back to its first mailbox and then its account header. It reports
+// false when no default is explicitly configured, which leaves the selection
+// where it already was.
+func (m Model) defaultAccountSidebarRow() (int, bool) {
+	acc, ok := m.defaultAccountRow()
+	if !ok {
+		return 0, false
+	}
+	fallback := -1
+	for i, row := range m.sidebarRows {
+		// A mailbox row carries only its mailbox ID, so its account comes from
+		// the mailbox itself; every other row carries the account ID directly.
+		if row.kind == rowKindMailbox {
+			mb := m.mailboxByID(row.mailboxID)
+			if mb == nil || mb.AccountID != acc.ID {
+				continue
+			}
+			if strings.EqualFold(mb.Name, "INBOX") {
+				return i, true
+			}
+			if fallback < 0 {
+				fallback = i
+			}
+			continue
+		}
+		if row.kind == rowKindAccount && row.accountID == acc.ID && fallback < 0 {
+			fallback = i
+		}
+	}
+	if fallback >= 0 {
+		return fallback, true
+	}
+	return 0, false
+}
+
+func (m Model) currentSidebarSelection() (sidebarRowKind, int64) {
+	if m.sidebarCursor < 0 || m.sidebarCursor >= len(m.sidebarRows) {
+		return rowKindMailbox, 0
+	}
+	row := m.sidebarRows[m.sidebarCursor]
+	if row.kind == rowKindUnified || row.kind == rowKindOutbox || row.kind == rowKindNeedsYou || row.kind == rowKindWaiting || row.kind == rowKindSnoozed {
+		return row.kind, 0
+	}
+	if row.kind == rowKindAccount {
+		return rowKindAccount, row.accountID
+	}
+	if row.kind == rowKindSysFolderHeader || row.kind == rowKindPersonalFolderHeader {
+		return row.kind, row.accountID
+	}
+	return rowKindMailbox, row.mailboxID
+}
+
+// selectedOutboxRow reports whether the cursor is on the sidebar's Outbox
+// entry, which Enter and Space open rather than treating as a folder.
+func (m *Model) selectedOutboxRow() bool {
+	if m.sidebarCursor < 0 || m.sidebarCursor >= len(m.sidebarRows) {
+		return false
+	}
+	return m.sidebarRows[m.sidebarCursor].kind == rowKindOutbox
+}
+
+func (m *Model) selectedUnifiedInbox() bool {
+	if m.sidebarCursor < 0 || m.sidebarCursor >= len(m.sidebarRows) {
+		return false
+	}
+	return m.sidebarRows[m.sidebarCursor].kind == rowKindUnified
+}
+
+func (m *Model) searchActive() bool {
+	return m.searchMode
+}
+
+func (m *Model) selectedMailbox() *db.Mailbox {
+	if m.sidebarCursor < 0 || m.sidebarCursor >= len(m.sidebarRows) {
+		return nil
+	}
+	row := m.sidebarRows[m.sidebarCursor]
+	if row.kind != rowKindMailbox {
+		return nil
+	}
+	return m.mailboxByID(row.mailboxID)
+}
+
+func (m Model) selectedAccountID() (int64, bool) {
+	if m.sidebarCursor < 0 || m.sidebarCursor >= len(m.sidebarRows) {
+		return 0, false
+	}
+	row := m.sidebarRows[m.sidebarCursor]
+	if row.kind != rowKindAccount {
+		return 0, false
+	}
+	return row.accountID, true
+}
+
+func (m Model) mailboxByID(mailboxID int64) *db.Mailbox {
+	for i := range m.mailboxes {
+		if m.mailboxes[i].ID == mailboxID {
+			return &m.mailboxes[i]
+		}
+	}
+	return nil
+}
+
+func (m *Model) accountByID(accountID int64) *db.Account {
+	for i := range m.accounts {
+		if m.accounts[i].ID == accountID {
+			return &m.accounts[i]
+		}
+	}
+	return nil
+}
+
+// toggleSelectedSection toggles a System or Labels section header.
+
+// saveCollapseState persists sidebar collapse state to the database.
+
+// loadCollapseState restores sidebar collapse state from the database.
+
+// Resolve exact message identity. Reveal a surviving member if its parent changed.
+func (m *Model) indexOfFilteredMessage(messageID int64) int {
+	if messageID == 0 {
+		return -1
+	}
+	if m.threadedMessagesEnabled() {
+		for i, row := range m.messageRows {
+			if m.messageThreads[row.ThreadIndex].Messages[row.MessageIndex].ID == messageID {
+				return i
+			}
+		}
+		for _, thread := range m.messageThreads {
+			for _, msg := range thread.Messages {
+				if msg.ID == messageID {
+					if m.expandedMessages == nil {
+						m.expandedMessages = make(map[int64]bool)
+					}
+					m.expandedMessages[messageID] = true
+					m.rebuildMessageRows()
+					return m.indexOfFilteredMessage(messageID)
+				}
+			}
+		}
+		return -1
+	}
+	for i := range m.filteredMessages {
+		if m.filteredMessages[i].ID == messageID {
+			return i
+		}
+	}
+	return -1
+}
+
+// setComposeStatus routes only explicitly compose-related notifications. Native
+// composer messages keep their existing path; unrelated application activity
+// continues to use setStatus, even while the application footer is hidden.
+func (m *Model) setComposeStatus(msg string, isErr bool) {
+	m.setStatus(msg, isErr)
+	if m.overlay == overlayCompose && m.compose.maximized {
+		m.compose.statusMsg, m.compose.isErr = msg, isErr
+		m.compose.routedStatus = msg
+		m.statusMsg, m.statusErr = "", false
+	}
+}
+
+// Clear only the routed notification, never a newer native composer message.
+func (c *ComposeModel) clearRoutedStatus() {
+	if c.routedStatus != "" && c.statusMsg == c.routedStatus {
+		c.statusMsg, c.isErr = "", false
+	}
+	c.routedStatus = ""
+}
+
+func (m *Model) setStatus(msg string, isErr bool) {
+	m.invalidateReaderSelectionView()
+	m.statusMsg = msg
+	m.statusErr = isErr
+	m.statusPill = !isErr
+	m.pillFadeStart = time.Time{}
+	// Push to log buffer (ring buffer, max 100 entries)
+	const maxLogEntries = 100
+	m.logBuffer = append(m.logBuffer, logEntry{Time: time.Now(), Message: msg, IsError: isErr})
+	if len(m.logBuffer) > maxLogEntries {
+		m.logBuffer = m.logBuffer[1:]
+	}
+}
+
+// setStatusPill sets a non-error status; every non-error status is drawn as a
+// pill, so this is the same as setStatus(msg, false).
+func (m *Model) setStatusPill(msg string) { m.setStatus(msg, false) }
+
+// statusPillText draws the status message as a green pill. Plain themes use
+// brackets.
+func (m Model) statusPillText() string { return m.pillText(m.statusMsg) }
+
+// pillText draws text as a green status bar pill; see statusPillText.
+func (m Model) pillText(text string) string { return m.pillTextWith(text, alertPillGreen) }
+
+// pillTextWith draws text as a status bar pill in the exact fill and text
+// colors of p. Plain themes use brackets.
+func (m Model) pillTextWith(text string, p alertPill) string {
+	style := m.styles.StatusBar.UnsetPadding()
+	if m.styles.PlainUI {
+		return style.Render("[" + text + "]")
+	}
+	barBg, _ := m.styles.StatusBar.GetBackground().(lipgloss.Color)
+	p = m.fadedPill(p, time.Now())
+	chip := tagChip{text: text, filled: true, ends: config.TagEndsRound}
+	return renderChipsWith([]tagChip{chip}, func(string) tagColor { return tagColor{bg: p.fill, fg: p.text} }, barBg, style)
+}
+
+const (
+	pillFadeDuration = 400 * time.Millisecond
+	pillFadeInterval = 40 * time.Millisecond
+)
+
+type pillFadeTickMsg struct{ Generation uint64 }
+
+// startPillFade blends the status pill in from from, redrawing every
+// pillFadeInterval until pillFadeDuration has passed. Call it after setStatus,
+// which cancels any fade.
+func (m *Model) startPillFade(from alertPill) tea.Cmd {
+	if m.styles.PlainUI {
+		return nil
+	}
+	m.pillFadeFrom = from
+	m.pillFadeStart = time.Now()
+	m.pillFadeGeneration++
+	gen := m.pillFadeGeneration
+	return tea.Tick(pillFadeInterval, func(time.Time) tea.Msg { return pillFadeTickMsg{Generation: gen} })
+}
+
+// pillFadeTick re-arms the fade until it is done; the tick itself only exists
+// to trigger a redraw.
+func (m *Model) pillFadeTick(msg pillFadeTickMsg) tea.Cmd {
+	if msg.Generation != m.pillFadeGeneration || m.pillFadeStart.IsZero() {
+		return nil
+	}
+	if time.Since(m.pillFadeStart) >= pillFadeDuration {
+		m.pillFadeStart = time.Time{}
+		return nil
+	}
+	gen := msg.Generation
+	return tea.Tick(pillFadeInterval, func(time.Time) tea.Msg { return pillFadeTickMsg{Generation: gen} })
+}
+
+// fadedPill returns p blended from the fade's starting pill by how far the
+// fade has run at now, or p itself when no fade is running.
+func (m Model) fadedPill(p alertPill, now time.Time) alertPill {
+	if m.pillFadeStart.IsZero() {
+		return p
+	}
+	t := float64(now.Sub(m.pillFadeStart)) / float64(pillFadeDuration)
+	if t >= 1 {
+		return p
+	}
+	t = max(0, t)
+	return alertPill{
+		fill: mixColors(m.pillFadeFrom.fill, p.fill, t),
+		text: mixColors(m.pillFadeFrom.text, p.text, t),
+	}
+}
+
+// gaugePillText draws the undo prompt as a yellow pill that drains like a fuel
+// gauge: the share of the undo window still left is the yellow fill with the
+// deep yellow text, and the drained share swaps the two. Plain themes have no
+// background to fill, so they show whole seconds left instead.
+func (m Model) gaugePillText(text string, remaining time.Duration) string {
+	if text == "" {
+		return ""
+	}
+	remaining = max(0, min(remaining, destructiveUndoWindow))
+	style := m.styles.StatusBar.UnsetPadding()
+	if m.styles.PlainUI {
+		secs := int((remaining + time.Second - 1) / time.Second)
+		return style.Render(fmt.Sprintf("[%s %ds]", text, secs))
+	}
+	full := alertPillYellow
+	drained := alertPill{fill: full.text, text: full.fill}
+	runes := []rune(text)
+	filled := int(math.Round(float64(remaining) / float64(destructiveUndoWindow) * float64(len(runes))))
+	left, right := drained, drained
+	if filled > 0 {
+		left = full
+	}
+	if filled == len(runes) {
+		right = full
+	}
+	body := func(s string, p alertPill) string {
+		if s == "" {
+			return ""
+		}
+		return lipgloss.NewStyle().Background(p.fill).Foreground(p.text).Bold(true).Render(s)
+	}
+	return style.Foreground(left.fill).Render(pillCapLeft) +
+		body(string(runes[:filled]), full) + body(string(runes[filled:]), drained) +
+		style.Foreground(right.fill).Render(pillCapRight)
+}
+
+// configSave is a seam over config.Save so tests can simulate a failed write.
+var configSave = config.Save
+
+func saveAccountDatabaseCmd(database *db.DB, request AccountSavedMsg, previousCfg, nextCfg config.Config) tea.Cmd {
+	return func() tea.Msg {
+		result := AccountDatabaseSavedMsg{
+			AccountCfg:  request.AccountCfg,
+			PreviousCfg: previousCfg,
+			NextCfg:     nextCfg,
+			WasNew:      request.EditID == 0,
+		}
+		if database == nil {
+			result.Err = fmt.Errorf("database unavailable")
+			return result
+		}
+		mailboxes := make([]db.Mailbox, 0, len(request.MailboxInfo))
+		for _, info := range request.MailboxInfo {
+			mailboxes = append(mailboxes, db.Mailbox{
+				Name:        info.Name,
+				DisplayName: displayNameForDelimiter(info.Name, info.Delimiter),
+				Delimiter:   info.Delimiter,
+				Flags:       info.Flags,
+			})
+		}
+		account, saved, err := database.SaveAccountWithMailboxes(
+			request.EditID,
+			request.AccountCfg.ID,
+			request.AccountCfg.Name,
+			request.Color,
+			mailboxes,
+		)
+		if err != nil {
+			result.Err = fmt.Errorf("save account database: %w", err)
+			return result
+		}
+		result.Account = account
+		result.Mailboxes = saved
+		return result
+	}
+}
+
+func deleteAccountDatabaseCmd(database *db.DB, request AccountDeletedMsg, previousCfg, nextCfg config.Config) tea.Cmd {
+	return func() tea.Msg {
+		result := AccountDatabaseDeletedMsg{
+			AccountID:   request.AccountID,
+			ConfigID:    request.ConfigID,
+			AccountName: request.AccountName,
+			PreviousCfg: previousCfg,
+			NextCfg:     nextCfg,
+		}
+		if database == nil {
+			result.Err = fmt.Errorf("database unavailable")
+			return result
+		}
+		if err := database.DeleteAccount(request.AccountID); err != nil {
+			result.Err = fmt.Errorf("delete account database: %w", err)
+		}
+		return result
+	}
+}
+
+// persistAccountConfigChange applies mutate to a copy of the config and writes
+// it straight away. Reordering accounts and choosing a default sender touch
+// config.toml only — no IMAP round trip and no database row — so they need
+// none of the two-phase save-then-rollback dance the account form uses. A
+// failed write leaves m.cfg untouched and re-syncs the account manager, which
+// reverts its optimistic row order because that order is derived from the
+// config list.
+func (m Model) persistAccountConfigChange(mutate func(*config.Config), okStatus, focusConfigID string) (tea.Model, tea.Cmd) {
+	next := m.cfg
+	next.Accounts = append([]config.AccountConfig(nil), m.cfg.Accounts...)
+	mutate(&next)
+
+	if err := m.persistConfig(next); err != nil {
+		m.accountManager.statusMsg = "SAVE FAILED: " + err.Error()
+		m.accountManager.setData(m.accounts, m.mailboxes, m.cfg.Accounts, m.cfg.OAuth, m.cfg.ExplicitDefaultAccountID())
+		m.accountManager.focusConfigID(focusConfigID)
+		m.setStatus("couldn't save accounts: "+err.Error(), true)
+		return m, m.clearStatusCmd()
+	}
+
+	prevKind, prevID := m.currentSidebarSelection()
+	m.cfg = next
+	m.rebuildSidebar()
+	if prevID != 0 || prevKind == rowKindUnified || prevKind == rowKindNeedsYou || prevKind == rowKindWaiting || prevKind == rowKindSnoozed {
+		m.restoreSidebarSelection(prevKind, prevID)
+	}
+	m.sidebarCursor = clamp(m.sidebarCursor, 0, max(0, len(m.sidebarRows)-1))
+	m.clampSidebarOffset()
+	m.accountManager.setData(m.accounts, m.mailboxes, m.cfg.Accounts, m.cfg.OAuth, m.cfg.ExplicitDefaultAccountID())
+	m.accountManager.focusConfigID(focusConfigID)
+	m.setStatus(okStatus, false)
+	return m, m.clearStatusCmd()
+}
+
+// saveConfig persists the config and surfaces any failure on the status line, so a
+// failed write (read-only dir, full disk) no longer silently drops account/OAuth/setting
+// changes the way a fire-and-forget config.Save would.
+func (m *Model) persistConfig(cfg config.Config) error {
+	cfg.Accounts = append([]config.AccountConfig(nil), cfg.Accounts...)
+	// Reconcile rotated OAuth refresh tokens before writing: config.Save's
+	// stripSecrets pushes each account's in-memory RefreshToken to the keyring,
+	// and m.cfg still holds the token from load time — without this, any save
+	// (theme change, etc.) would clobber the rotated keyring token with a stale
+	// one the provider has already invalidated.
+	for i := range cfg.Accounts {
+		if tok, ok := auth.LatestRefreshToken(cfg.Accounts[i].SessionKey()); ok {
+			cfg.Accounts[i].RefreshToken = tok
+		}
+	}
+	// Update-check state lives in the database, not config.toml, so a config
+	// kept in a dotfiles repo doesn't change every time an update is checked.
+	// Without a database to hold it, leave it in the file rather than lose it.
+	if m.saveUpdateState() == nil {
+		cfg = withoutUpdateState(cfg)
+	}
+	return configSave(cfg)
+}
+
+func (m *Model) saveConfig() error {
+	if err := m.persistConfig(m.cfg); err != nil {
+		m.setStatus(fmt.Sprintf("couldn't save settings: %v", err), true)
+		return err
+	}
+	return nil
+}
+
+// addToLog appends to the in-memory log buffer without updating the status bar.
+func (m *Model) addToLog(msg string, isErr bool) {
+	const maxLogEntries = 100
+	m.logBuffer = append(m.logBuffer, logEntry{Time: time.Now(), Message: msg, IsError: isErr})
+	if len(m.logBuffer) > maxLogEntries {
+		m.logBuffer = m.logBuffer[1:]
+	}
+}
+
+// statusBarSpaceFill renders spaces with the status bar background for pads and gaps
+// (raw spaces would show the terminal default behind lipgloss segments).
+func (m Model) statusBarSpaceFill(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return m.styles.StatusBarJoiner.Render(strings.Repeat(" ", n))
+}
+
+func (m Model) padRightWithStatusBarBG(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) >= width {
+		return s
+	}
+	return s + m.statusBarSpaceFill(width-lipgloss.Width(s))
+}
+
+func (m Model) statusLine(left, right string) string {
+	maxW := max(0, m.width-4) // leave room for status bar padding
+	left = strings.ReplaceAll(left, "\n", " ")
+	right = strings.ReplaceAll(right, "\n", " ")
+	if right == "" {
+		return truncate(left, maxW)
+	}
+
+	right = truncate(right, maxW)
+	rightW := lipgloss.Width(right)
+	if rightW >= maxW {
+		return right
+	}
+	if left == "" {
+		return m.statusBarSpaceFill(maxW-rightW) + right
+	}
+
+	const gap = 2
+	leftW := maxW - rightW - gap
+	if leftW <= 0 {
+		return right
+	}
+
+	left = truncate(left, leftW)
+	return m.padRightWithStatusBarBG(left, leftW) + m.statusBarSpaceFill(gap) + right
+}
+
+// renderSectionHeader renders a collapsible section header (System / Labels).
+
+// ── Dimension helpers ─────────────────────────────────────────────────────────
+
+const (
+	defaultAccountsWidthPercent  = 28
+	minAccountsWidthPercent      = 15
+	maxAccountsWidthPercent      = 50
+	accountsPaneStepPercent      = 2
+	defaultMessagesHeightPercent = 40
+	minMessagesHeightPercent     = 20
+	maxMessagesHeightPercent     = 75
+	messagesPaneStepPercent      = 5
+)
+
+func (m *Model) accountsWidthPercent() int {
+	pct := m.cfg.Display.AccountsWidthPercent
+	if pct <= 0 {
+		pct = defaultAccountsWidthPercent
+	}
+	return clamp(pct, minAccountsWidthPercent, maxAccountsWidthPercent)
+}
+
+func (m *Model) messagesHeightPercent() int {
+	pct := m.cfg.Display.MessagesHeightPercent
+	if pct <= 0 {
+		pct = defaultMessagesHeightPercent
+	}
+	return clamp(pct, minMessagesHeightPercent, maxMessagesHeightPercent)
+}
+
+func (m *Model) resizeAccountsPane(delta int) {
+	m.cfg.Display.AccountsWidthPercent = clamp(m.accountsWidthPercent()+delta, minAccountsWidthPercent, maxAccountsWidthPercent)
+	m.refreshContentAfterPaneResize()
+	m.setStatus("pane layout saved", false)
+	_ = m.saveConfig()
+}
+
+func (m *Model) resizeMessagesPane(delta int) {
+	m.cfg.Display.MessagesHeightPercent = clamp(m.messagesHeightPercent()+delta, minMessagesHeightPercent, maxMessagesHeightPercent)
+	m.refreshContentAfterPaneResize()
+	m.setStatus("pane layout saved", false)
+	_ = m.saveConfig()
+}
+
+func (m *Model) refreshContentAfterPaneResize() {
+	m.viewport.Width = m.contentBodyWidth()
+	m.viewport.Height = m.contentBodyHeight()
+	if m.contentDraftID != 0 && len(m.drafts) > 0 {
+		m.setViewportForCurrentRow()
+		return
+	}
+	if m.contentMessageID != 0 && m.activeMessageRowCount() > 0 {
+		m.setViewportForCurrentRow()
+	}
+}
+
+func (m *Model) feedsPaneWidth() int {
+	w := m.width * m.accountsWidthPercent() / 100
+	return clamp(w, 1, max(1, m.width-1))
+}
+
+func (m *Model) articlesPaneWidth() int { return m.width - m.feedsPaneWidth() }
+func (m *Model) mainHeight() int        { return m.height - 1 }
+
+// accountsPaneContentWidth/Height are the accounts pane's inner content area
+// once its full 4-sided focus border is subtracted.
+func (m *Model) accountsPaneContentWidth() int  { return max(1, m.feedsPaneWidth()-2) }
+func (m *Model) accountsPaneContentHeight() int { return max(1, m.mainHeight()-2) }
+
+func (m *Model) articlesPaneOuterHeight() int {
+	h := m.mainHeight() * m.messagesHeightPercent() / 100
+	if m.mainHeight() <= 6 {
+		return max(1, h)
+	}
+	return clamp(h, 3, m.mainHeight()-3)
+}
+
+// messagesPaneContentWidth is the messages pane's inner content width once
+// its full 4-sided focus border is subtracted.
+func (m *Model) messagesPaneContentWidth() int { return max(1, m.articlesPaneWidth()-2) }
+func (m *Model) articlesPaneContentHeight() int {
+	return max(2, m.articlesPaneOuterHeight()-2)
+}
+
+// clampMessageListViewport keeps focus visible after terminal geometry changes.
+func (m *Model) clampMessageListViewport() {
+	count := m.activeMessageRowCount()
+	if m.selectedDraftsMailbox() {
+		count = len(m.drafts)
+	}
+	visible := max(1, m.articleRowsVisible())
+	m.messageCursor = clamp(m.messageCursor, 0, max(0, count-1))
+	m.listOffset = clamp(m.listOffset, 0, max(0, count-visible))
+	if m.messageCursor < m.listOffset {
+		m.listOffset = m.messageCursor
+	}
+	if m.messageCursor >= m.listOffset+visible {
+		m.listOffset = m.messageCursor - visible + 1
+	}
+}
+
+func (m *Model) articleRowsVisible() int {
+	stride := m.styles.ListItemLineStride()
+	bodyLines := max(0, m.articlesPaneContentHeight()-m.paneHeaderHeight()-m.messageSearchRowHeight())
+	return bodyLines / stride
+}
+
+func (m *Model) messageSearchRowHeight() int {
+	if m.searchMode {
+		return 1
+	}
+	return 0
+}
+
+func (m *Model) paneHeaderHeight() int {
+	if m.cfg.Display.ShowPaneHeaders {
+		return 1
+	}
+	return 0
+}
+func (m *Model) contentPaneOuterHeight() int {
+	return max(3, m.mainHeight()-m.articlesPaneOuterHeight())
+}
+
+// contentPaneContentWidth is the content pane's inner content width once its
+// full 4-sided focus border is subtracted.
+func (m *Model) contentPaneContentWidth() int { return max(1, m.articlesPaneWidth()-2) }
+func (m *Model) contentBodyHeight() int {
+	return max(1, m.contentPaneOuterHeight()-2-m.paneHeaderHeight())
+}
+func (m *Model) contentBodyWidth() int {
+	w := m.contentPaneContentWidth()
+	if cap := m.cfg.Display.ReadingWidth; cap > 0 && cap < w {
+		return cap
+	}
+	return w
+}

@@ -1,0 +1,21 @@
+{
+  "name": "ut",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The ultimate tracker — mst (anime/series), tvl (videogames) and Modify (mods) as one TUI",
+  "bin": {
+    "ut": "bin/ut"
+  },
+  "scripts": {
+    "start": "bun src/main.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "0.7.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}

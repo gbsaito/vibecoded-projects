@@ -1,0 +1,898 @@
+package imap
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/emersion/go-imap/v2"
+	imapclient "github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
+)
+
+// TestApplyDeadlineHonorsContext verifies applyDeadline pushes the ctx deadline
+// down onto the transport so a blocked socket read fails instead of hanging
+// (go-imap commands take no ctx, so the socket deadline is the only lever). An
+// already-expired ctx must make the very next read return immediately.
+func TestApplyDeadlineHonorsContext(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	c := &Client{netConn: local}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	clear := c.applyDeadline(ctx)
+	defer clear()
+
+	buf := make([]byte, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := local.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a deadline error from a read past the ctx deadline")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read blocked despite an expired context deadline")
+	}
+}
+
+// startTestServer creates an in-memory IMAP server on a random port
+// and returns the port and a cleanup function.
+func startTestServer(t *testing.T) (int, func()) {
+	t.Helper()
+	return startTestServerWithSession(t, nil)
+}
+
+func startTestServerWithSession(t *testing.T, wrap func(imapserver.Session, *imapserver.Conn) imapserver.Session) (int, func()) {
+	t.Helper()
+	return startTestServerWithCaps(t, wrap, nil)
+}
+
+// startTestServerWithCaps is startTestServerWithSession advertising only caps
+// (nil keeps the server's defaults), e.g. to imitate a server without UIDPLUS.
+func startTestServerWithCaps(t *testing.T, wrap func(imapserver.Session, *imapserver.Conn) imapserver.Session, caps imap.CapSet) (int, func()) {
+	t.Helper()
+
+	memServer := imapmemserver.New()
+	user := imapmemserver.NewUser("testuser", "testpass")
+	memServer.AddUser(user)
+
+	// Create mailboxes
+	if err := user.Create("INBOX", nil); err != nil {
+		t.Fatalf("create INBOX: %v", err)
+	}
+	if err := user.Create("Sent", nil); err != nil {
+		t.Fatalf("create Sent: %v", err)
+	}
+	if err := user.Create("Archive", nil); err != nil {
+		t.Fatalf("create Archive: %v", err)
+	}
+
+	be := &imapserver.Options{
+		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			session := imapserver.Session(memServer.NewSession())
+			if wrap != nil {
+				session = wrap(session, conn)
+			}
+			return session, nil, nil
+		},
+		InsecureAuth: true,
+		Caps:         caps,
+	}
+
+	s := imapserver.New(be)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	go func() {
+		s.Serve(ln) //nolint:errcheck
+	}()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cleanup := func() {
+		s.Close()
+		ln.Close()
+	}
+
+	return port, cleanup
+}
+
+// appendTestMessage appends a simple message to a mailbox using a raw imapclient.
+func appendTestMessage(t *testing.T, port int, mailbox string, seen bool) uint32 {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial for append: %v", err)
+	}
+	defer conn.Close()
+
+	client := imapclient.New(conn, nil)
+	defer client.Close()
+
+	if err := client.Login("testuser", "testpass").Wait(); err != nil {
+		t.Fatalf("login for append: %v", err)
+	}
+
+	var flags []imap.Flag
+	if seen {
+		flags = append(flags, imap.FlagSeen)
+	}
+
+	body := fmt.Sprintf("Subject: Test %d\r\n\r\nHello world %d", time.Now().UnixNano(), time.Now().UnixNano())
+	cmd := client.Append(mailbox, int64(len(body)), &imap.AppendOptions{
+		Flags: flags,
+	})
+	_, _ = cmd.Write([]byte(body))
+	_ = cmd.Close()
+	appendData, err := cmd.Wait()
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	return uint32(appendData.UID)
+}
+
+func TestConnect_OK(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	if client.conn == nil {
+		t.Fatal("client.conn is nil after Connect")
+	}
+}
+
+func TestConnect_BadAuth(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "wrongpass",
+	})
+
+	err := client.Connect(context.Background())
+	if err == nil {
+		t.Fatal("expected error for bad auth, got nil")
+	}
+}
+
+func TestConnect_BadHost(t *testing.T) {
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: 1,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	err := client.Connect(context.Background())
+	if err == nil {
+		t.Fatal("expected error for bad host, got nil")
+	}
+}
+
+func TestListMailboxes(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	mailboxes, err := client.ListMailboxes(context.Background())
+	if err != nil {
+		t.Fatalf("ListMailboxes failed: %v", err)
+	}
+
+	names := make(map[string]bool)
+	for _, mb := range mailboxes {
+		names[mb.Name] = true
+	}
+
+	if !names["INBOX"] {
+		t.Errorf("expected INBOX in list, got %v", names)
+	}
+	if !names["Sent"] {
+		t.Errorf("expected Sent in list, got %v", names)
+	}
+	if !names["Archive"] {
+		t.Errorf("expected Archive in list, got %v", names)
+	}
+}
+
+func TestFetchMessages_Empty(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	msgs, err := client.FetchMessages(context.Background(), "INBOX", 10)
+	if err != nil {
+		t.Fatalf("FetchMessages failed: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("expected 0 messages, got %d", len(msgs))
+	}
+}
+
+func TestFetchMessages_WithMessages(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	// Pre-populate messages using a raw IMAP client
+	appendTestMessage(t, port, "INBOX", false)
+	uid := appendTestMessage(t, port, "INBOX", true)
+	_ = uid
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	msgs, err := client.FetchMessages(context.Background(), "INBOX", 10)
+	if err != nil {
+		t.Fatalf("FetchMessages failed: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Errorf("expected 2 messages, got %d", len(msgs))
+	}
+}
+
+func TestMarkSeen(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	uid := appendTestMessage(t, port, "INBOX", false)
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.MarkSeen(context.Background(), "INBOX", uid, true); err != nil {
+		t.Fatalf("MarkSeen failed: %v", err)
+	}
+
+	// Verify by fetching and checking flags
+	msgs, err := client.FetchMessages(context.Background(), "INBOX", 10)
+	if err != nil {
+		t.Fatalf("FetchMessages after MarkSeen: %v", err)
+	}
+	found := false
+	for _, msg := range msgs {
+		if msg.UID == uid {
+			found = true
+			if !msg.Read {
+				t.Error("expected message to be marked seen")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected to find the message")
+	}
+}
+
+func TestServerStateReportsSeenAndFlagged(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	seenUID := appendTestMessage(t, port, "INBOX", true)
+	flaggedUID := appendTestMessage(t, port, "INBOX", false)
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.MarkFlagged(context.Background(), "INBOX", flaggedUID, true); err != nil {
+		t.Fatalf("MarkFlagged failed: %v", err)
+	}
+	state, _, err := client.ServerState(context.Background(), "INBOX")
+	if err != nil {
+		t.Fatalf("ServerState failed: %v", err)
+	}
+	byUID := make(map[uint32]ServerMessage, len(state))
+	for _, msg := range state {
+		byUID[msg.UID] = msg
+	}
+	if !byUID[seenUID].Seen {
+		t.Fatal("expected server state to report seen flag")
+	}
+	if byUID[seenUID].Flagged {
+		t.Fatal("expected seen-only message not to be flagged")
+	}
+	if !byUID[flaggedUID].Flagged {
+		t.Fatal("expected server state to report flagged state")
+	}
+
+	if err := client.MarkFlagged(context.Background(), "INBOX", flaggedUID, false); err != nil {
+		t.Fatalf("unflag failed: %v", err)
+	}
+	state, _, err = client.ServerState(context.Background(), "INBOX")
+	if err != nil {
+		t.Fatalf("ServerState after unflag failed: %v", err)
+	}
+	found := false
+	for _, msg := range state {
+		if msg.UID == flaggedUID {
+			found = true
+			if msg.Flagged {
+				t.Fatal("expected server state to report removed flag")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected unflagged message in server state")
+	}
+}
+
+func TestMoveMessage(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	uid := appendTestMessage(t, port, "INBOX", false)
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.MoveMessage(context.Background(), "INBOX", uid, "Archive"); err != nil {
+		t.Fatalf("MoveMessage failed: %v", err)
+	}
+
+	// Verify: message should be gone from INBOX
+	msgs, err := client.FetchMessages(context.Background(), "INBOX", 10)
+	if err != nil {
+		t.Fatalf("FetchMessages after Move: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("expected 0 messages in INBOX after move, got %d", len(msgs))
+	}
+}
+
+func TestDeleteMessage(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	uid := appendTestMessage(t, port, "INBOX", false)
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.DeleteMessage(context.Background(), "INBOX", uid); err != nil {
+		t.Fatalf("DeleteMessage failed: %v", err)
+	}
+
+	// Verify: message should be gone
+	msgs, err := client.FetchMessages(context.Background(), "INBOX", 10)
+	if err != nil {
+		t.Fatalf("FetchMessages after Delete: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("expected 0 messages after delete, got %d", len(msgs))
+	}
+}
+
+// startGmailTrashQuirkServer speaks just enough IMAP to drive LOGIN, SELECT and
+// UID MOVE, replying to the MOVE with a tagged OK carrying Gmail's malformed
+// `[COPYUID 1 1 0]` resp-code. go-imap rejects the `0` while parsing the OK
+// response, so a faithful reproduction needs a raw server rather than
+// imapmemserver (which always returns a well-formed COPYUID).
+func startGmailTrashQuirkServer(t *testing.T) (int, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		write := func(s string) { _, _ = conn.Write([]byte(s)) }
+		write("* OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS] ready\r\n")
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			tag, cmd := fields[0], strings.ToUpper(fields[1])
+			switch {
+			case cmd == "LOGIN":
+				write(tag + " OK LOGIN completed\r\n")
+			case cmd == "CAPABILITY":
+				// Advertise MOVE so go-imap issues a real UID MOVE rather than
+				// falling back to COPY+STORE+EXPUNGE — only the MOVE path
+				// surfaces Gmail's malformed COPYUID this test reproduces.
+				write("* CAPABILITY IMAP4rev1 MOVE UIDPLUS\r\n")
+				write(tag + " OK CAPABILITY completed\r\n")
+			case cmd == "SELECT":
+				write("* 1 EXISTS\r\n")
+				write("* OK [UIDVALIDITY 1] .\r\n")
+				write("* OK [UIDNEXT 2] .\r\n")
+				write("* FLAGS (\\Seen \\Deleted)\r\n")
+				write("* OK [PERMANENTFLAGS (\\Seen \\Deleted)] .\r\n")
+				write(tag + " OK [READ-WRITE] SELECT completed\r\n")
+			case cmd == "UID" && len(fields) >= 3 && strings.ToUpper(fields[2]) == "MOVE":
+				// The move succeeds server-side; the OK carries Gmail's
+				// malformed COPYUID with a destination set of "0".
+				write("* 1 EXPUNGE\r\n")
+				write(tag + " OK [COPYUID 1 1 0] MOVE completed\r\n")
+			case cmd == "LOGOUT":
+				write("* BYE logging out\r\n")
+				write(tag + " OK LOGOUT completed\r\n")
+				return
+			default:
+				write(tag + " OK completed\r\n")
+			}
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port, func() { ln.Close() }
+}
+
+// TestMoveMessages_GmailTrashCopyUIDQuirk verifies that a MOVE which the server
+// completes is reported as success even when go-imap fails to parse Gmail's
+// malformed COPYUID resp-code — otherwise a deleted message wrongly looks like
+// "delete failed" and stays visible.
+func TestMoveMessages_GmailTrashCopyUIDQuirk(t *testing.T) {
+	port, cleanup := startGmailTrashQuirkServer(t)
+	defer cleanup()
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.MoveMessages(context.Background(), "INBOX", []uint32{1}, "[Gmail]/Trash"); err != nil {
+		t.Fatalf("MoveMessages should treat the COPYUID parse failure as success, got: %v", err)
+	}
+}
+
+func TestIsCopyUIDParseError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"copyuid parse", fmt.Errorf("in resp-code-copy: imap: bad number set value %q", "0"), true},
+		{"other error", fmt.Errorf("move to Archive: connection reset"), false},
+	}
+	for _, tc := range cases {
+		if got := isCopyUIDParseError(tc.err); got != tc.want {
+			t.Errorf("%s: isCopyUIDParseError = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestClose_NotConnected(t *testing.T) {
+	client := New(config.AccountConfig{})
+	err := client.Close()
+	if err != nil {
+		t.Errorf("expected nil for Close when not connected, got %v", err)
+	}
+}
+
+func TestDoubleClose(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+
+	client := New(config.AccountConfig{
+		IMAPHost: "127.0.0.1",
+		IMAPPort: port,
+		User:     "testuser",
+		Password: "testpass",
+	})
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+}
+
+func TestNotConnectedError(t *testing.T) {
+	client := New(config.AccountConfig{})
+
+	_, err := client.ListMailboxes(context.Background())
+	if err == nil {
+		t.Fatal("expected error for ListMailboxes when not connected")
+	}
+
+	_, err = client.FetchMessages(context.Background(), "INBOX", 10)
+	if err == nil {
+		t.Fatal("expected error for FetchMessages when not connected")
+	}
+
+	err = client.MarkSeen(context.Background(), "INBOX", 1, true)
+	if err == nil {
+		t.Fatal("expected error for MarkSeen when not connected")
+	}
+
+	err = client.MoveMessage(context.Background(), "INBOX", 1, "Archive")
+	if err == nil {
+		t.Fatal("expected error for MoveMessage when not connected")
+	}
+
+	err = client.DeleteMessage(context.Background(), "INBOX", 1)
+	if err == nil {
+		t.Fatal("expected error for DeleteMessage when not connected")
+	}
+}
+
+func TestListDelimiterTreatsNILAsNoDelimiter(t *testing.T) {
+	if got := listDelimiter(0); got != "" {
+		t.Fatalf("NIL delimiter = %q, want empty", got)
+	}
+	if got := listDelimiter('/'); got != "/" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// A UID write must not run once the server has renumbered the mailbox: the
+// cached UID would now name a different message.
+func TestUIDWritesRefuseAChangedUIDValidity(t *testing.T) {
+	port, cleanup := startTestServer(t)
+	defer cleanup()
+	uid := appendTestMessage(t, port, "INBOX", false)
+
+	client := New(config.AccountConfig{IMAPHost: "127.0.0.1", IMAPPort: port, User: "testuser", Password: "testpass"})
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, validity, err := client.ServerState(context.Background(), "INBOX")
+	if err != nil || validity == 0 {
+		t.Fatalf("server state: %v (validity %d)", err, validity)
+	}
+
+	stale := WithUIDValidity(context.Background(), "INBOX", validity+1)
+	for name, write := range map[string]func() error{
+		"seen":   func() error { return client.MarkSeen(stale, "INBOX", uid, true) },
+		"flag":   func() error { return client.MarkFlagged(stale, "INBOX", uid, true) },
+		"move":   func() error { return client.MoveMessage(stale, "INBOX", uid, "Archive") },
+		"delete": func() error { return client.DeleteMessage(stale, "INBOX", uid) },
+	} {
+		if err := write(); !errors.Is(err, ErrUIDValidityChanged) {
+			t.Fatalf("%s with a stale UIDVALIDITY: %v", name, err)
+		}
+	}
+	msgs, _, err := client.ServerState(context.Background(), "INBOX")
+	if err != nil || len(msgs) != 1 || msgs[0].Seen || msgs[0].Flagged {
+		t.Fatalf("a refused write still changed the mailbox: %+v %v", msgs, err)
+	}
+
+	// The matching UIDVALIDITY, or none at all, lets the write through.
+	current := WithUIDValidity(context.Background(), "INBOX", validity)
+	if err := client.MarkSeen(current, "INBOX", uid, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.MarkFlagged(context.Background(), "INBOX", uid, true); err != nil {
+		t.Fatal(err)
+	}
+	// An expectation for another mailbox does not apply here.
+	if err := client.DeleteMessage(WithUIDValidity(context.Background(), "Sent", validity+1), "INBOX", uid); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, _, _ := client.ServerState(context.Background(), "INBOX"); len(msgs) != 0 {
+		t.Fatalf("delete did not run: %+v", msgs)
+	}
+}
+
+// Without UIDPLUS a plain EXPUNGE removes every \Deleted message, including one
+// another client flagged and has not expunged. Our delete and move must only
+// ever remove our own messages, and leave the other client's flag in place.
+func TestExpungeWithoutUIDPlusSparesOtherDeletedMessages(t *testing.T) {
+	port, cleanup := startTestServerWithCaps(t, nil, imap.CapSet{imap.CapIMAP4rev1: {}})
+	defer cleanup()
+	ours := appendTestMessage(t, port, "INBOX", false)
+	theirs := appendTestMessage(t, port, "INBOX", false)
+	moving := appendTestMessage(t, port, "INBOX", false)
+
+	// Another client marks a message \Deleted but does not expunge it.
+	other := imapclient.New(mustDial(t, port), nil)
+	defer other.Close()
+	if err := other.Login("testuser", "testpass").Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Store(imap.UIDSetNum(imap.UID(theirs)), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	client := New(config.AccountConfig{IMAPHost: "127.0.0.1", IMAPPort: port, User: "testuser", Password: "testpass"})
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if client.conn.Caps().Has(imap.CapUIDPlus) || client.conn.Caps().Has(imap.CapMove) {
+		t.Fatal("test server must not advertise UIDPLUS or MOVE")
+	}
+	if err := client.DeleteMessage(context.Background(), "INBOX", ours); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.MoveMessage(context.Background(), "INBOX", moving, "Archive"); err != nil {
+		t.Fatal(err)
+	}
+
+	// IMAP holds back expunge notices during FETCH; NOOP lets this session see them.
+	if err := other.Noop().Wait(); err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := other.Fetch(imap.UIDSetNum(imap.UID(ours), imap.UID(theirs), imap.UID(moving)), &imap.FetchOptions{UID: true, Flags: true}).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inbox) != 1 || uint32(inbox[0].UID) != theirs {
+		t.Fatalf("INBOX should hold only the other client's message, got %d messages", len(inbox))
+	}
+	deleted := false
+	for _, f := range inbox[0].Flags {
+		deleted = deleted || f == imap.FlagDeleted
+	}
+	if !deleted {
+		t.Fatal("the other client's \\Deleted flag must be put back")
+	}
+	if msgs, _, err := client.ServerState(context.Background(), "Archive"); err != nil || len(msgs) != 1 {
+		t.Fatalf("moved message missing from Archive: %d %v", len(msgs), err)
+	}
+}
+
+func mustDial(t *testing.T, port int) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+// moveScenario scripts a fake server for MoveMessages tests. move(n) returns the
+// tagged status line text for the n-th MOVE; search(n) returns the UID SEARCH
+// reply once n MOVEs have been seen ("" means the search answers NO).
+type moveScenario struct {
+	move      func(n int) string
+	search    func(n int) string
+	wantMoves int
+	wantErr   bool
+}
+
+// TestMoveMessages_TransientSystemError covers Gmail's intermittent
+// "NO System Error (Failure)" on a move to Trash. If the message is gone from
+// the source afterwards the move counts as done; if it is still there the MOVE
+// is retried; if that check fails the original error is reported without
+// re-sending the MOVE.
+func TestMoveMessages_TransientSystemError(t *testing.T) {
+	const sysErr = "NO System Error (Failure)"
+	t.Run("moved despite NO", func(t *testing.T) {
+		runMoveScenario(t, moveScenario{
+			move:      func(int) string { return sysErr },
+			search:    func(int) string { return "* SEARCH" },
+			wantMoves: 1,
+		})
+	})
+	t.Run("not moved, retried", func(t *testing.T) {
+		runMoveScenario(t, moveScenario{
+			move: func(n int) string {
+				if n == 1 {
+					return sysErr
+				}
+				return "OK MOVE completed"
+			},
+			search:    func(int) string { return "* SEARCH 1" },
+			wantMoves: 2,
+		})
+	})
+	t.Run("search fails, no second MOVE", func(t *testing.T) {
+		runMoveScenario(t, moveScenario{
+			move:      func(int) string { return sysErr },
+			search:    func(int) string { return "" },
+			wantMoves: 1,
+			wantErr:   true,
+		})
+	})
+	t.Run("retry refused because first attempt moved it", func(t *testing.T) {
+		runMoveScenario(t, moveScenario{
+			move: func(n int) string {
+				if n == 1 {
+					return sysErr
+				}
+				return "NO [NONEXISTENT] No matching messages"
+			},
+			search: func(n int) string {
+				if n < 2 {
+					return "* SEARCH 1"
+				}
+				return "* SEARCH"
+			},
+			wantMoves: 2,
+		})
+	})
+	t.Run("persistent failure gives up", func(t *testing.T) {
+		runMoveScenario(t, moveScenario{
+			move:      func(int) string { return sysErr },
+			search:    func(int) string { return "* SEARCH 1" },
+			wantMoves: 3,
+			wantErr:   true,
+		})
+	})
+}
+
+func runMoveScenario(t *testing.T, sc moveScenario) {
+	old := moveRetryDelays
+	moveRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { moveRetryDelays = old }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	var moves atomic.Int32
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		write := func(s string) { _, _ = conn.Write([]byte(s)) }
+		write("* OK [CAPABILITY IMAP4rev1 MOVE UIDPLUS] ready\r\n")
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			tag, cmd := fields[0], strings.ToUpper(fields[1])
+			switch {
+			case cmd == "LOGIN":
+				write(tag + " OK LOGIN completed\r\n")
+			case cmd == "CAPABILITY":
+				write("* CAPABILITY IMAP4rev1 MOVE UIDPLUS\r\n")
+				write(tag + " OK CAPABILITY completed\r\n")
+			case cmd == "SELECT":
+				write("* 1 EXISTS\r\n* OK [UIDVALIDITY 1] .\r\n* OK [UIDNEXT 2] .\r\n")
+				write(tag + " OK [READ-WRITE] SELECT completed\r\n")
+			case cmd == "UID" && len(fields) >= 3 && strings.ToUpper(fields[2]) == "SEARCH":
+				if reply := sc.search(int(moves.Load())); reply == "" {
+					write(tag + " NO search failed\r\n")
+				} else {
+					write(reply + "\r\n" + tag + " OK SEARCH completed\r\n")
+				}
+			case cmd == "UID" && len(fields) >= 3 && strings.ToUpper(fields[2]) == "MOVE":
+				n := int(moves.Add(1))
+				status := sc.move(n)
+				if strings.HasPrefix(status, "OK") {
+					write("* 1 EXPUNGE\r\n")
+				}
+				write(tag + " " + status + "\r\n")
+			case cmd == "LOGOUT":
+				write("* BYE\r\n" + tag + " OK LOGOUT completed\r\n")
+				return
+			default:
+				write(tag + " OK completed\r\n")
+			}
+		}
+	}()
+
+	client := New(config.AccountConfig{IMAPHost: "127.0.0.1", IMAPPort: ln.Addr().(*net.TCPAddr).Port, User: "u", Password: "p"})
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer client.Close()
+	err = client.MoveMessages(context.Background(), "INBOX", []uint32{1}, "[Gmail]/Trash")
+	if (err != nil) != sc.wantErr {
+		t.Fatalf("MoveMessages error = %v, wantErr %v", err, sc.wantErr)
+	}
+	if got := int(moves.Load()); got != sc.wantMoves {
+		t.Fatalf("expected %d MOVE attempts, got %d", sc.wantMoves, got)
+	}
+}

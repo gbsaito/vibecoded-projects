@@ -1,0 +1,1283 @@
+package ui
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/allisonhere/tidemail/internal/db"
+)
+
+func TestSaveConfigSurfacesError(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	m := NewModel(database, config.DefaultConfig(), "dev", false)
+	orig := configSave
+	configSave = func(config.Config) error { return fmt.Errorf("disk full") }
+	defer func() { configSave = orig }()
+
+	m.saveConfig()
+	if !m.statusErr {
+		t.Fatal("expected the status line to be flagged as an error")
+	}
+	if !strings.Contains(m.statusMsg, "disk full") {
+		t.Fatalf("expected the save error surfaced on the status line, got %q", m.statusMsg)
+	}
+}
+
+func TestSaveConfigSuccessNoError(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	m := NewModel(database, config.DefaultConfig(), "dev", false)
+	orig := configSave
+	configSave = func(config.Config) error { return nil }
+	defer func() { configSave = orig }()
+
+	m.saveConfig()
+	if m.statusErr {
+		t.Fatalf("did not expect an error status on success, got %q", m.statusMsg)
+	}
+}
+
+func TestQuitActivationIsRecordedWithoutConfirmation(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Display.ConfirmQuit = false
+	m := NewModel(database, cfg, "dev", false)
+	next, cmd := m.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+
+	if !next.(Model).QuitActivated() {
+		t.Fatal("expected direct quit to record normal quit activation")
+	}
+	if cmd == nil {
+		t.Fatal("expected direct quit command")
+	}
+}
+
+func TestConfirmedQuitActivationIsRecorded(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	m := NewModel(database, config.DefaultConfig(), "dev", false)
+	m.overlay = overlayQuitConfirm
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+
+	if !next.(Model).QuitActivated() {
+		t.Fatal("expected confirmed quit to record normal quit activation")
+	}
+	if cmd == nil {
+		t.Fatal("expected confirmed quit command")
+	}
+}
+
+func TestShiftArrowsPersistPaneResize(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := config.DefaultConfig()
+	m := NewModel(database, cfg, "dev", false)
+	m.width = 100
+	m.height = 31
+
+	var saved []config.Config
+	orig := configSave
+	configSave = func(cfg config.Config) error {
+		saved = append(saved, cfg)
+		return nil
+	}
+	defer func() { configSave = orig }()
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyShiftRight})
+	m = next.(Model)
+	if got, want := m.cfg.Display.AccountsWidthPercent, 30; got != want {
+		t.Fatalf("expected shift+right to widen accounts pane to %d%%, got %d%%", want, got)
+	}
+	if got, want := m.feedsPaneWidth(), 30; got != want {
+		t.Fatalf("expected accounts pane width %d, got %d", want, got)
+	}
+
+	next, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyShiftDown})
+	m = next.(Model)
+	if got, want := m.cfg.Display.MessagesHeightPercent, 45; got != want {
+		t.Fatalf("expected shift+down to grow messages pane to %d%%, got %d%%", want, got)
+	}
+	if got, want := m.articlesPaneOuterHeight(), 13; got != want {
+		t.Fatalf("expected messages pane height %d, got %d", want, got)
+	}
+
+	if len(saved) != 2 {
+		t.Fatalf("expected two config saves, got %d", len(saved))
+	}
+	if got := saved[1].Display.MessagesHeightPercent; got != 45 {
+		t.Fatalf("expected saved messages split to be 45%%, got %d%%", got)
+	}
+}
+
+func TestPaneResizeKeysIgnoredInOverlay(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	cfg := config.DefaultConfig()
+	m := NewModel(database, cfg, "dev", false)
+	m.overlay = overlayHelp
+
+	orig := configSave
+	saveCount := 0
+	configSave = func(config.Config) error {
+		saveCount++
+		return nil
+	}
+	defer func() { configSave = orig }()
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyShiftRight})
+	m = next.(Model)
+	if got, want := m.cfg.Display.AccountsWidthPercent, config.DefaultConfig().Display.AccountsWidthPercent; got != want {
+		t.Fatalf("expected overlay to ignore pane resize, got %d%% want %d%%", got, want)
+	}
+	if saveCount != 0 {
+		t.Fatalf("expected overlay resize key not to save config, got %d saves", saveCount)
+	}
+}
+
+func TestSettingsSavePreservesSelectedMessageAfterUnreadFirstReload(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	accountID, err := database.AddAccount("cfg-acct", "Acct", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailboxID, err := database.UpsertMailbox(db.Mailbox{AccountID: accountID, Name: "INBOX"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []db.Message{
+		{MailboxID: mailboxID, UID: 1, Subject: "Older unread", Date: time.Unix(10, 0)},
+		{MailboxID: mailboxID, UID: 2, Subject: "Newest read", Date: time.Unix(30, 0), Read: true},
+		{MailboxID: mailboxID, UID: 3, Subject: "Older read", Date: time.Unix(20, 0), Read: true},
+	} {
+		if err := database.UpsertMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Display.UnreadFirst = false
+	m := NewModel(database, cfg, "dev", false)
+	m.accounts = []db.Account{{ID: accountID, Name: "Acct"}}
+	m.mailboxes = []db.Mailbox{{ID: mailboxID, AccountID: accountID, Name: "INBOX"}}
+	m.rebuildSidebar()
+	for i, row := range m.sidebarRows {
+		if row.kind == rowKindMailbox && row.mailboxID == mailboxID {
+			m.sidebarCursor = i
+			break
+		}
+	}
+	msgs, err := database.ListMessages(mailboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.messages = msgs
+	m.filteredMessages = msgs
+	m.messageCursor = 0
+	selectedID := msgs[0].ID
+	m.overlay = overlaySettings
+	m.settings = newSettings(cfg, m.settingsUpdateState())
+	m.settings.unreadFirst = true
+
+	origSave := configSave
+	configSave = func(config.Config) error { return nil }
+	defer func() { configSave = origSave }()
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = next.(Model)
+
+	if m.pendingSelectMessageID != selectedID {
+		t.Fatalf("expected settings save to remember selected message %d, got %d", selectedID, m.pendingSelectMessageID)
+	}
+
+	reloaded := []db.Message{msgs[2], msgs[0], msgs[1]}
+	next, _ = m.Update(MessagesLoadedMsg{MailboxID: mailboxID, Messages: reloaded})
+	m = next.(Model)
+
+	if len(m.filteredMessages) == 0 || m.filteredMessages[m.messageCursor].ID != selectedID {
+		t.Fatalf("expected selected message %d preserved after reload, cursor=%d messages=%+v", selectedID, m.messageCursor, m.filteredMessages)
+	}
+}
+
+func TestDeleteKeyWaitsForDeleteResultBeforeRemovingMessage(t *testing.T) {
+	msg := db.Message{ID: 42, MailboxID: 7, UID: 99, Subject: "Keep until confirmed"}
+	m := Model{
+		keys:             DefaultKeys,
+		focused:          paneMessages,
+		messages:         []db.Message{msg},
+		filteredMessages: []db.Message{msg},
+		selectedMessages: make(map[int64]bool),
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next.(Model)
+
+	if cmd == nil {
+		t.Fatal("expected delete key to start a delete command")
+	}
+	if len(m.messages) != 1 || len(m.filteredMessages) != 1 {
+		t.Fatalf("expected message to stay visible until delete succeeds, got %d/%d", len(m.messages), len(m.filteredMessages))
+	}
+
+	next, _ = m.Update(MessagesDeletedMsg{Deleted: []MessageRef{{ID: msg.ID, MailboxID: msg.MailboxID}}})
+	m = next.(Model)
+
+	if len(m.messages) != 0 || len(m.filteredMessages) != 0 {
+		t.Fatalf("expected successful delete result to remove message, got %d/%d", len(m.messages), len(m.filteredMessages))
+	}
+}
+
+func TestBulkDeleteOpensConfirmationOverlay(t *testing.T) {
+	msgs := []db.Message{
+		{ID: 1, MailboxID: 7, Subject: "One"},
+		{ID: 2, MailboxID: 7, Subject: "Two"},
+	}
+	m := Model{
+		keys:             DefaultKeys,
+		focused:          paneMessages,
+		messages:         msgs,
+		filteredMessages: msgs,
+		selectedMessages: map[int64]bool{1: true, 2: true},
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next.(Model)
+
+	if cmd != nil {
+		t.Fatal("expected bulk delete confirmation to defer delete command")
+	}
+	if m.overlay != overlayBulkDeleteConfirm {
+		t.Fatalf("expected bulk delete confirm overlay, got %v", m.overlay)
+	}
+	if got := len(m.pendingBulkDelete); got != 2 {
+		t.Fatalf("expected 2 pending bulk-delete messages, got %d", got)
+	}
+	if len(m.selectedMessages) != 2 {
+		t.Fatalf("expected selection preserved while confirming, got %+v", m.selectedMessages)
+	}
+}
+
+func TestBulkDeleteConfirmCancelPreservesSelection(t *testing.T) {
+	msgs := []db.Message{
+		{ID: 1, MailboxID: 7, Subject: "One"},
+		{ID: 2, MailboxID: 7, Subject: "Two"},
+	}
+	m := Model{
+		keys:              DefaultKeys,
+		focused:           paneMessages,
+		messages:          msgs,
+		filteredMessages:  msgs,
+		selectedMessages:  map[int64]bool{1: true, 2: true},
+		pendingBulkDelete: msgs,
+		overlay:           overlayBulkDeleteConfirm,
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+
+	if cmd != nil {
+		t.Fatal("expected cancel to close the overlay without running delete")
+	}
+	if m.overlay != overlayNone {
+		t.Fatalf("expected overlay cleared, got %v", m.overlay)
+	}
+	if got := len(m.pendingBulkDelete); got != 0 {
+		t.Fatalf("expected pending bulk delete cleared, got %d", got)
+	}
+	if len(m.selectedMessages) != 2 {
+		t.Fatalf("expected selection preserved after cancel, got %+v", m.selectedMessages)
+	}
+}
+
+func TestBulkDeleteConfirmRunsDeleteAndClearsSelection(t *testing.T) {
+	msgs := []db.Message{
+		{ID: 1, MailboxID: 7, Subject: "One"},
+		{ID: 2, MailboxID: 7, Subject: "Two"},
+	}
+	m := Model{
+		keys:              DefaultKeys,
+		focused:           paneMessages,
+		messages:          msgs,
+		filteredMessages:  msgs,
+		selectedMessages:  map[int64]bool{1: true, 2: true},
+		pendingBulkDelete: msgs,
+		overlay:           overlayBulkDeleteConfirm,
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+
+	if cmd == nil {
+		t.Fatal("expected confirm to start delete command")
+	}
+	if m.overlay != overlayNone {
+		t.Fatalf("expected overlay cleared after confirm, got %v", m.overlay)
+	}
+	if got := len(m.pendingBulkDelete); got != 0 {
+		t.Fatalf("expected pending bulk delete cleared, got %d", got)
+	}
+	if len(m.selectedMessages) != 0 {
+		t.Fatalf("expected selection cleared after confirm, got %+v", m.selectedMessages)
+	}
+}
+
+func TestMessagesDeletedMsgKeepsRemoteFailuresVisible(t *testing.T) {
+	deleted := db.Message{ID: 1, MailboxID: 2, Subject: "Gone"}
+	failed := db.Message{ID: 3, MailboxID: 2, Subject: "Still on server"}
+	m := Model{
+		messages:         []db.Message{deleted, failed},
+		filteredMessages: []db.Message{deleted, failed},
+		messageCursor:    0,
+		selectedMessages: make(map[int64]bool),
+	}
+
+	next, _ := m.Update(MessagesDeletedMsg{
+		Deleted: []MessageRef{{ID: deleted.ID, MailboxID: deleted.MailboxID}},
+		Failed:  1,
+		Err:     errors.New("too many simultaneous connections"),
+	})
+	m = next.(Model)
+
+	if len(m.messages) != 1 || m.messages[0].ID != failed.ID {
+		t.Fatalf("expected only the failed message to stay, got %d messages", len(m.messages))
+	}
+	if !m.statusErr {
+		t.Fatal("expected an error status when some deletes fail")
+	}
+	if !strings.Contains(m.statusMsg, "1 failed") {
+		t.Fatalf("expected status to report the failure count, got %q", m.statusMsg)
+	}
+}
+
+func TestRightFromMessageListMarksUnreadMessageRead(t *testing.T) {
+	database, err := db.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	accountID, err := database.AddAccount("", "Acct", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailboxID, err := database.UpsertMailbox(db.Mailbox{AccountID: accountID, Name: "INBOX", UnreadCount: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpsertMessage(db.Message{MailboxID: mailboxID, UID: 1, Subject: "Unread", Read: false}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := database.ListMessages(mailboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected one message, got %d", len(msgs))
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Accounts = []config.AccountConfig{{ID: "cfg-acct", Name: "Acct"}}
+	m := NewModel(database, cfg, "dev", false)
+	m.focused = paneMessages
+	m.accounts = []db.Account{{ID: accountID, ConfigID: "cfg-acct", Name: "Acct"}}
+	m.messages = msgs
+	m.filteredMessages = msgs
+	m.mailboxes = []db.Mailbox{{ID: mailboxID, AccountID: accountID, Name: "INBOX", UnreadCount: 1}}
+	m.selectedMessages = make(map[int64]bool)
+	m.rebuildSidebar()
+	for i, row := range m.sidebarRows {
+		if row.kind == rowKindMailbox && row.mailboxID == mailboxID {
+			m.sidebarCursor = i
+			break
+		}
+	}
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = next.(Model)
+	if m.focused != paneContent {
+		t.Fatalf("expected focus to move to content, got %v", m.focused)
+	}
+	if cmd == nil {
+		t.Fatal("expected right arrow into content to mark unread message read")
+	}
+
+	// Request acceptance leaves local state unchanged until completion.
+	if m.messages[0].Read {
+		t.Fatal("read state changed before completion")
+	}
+	m = settle(t, m, cmd)
+
+	if !m.messages[0].Read || !m.filteredMessages[0].Read {
+		t.Fatalf("expected in-memory message marked read, got messages=%+v filtered=%+v", m.messages[0], m.filteredMessages[0])
+	}
+	stored, err := database.GetMessage(msgs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Read {
+		t.Fatal("expected database message marked read")
+	}
+	if m.mailboxes[0].UnreadCount != 0 {
+		t.Fatalf("expected unread count decremented to 0, got %d", m.mailboxes[0].UnreadCount)
+	}
+}
+
+func TestRightFromMessageListRespectsMarkReadOnOpenDisabled(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.MarkReadOnOpen = false
+	msg := db.Message{ID: 1, MailboxID: 2, Subject: "Unread", Read: false}
+	m := NewModel(nil, cfg, "dev", false)
+	m.focused = paneMessages
+	m.messages = []db.Message{msg}
+	m.filteredMessages = []db.Message{msg}
+	m.selectedMessages = make(map[int64]bool)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = next.(Model)
+	if m.focused != paneContent {
+		t.Fatalf("expected focus to move to content, got %v", m.focused)
+	}
+	if cmd != nil {
+		t.Fatal("did not expect mark-read command when mark_read_on_open is disabled")
+	}
+}
+
+func TestMessageRowCollapsesFoldedHeadersToOneLine(t *testing.T) {
+	row := renderArticleRowWithSender(
+		"⬤ ",
+		"  ",
+		senderDisplay("Alice\r\n Bob <alice@example.com>"),
+		unescapeDisplayText("this &amp; that\r\n folded	 subject"),
+		"now",
+		44,
+		12,
+	)
+
+	if strings.ContainsAny(row, "\r\n	") {
+		t.Fatalf("expected row text to be single-line, got %q", row)
+	}
+	if got := lipgloss.Width(row); got != 44 {
+		t.Fatalf("expected row width 44, got %d: %q", got, row)
+	}
+	if !strings.Contains(row, "this & that folded") {
+		t.Fatalf("expected folded subject collapsed and unescaped, got %q", row)
+	}
+}
+
+func TestRemoteDeletePlanMovesToTrashWhenAvailable(t *testing.T) {
+	source := db.Mailbox{ID: 1, AccountID: 10, Name: "INBOX"}
+	trash := db.Mailbox{ID: 2, AccountID: 10, Name: "[Gmail]/Trash", Flags: []string{"\\Trash"}}
+
+	action, target := remoteDeletePlan(source, &trash)
+
+	if action != remoteDeleteMoveToTrash {
+		t.Fatalf("expected move-to-trash delete plan, got %v", action)
+	}
+	if target == nil || target.ID != trash.ID {
+		t.Fatalf("expected trash target, got %+v", target)
+	}
+}
+
+func TestRemoteDeletePlanExpungesWhenAlreadyInTrash(t *testing.T) {
+	source := db.Mailbox{ID: 2, AccountID: 10, Name: "[Gmail]/Trash", Flags: []string{"\\Trash"}}
+
+	action, target := remoteDeletePlan(source, &source)
+
+	if action != remoteDeleteExpunge {
+		t.Fatalf("expected expunge delete plan, got %v", action)
+	}
+	if target != nil {
+		t.Fatalf("expected no target for expunge, got %+v", target)
+	}
+}
+
+func TestMessageRowStylesKeepReverseVideoSelectedColorWithAccountAccent(t *testing.T) {
+	styles := BuildStyles(BuiltinThemes[0], "compact", "square")
+	m := Model{
+		styles: styles,
+		accounts: []db.Account{
+			{ID: 10, Name: "Personal", Color: "#c41e3a"},
+		},
+		mailboxes: []db.Mailbox{
+			{ID: 20, AccountID: 10, Name: "INBOX"},
+		},
+		sidebarRows: []sidebarRow{
+			{kind: rowKindMailbox, mailboxID: 20, accountID: 10},
+		},
+	}
+
+	_, _, selected, headerActive, _, borderFocus := m.messageRowStyles()
+
+	if selected.GetForeground() != styles.ArticleSelected.GetForeground() {
+		t.Fatalf("selected row foreground should stay base reverse-video color, got %q want %q", selected.GetForeground(), styles.ArticleSelected.GetForeground())
+	}
+	if headerActive.GetBackground() != lipgloss.Color("#c41e3a") {
+		t.Fatalf("header should still use account accent, got %q", headerActive.GetBackground())
+	}
+	// The raw account accent (#c41e3a) only has ~2.8:1 contrast against this
+	// theme's background, below the pane-focus contrast floor, so it should
+	// come back nudged rather than passed through untouched — but it must
+	// still be account-specific, not the theme's generic BorderFocus.
+	if borderFocus == lipgloss.Color("#c41e3a") {
+		t.Fatalf("expected account accent to be nudged for contrast, got it unchanged: %q", borderFocus)
+	}
+	if borderFocus == styles.Theme.BorderFocus {
+		t.Fatalf("expected border focus to still be derived from the account accent, got the theme default %q", borderFocus)
+	}
+	if got := contrastRatio(borderFocus, styles.Theme.Bg); got < paneFocusMinContrast {
+		t.Fatalf("expected nudged border focus to meet the %.1f contrast floor, got %.2f (%q)", paneFocusMinContrast, got, borderFocus)
+	}
+}
+
+func TestSpaceSelectAdvanceKeepsCursorVisible(t *testing.T) {
+	m := NewModel(nil, config.DefaultConfig(), "dev", false)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = next.(Model)
+	m.focused = paneMessages
+
+	visible := m.articleRowsVisible()
+	if visible < 2 {
+		t.Fatalf("expected at least 2 visible message rows, got %d", visible)
+	}
+	msgs := make([]db.Message, visible+2)
+	for i := range msgs {
+		msgs[i] = db.Message{ID: int64(i + 1), Subject: fmt.Sprintf("Message %d", i+1)}
+	}
+	m.messages = msgs
+	m.filteredMessages = msgs
+	m.messageCursor = visible - 1
+	m.listOffset = 0
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = next.(Model)
+
+	if m.messageCursor != visible {
+		t.Fatalf("expected cursor to advance to %d, got %d", visible, m.messageCursor)
+	}
+	if m.listOffset != 1 {
+		t.Fatalf("expected list offset to scroll to 1, got %d", m.listOffset)
+	}
+}
+
+func TestSelectAllKeySelectsFilteredMessages(t *testing.T) {
+	msgs := []db.Message{
+		{ID: 1, Subject: "Visible 1"},
+		{ID: 2, Subject: "Visible 2"},
+		{ID: 3, Subject: "Hidden"},
+	}
+	m := Model{
+		keys:             DefaultKeys,
+		focused:          paneMessages,
+		messages:         msgs,
+		filteredMessages: msgs[:2],
+		selectedMessages: make(map[int64]bool),
+	}
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	m = next.(Model)
+
+	if len(m.selectedMessages) != 2 {
+		t.Fatalf("expected 2 selected messages, got %d: %+v", len(m.selectedMessages), m.selectedMessages)
+	}
+	for _, id := range []int64{1, 2} {
+		if !m.selectedMessages[id] {
+			t.Fatalf("expected message %d selected, got %+v", id, m.selectedMessages)
+		}
+	}
+	if m.selectedMessages[3] {
+		t.Fatalf("did not expect hidden message selected, got %+v", m.selectedMessages)
+	}
+}
+
+func TestThreadToggleGroupsMessageRows(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+
+	msgs := []db.Message{
+		{ID: 2, MessageID: "<reply@example.com>", InReplyTo: "<root@example.com>", Subject: "Re: Plan", Date: time.Unix(200, 0)},
+		{ID: 1, MessageID: "<root@example.com>", Subject: "Plan", Date: time.Unix(100, 0), Read: true},
+	}
+	m := NewModel(nil, config.DefaultConfig(), "dev", false)
+	m.focused = paneMessages
+	m.messages = msgs
+	m.filteredMessages = msgs
+	m.selectedMessages = make(map[int64]bool)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = next.(Model)
+
+	if !m.cfg.Display.ThreadedConversations {
+		t.Fatal("expected threaded conversations enabled")
+	}
+	if got := m.activeMessageRowCount(); got != 1 {
+		t.Fatalf("expected one thread row, got %d", got)
+	}
+	if len(m.messageThreads) != 1 || m.messageThreads[0].Count != 2 {
+		t.Fatalf("expected grouped thread, got %+v", m.messageThreads)
+	}
+	if msg := m.currentRowMessage(); msg == nil || msg.ID != 2 {
+		t.Fatalf("expected newest reply representative, got %+v", msg)
+	}
+}
+
+func TestAccountsPaneComfortableDensityDoesNotExceedMainHeight(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.Density = "comfortable"
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 100
+	m.height = 12
+	m.focused = paneAccounts
+	m.accounts = []db.Account{{ID: 1, Name: "Work"}}
+	for i := 0; i < 20; i++ {
+		m.mailboxes = append(m.mailboxes, db.Mailbox{
+			ID:        int64(i + 1),
+			AccountID: 1,
+			Name:      fmt.Sprintf("Folder %02d", i),
+		})
+	}
+	m.rebuildSidebar()
+
+	view := ansi.Strip(m.renderAccountsPane())
+	if got, want := strings.Count(view, "\n")+1, m.mainHeight(); got > want {
+		t.Fatalf("expected accounts pane height <= %d lines, got %d:\n%s", want, got, view)
+	}
+}
+
+func TestMessagesPaneComfortableDensityDoesNotExceedPaneHeight(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.Density = "comfortable"
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 100
+	m.height = 16
+	m.focused = paneMessages
+	m.selectedMessages = make(map[int64]bool)
+	for i := 0; i < 30; i++ {
+		msg := db.Message{
+			ID:      int64(i + 1),
+			Subject: fmt.Sprintf("Message %02d", i),
+			From:    "sender@example.com",
+			Date:    time.Unix(int64(i), 0),
+		}
+		m.messages = append(m.messages, msg)
+		m.filteredMessages = append(m.filteredMessages, msg)
+	}
+	m.messageCursor = 10
+	m.listOffset = 8
+
+	view := ansi.Strip(m.renderMessagesPane())
+	if got, want := strings.Count(view, "\n")+1, m.articlesPaneOuterHeight(); got > want {
+		t.Fatalf("expected messages pane height <= %d lines, got %d:\n%s", want, got, view)
+	}
+	if got, want := lipgloss.Width(m.renderMessagesPane()), m.articlesPaneWidth(); got > want {
+		t.Fatalf("expected messages pane width <= %d columns, got %d", want, got)
+	}
+}
+
+// subjectStartColumn returns the display column where needle begins on the first
+// rendered line that contains it, or -1 if no line contains it.
+func subjectStartColumn(pane, needle string) int {
+	for _, line := range strings.Split(ansi.Strip(pane), "\n") {
+		if idx := strings.Index(line, needle); idx >= 0 {
+			return lipgloss.Width(line[:idx])
+		}
+	}
+	return -1
+}
+
+func TestMessagesPaneMedalSubjectDoesNotShiftLayout(t *testing.T) {
+	for _, density := range []string{"compact", "comfortable"} {
+		for _, showSender := range []bool{false, true} {
+			for _, medalStarred := range []bool{false, true} {
+				for _, cursor := range []int{0, 1} { // medal row focused and unfocused
+					name := fmt.Sprintf("density=%s/sender=%v/starred=%v/cursor=%d", density, showSender, medalStarred, cursor)
+					t.Run(name, func(t *testing.T) {
+						cfg := config.DefaultConfig()
+						cfg.Display.Density = density
+						cfg.Display.ShowSender = showSender
+						m := NewModel(nil, cfg, "dev", false)
+						m.width = 120
+						m.height = 30
+						m.focused = paneMessages
+						m.selectedMessages = make(map[int64]bool)
+						m.accounts = []db.Account{{ID: 1, Name: "Work"}}
+						m.mailboxes = []db.Mailbox{{ID: 1, AccountID: 1, Name: "INBOX"}}
+
+						for i := 0; i < 20; i++ {
+							subject := fmt.Sprintf("Message %02d subject text with extra words", i)
+							from := "sender@example.com"
+							starred := i%3 == 0
+							if i == 0 {
+								subject = "LEVEL UP 🥇 "
+								from = "Just Between Friends - Lee's Summit <leessummit@jbfsale.com>"
+								starred = medalStarred
+							}
+							msg := db.Message{
+								ID:        int64(i + 1),
+								MailboxID: 1,
+								Subject:   subject,
+								From:      from,
+								Date:      time.Unix(int64(i), 0),
+								Starred:   starred,
+							}
+							m.messages = append(m.messages, msg)
+							m.filteredMessages = append(m.filteredMessages, msg)
+						}
+						m.rebuildSidebar()
+						m.messageCursor = cursor
+						m.listOffset = 0
+
+						pane := m.renderMessagesPane()
+						if !strings.Contains(ansi.Strip(pane), "LEVEL UP") || strings.Contains(ansi.Strip(pane), "🥇") {
+							t.Fatal("expected the message list to omit the medal emoji")
+						}
+						if got := m.filteredMessages[0].Subject; got != "LEVEL UP 🥇 " {
+							t.Fatalf("stored subject changed during rendering: %q", got)
+						}
+						// The star lives in a fixed-width reserved column, so a
+						// starred subject must start at the same visual column as a
+						// non-starred one — the marker must not shift the subject.
+						medalCol := subjectStartColumn(pane, "LEVEL UP")
+						plainCol := subjectStartColumn(pane, "Message 01")
+						if medalCol < 0 || plainCol < 0 {
+							t.Fatalf("expected both the medal and a plain row to render, got medal=%d plain=%d", medalCol, plainCol)
+						}
+						if medalCol != plainCol {
+							t.Fatalf("starred state shifted the subject column: medal starts at %d, plain at %d", medalCol, plainCol)
+						}
+						if got, want := strings.Count(ansi.Strip(pane), "\n")+1, m.articlesPaneOuterHeight(); got > want {
+							t.Fatalf("message pane height %d > allocated height %d", got, want)
+						}
+
+						view := m.View()
+						plain := ansi.Strip(view)
+						if got := strings.Count(plain, "\n") + 1; got != m.height {
+							t.Fatalf("full view height %d != terminal height %d", got, m.height)
+						}
+						for i, line := range strings.Split(view, "\n") {
+							if got := lipgloss.Width(line); got > m.width {
+								t.Fatalf("rendered line %d width %d > terminal width %d", i, got, m.width)
+							}
+						}
+						headerLine := strings.Split(plain, "\n")[1]
+						if !strings.Contains(headerLine, "Accounts") || !strings.Contains(headerLine, "Unified Inbox") {
+							t.Fatalf("expected pane headers on the second line (below the top border), got %q", headerLine)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestScrollingMessageListKeepsPaneHeadersVisible(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.Density = "comfortable"
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 100
+	m.height = 16
+	m.focused = paneMessages
+	m.accounts = []db.Account{{ID: 1, Name: "Work"}}
+	m.mailboxes = []db.Mailbox{{ID: 1, AccountID: 1, Name: "INBOX"}}
+	m.selectedMessages = make(map[int64]bool)
+	for i := 0; i < 30; i++ {
+		msg := db.Message{
+			ID:        int64(i + 1),
+			MailboxID: 1,
+			Subject:   fmt.Sprintf("Message %02d", i),
+			From:      "sender@example.com",
+			Date:      time.Unix(int64(i), 0),
+		}
+		m.messages = append(m.messages, msg)
+		m.filteredMessages = append(m.filteredMessages, msg)
+	}
+	m.rebuildSidebar()
+	m.messageCursor = 10
+	m.listOffset = 8
+	m.setViewportForCurrentRow()
+
+	next, _ := m.handleUp()
+	m = next.(Model)
+
+	view := ansi.Strip(m.View())
+	lines := strings.Split(view, "\n")
+	if got, want := len(lines), m.height; got != want {
+		t.Fatalf("expected full view height %d lines, got %d:\n%s", want, got, view)
+	}
+	for i, line := range strings.Split(m.View(), "\n") {
+		if got, want := lipgloss.Width(line), m.width; got > want {
+			t.Fatalf("expected rendered line %d width <= %d columns, got %d: %q", i, want, got, ansi.Strip(line))
+		}
+	}
+	if len(lines) < 2 || !strings.Contains(lines[1], "Accounts") || !strings.Contains(lines[1], "Unified Inbox") {
+		t.Fatalf("expected pane headers to remain visible below the top border, got:\n%s", view)
+	}
+}
+
+func TestValidateAccountForConnect(t *testing.T) {
+	base := config.AccountConfig{Name: "Acct", IMAPHost: "imap.x", SMTPHost: "smtp.x", User: "u", From: "u@example.com", IMAPPort: 993, SMTPPort: 587}
+	if got := validateAccountForConnect(base).msg; got != "" {
+		t.Fatalf("valid config rejected: %q", got)
+	}
+	cases := []struct {
+		name string
+		mut  func(*config.AccountConfig)
+	}{
+		{"missing name", func(c *config.AccountConfig) { c.Name = "" }},
+		{"missing imap host", func(c *config.AccountConfig) { c.IMAPHost = "" }},
+		{"missing smtp host", func(c *config.AccountConfig) { c.SMTPHost = "" }},
+		{"imap host as url", func(c *config.AccountConfig) { c.IMAPHost = "imaps://imap.x" }},
+		{"smtp host with port", func(c *config.AccountConfig) { c.SMTPHost = "smtp.x:587" }},
+		{"non-address login with no from", func(c *config.AccountConfig) { c.From = "" }},
+		{"missing user", func(c *config.AccountConfig) { c.User = "" }},
+		{"imap port too high", func(c *config.AccountConfig) { c.IMAPPort = 70000 }},
+		{"smtp port zero", func(c *config.AccountConfig) { c.SMTPPort = 0 }},
+		{"imap port negative", func(c *config.AccountConfig) { c.IMAPPort = -1 }},
+	}
+	for _, tc := range cases {
+		cfg := base
+		tc.mut(&cfg)
+		if got := validateAccountForConnect(cfg).msg; got == "" {
+			t.Errorf("%s: expected a validation error, got none", tc.name)
+		}
+	}
+}
+
+// TestMailboxReloadKeepsScrollPositionAfterDelete verifies that a
+// MessagesLoadedMsg for the active mailbox (as fired after a delete commits, or
+// by a background sync) holds the list where the user left it instead of
+// snapping back to the top.
+func TestMailboxReloadKeepsScrollPositionAfterDelete(t *testing.T) {
+	const mailboxID = int64(7)
+	cfg := config.DefaultConfig()
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 100
+	m.height = 30
+	m.focused = paneMessages
+	m.accounts = []db.Account{{ID: 1, Name: "Personal"}}
+	m.mailboxes = []db.Mailbox{{ID: mailboxID, AccountID: 1, Name: "INBOX"}}
+	m.rebuildSidebar()
+	for i, row := range m.sidebarRows {
+		if row.kind == rowKindMailbox && row.mailboxID == mailboxID {
+			m.sidebarCursor = i
+			break
+		}
+	}
+
+	msgs := make([]db.Message, 30)
+	for i := range msgs {
+		msgs[i] = db.Message{ID: int64(i + 1), MailboxID: mailboxID, Subject: fmt.Sprintf("msg %d", i+1), Date: time.Unix(int64(1000-i), 0)}
+	}
+	m.messages = msgs
+	m.applyFilter()
+	// User has scrolled down and parked on msg 21 (index 20).
+	m.messageCursor = 20
+	m.listOffset = 14
+	focusedID := m.filteredMessages[m.messageCursor].ID
+
+	// Reload with an earlier message (index 5) removed, mimicking a delete of a
+	// row above the cursor.
+	reloaded := append(append([]db.Message(nil), msgs[:5]...), msgs[6:]...)
+	next, _ := m.Update(MessagesLoadedMsg{MailboxID: mailboxID, Messages: reloaded})
+	m = next.(Model)
+
+	if got := m.filteredMessages[m.messageCursor].ID; got != focusedID {
+		t.Fatalf("expected cursor to stay on message %d, landed on %d", focusedID, got)
+	}
+	if m.messageCursor != 19 {
+		t.Fatalf("expected cursor index to shift to 19 after a row above was removed, got %d", m.messageCursor)
+	}
+	if m.listOffset != 13 {
+		t.Fatalf("expected scroll offset to follow the cursor (13), got %d", m.listOffset)
+	}
+}
+
+func TestSearchResultsReplaceCurrentMailboxListAndRenderContext(t *testing.T) {
+	cfg := config.DefaultConfig()
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 102
+	m.height = 20
+	m.focused = paneMessages
+	m.accounts = []db.Account{{ID: 1, Name: "Personal"}, {ID: 2, Name: "Work"}}
+	m.mailboxes = []db.Mailbox{
+		{ID: 11, AccountID: 1, Name: "INBOX", DisplayName: "Inbox"},
+		{ID: 22, AccountID: 2, Name: "Archive", DisplayName: "Archive"},
+	}
+	m.rebuildSidebar()
+	m.sidebarCursor = 1
+	m.searchMode = true
+	m.searchQuery = "launch"
+
+	next, _ := m.Update(MessagesLoadedMsg{
+		Search: true,
+		Query:  "launch",
+		Messages: []db.Message{
+			{ID: 1, MailboxID: 11, Subject: "Quarterly launch", AccountName: "Personal", MailboxName: "Inbox", Date: time.Unix(10, 0)},
+			{ID: 2, MailboxID: 22, Subject: "Retrospective", AccountName: "Work", MailboxName: "Archive", Date: time.Unix(20, 0)},
+		},
+	})
+	m = next.(Model)
+
+	if len(m.filteredMessages) != 2 {
+		t.Fatalf("expected 2 search results, got %+v", m.filteredMessages)
+	}
+	view := ansi.Strip(m.renderMessagesPane())
+	if !strings.Contains(view, "Quarterly launch [Personal / Inbox]") {
+		t.Fatalf("expected rendered row to include mailbox/account context, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Search: launch") {
+		t.Fatalf("expected search-results title, got:\n%s", view)
+	}
+}
+
+func TestSearchUsesDedicatedRowBelowMessagesHeader(t *testing.T) {
+	m := NewModel(nil, config.DefaultConfig(), "dev", false)
+	m.width = 100
+	m.height = 20
+	m.focused = paneMessages
+	m.searchMode = true
+	m.searchEditing = true
+	m.searchQuery = "launch"
+	m.searchInput.SetValue("launch")
+	m.filteredMessages = []db.Message{{ID: 1, Subject: "Quarterly launch", Date: time.Unix(10, 0)}}
+	m.selectedMessages = make(map[int64]bool)
+
+	lines := strings.Split(ansi.Strip(m.renderMessagesPane()), "\n")
+	header, search, subject := -1, -1, -1
+	for i, line := range lines {
+		switch {
+		case strings.Contains(line, "Messages"):
+			header = i
+		case strings.Contains(line, "Search: launch"):
+			search = i
+		case strings.Contains(line, "Quarterly launch"):
+			subject = i
+		}
+	}
+	if header < 0 || search != header+1 || subject != search+1 {
+		t.Fatalf("expected header, search, and first subject on consecutive rows; got header=%d search=%d subject=%d\n%s", header, search, subject, strings.Join(lines, "\n"))
+	}
+}
+
+func TestSearchCursorFollowsPromptAndTypedQuery(t *testing.T) {
+	m := NewModel(nil, config.DefaultConfig(), "dev", false)
+	m.searchMode = true
+	m.searchEditing = true
+
+	empty := ansi.Strip(m.renderMessageSearchRow(40))
+	if !strings.HasPrefix(empty, "Search:  ") {
+		t.Fatalf("empty search cursor should follow the prompt, got %q", empty)
+	}
+
+	next, _ := m.handleSearchCharacter("launch")
+	m = next.(Model)
+	if got, want := m.searchInput.Position(), len([]rune("launch")); got != want {
+		t.Fatalf("search cursor position=%d, want end of query at %d", got, want)
+	}
+	typed := ansi.Strip(m.renderMessageSearchRow(40))
+	if !strings.HasPrefix(typed, "Search: launch ") {
+		t.Fatalf("typed search cursor should follow the query, got %q", typed)
+	}
+}
+
+// Found driving a real mailbox: typing "E2E 0" searched for "E2E0".
+func TestSearchKeepsSpacesBetweenWords(t *testing.T) {
+	m := NewModel(nil, config.DefaultConfig(), "dev", false)
+	m.focused = paneMessages
+	send := func(k tea.KeyMsg) {
+		next, _ := m.handleMainKey(k)
+		m = next.(Model)
+	}
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	for _, k := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune{'a'}},
+		{Type: tea.KeySpace, Runes: []rune{' '}},
+		{Type: tea.KeyRunes, Runes: []rune{'b'}},
+	} {
+		send(k)
+	}
+	if m.searchQuery != "a b" || m.searchInput.Value() != "a b" {
+		t.Fatalf("query=%q box=%q, want both %q", m.searchQuery, m.searchInput.Value(), "a b")
+	}
+	send(tea.KeyMsg{Type: tea.KeyBackspace})
+	send(tea.KeyMsg{Type: tea.KeyBackspace})
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if m.searchQuery != "ac" {
+		t.Fatalf("after deleting the space: query=%q, want %q", m.searchQuery, "ac")
+	}
+}
+
+func TestHiddenPaneHeadersMoveFocusedContextToStatusLine(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.ShowPaneHeaders = false
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 140
+	m.height = 24
+	m.selectedMessages = make(map[int64]bool)
+
+	checks := []struct {
+		focus pane
+		title string
+		want  string
+	}{
+		{paneAccounts, "Accounts", "toggle"},
+		{paneMessages, "Messages", "archive"},
+		{paneContent, "Content", "reply"},
+	}
+	for _, tc := range checks {
+		m.focused = tc.focus
+		got := ansi.Strip(m.renderStatusBar())
+		if !strings.Contains(got, tc.title) || !strings.Contains(got, tc.want) || strings.Index(got, tc.title) > strings.Index(got, tc.want) {
+			t.Errorf("focus %v: expected title %q before contextual hint %q, got %q", tc.focus, tc.title, tc.want, got)
+		}
+	}
+	m.focused = paneAccounts
+	accountStatus := ansi.Strip(m.renderStatusBar())
+	for _, want := range []string{"command", "accounts", "settings", "search", "help"} {
+		if !strings.Contains(accountStatus, want) {
+			t.Errorf("Accounts status hints missing default action %q: %q", want, accountStatus)
+		}
+	}
+
+	if got := ansi.Strip(m.renderMessagesPane()); strings.Contains(got, "> Messages") {
+		t.Fatalf("hidden pane header leaked into message pane: %q", got)
+	}
+}
+
+func TestHiddenPaneHeadersShowSearchControlsWhileEditing(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Display.ShowPaneHeaders = false
+	m := NewModel(nil, cfg, "dev", false)
+	m.width = 120
+	m.height = 24
+	m.focused = paneAccounts
+	m.searchMode = true
+	m.searchEditing = true
+
+	got := ansi.Strip(m.renderStatusBar())
+	if !strings.Contains(got, "enter finish") || !strings.Contains(got, "esc exit") {
+		t.Fatalf("expected active search controls to replace pane hints, got %q", got)
+	}
+}
+
+func TestHiddenPaneHeadersRecoverOneContentRowPerPane(t *testing.T) {
+	shownCfg := config.DefaultConfig()
+	shown := NewModel(nil, shownCfg, "dev", false)
+	shown.width, shown.height = 120, 30
+
+	hiddenCfg := shownCfg
+	hiddenCfg.Display.ShowPaneHeaders = false
+	hidden := NewModel(nil, hiddenCfg, "dev", false)
+	hidden.width, hidden.height = shown.width, shown.height
+
+	if got, want := hidden.sidebarVisibleRows(), shown.sidebarVisibleRows()+1; got != want {
+		t.Fatalf("hidden Accounts header: visible rows=%d, want %d", got, want)
+	}
+	if got, want := hidden.articleRowsVisible(), shown.articleRowsVisible()+1; got != want {
+		t.Fatalf("hidden Messages header: visible rows=%d, want %d", got, want)
+	}
+	if got, want := hidden.contentBodyHeight(), shown.contentBodyHeight()+1; got != want {
+		t.Fatalf("hidden Content header: body height=%d, want %d", got, want)
+	}
+}
+
+func TestSidebarNavigationDoesNotReloadWhileSearchIsActive(t *testing.T) {
+	cfg := config.DefaultConfig()
+	m := NewModel(nil, cfg, "dev", false)
+	m.accounts = []db.Account{{ID: 1, Name: "Personal"}}
+	m.mailboxes = []db.Mailbox{
+		{ID: 11, AccountID: 1, Name: "INBOX"},
+		{ID: 12, AccountID: 1, Name: "Archive"},
+	}
+	m.rebuildSidebar()
+	m.sidebarCursor = 1
+	m.focused = paneAccounts
+	m.searchMode = true
+	m.searchQuery = "launch"
+	m.messages = []db.Message{{ID: 1, MailboxID: 11, Subject: "Search hit"}}
+	m.filteredMessages = append([]db.Message(nil), m.messages...)
+
+	next, cmd := m.handleDown()
+	m = next.(Model)
+
+	if cmd != nil {
+		t.Fatal("expected sidebar move during search not to trigger reload")
+	}
+	if m.sidebarCursor != 2 {
+		t.Fatalf("expected cursor to move to next sidebar row, got %d", m.sidebarCursor)
+	}
+	if len(m.filteredMessages) != 1 || m.filteredMessages[0].Subject != "Search hit" {
+		t.Fatalf("expected search results preserved, got %+v", m.filteredMessages)
+	}
+}
+
+func TestSearchModePersistsAfterMultipleCharacters(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mm := NewModel(nil, cfg, "dev", false)
+	mm.searchMode = true
+	mm.searchEditing = true
+	mm.searchQuery = "l"
+	mm.searchInput.SetValue("l") // the box and the query always move together
+
+	// Type second character — search mode and editing should stay active.
+	next, _ := mm.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m := next.(Model)
+
+	if !m.searchMode {
+		t.Fatal("expected searchMode to stay true after typing second character")
+	}
+	if !m.searchEditing {
+		t.Fatal("expected searchEditing to stay true after typing second character")
+	}
+	if m.searchQuery != "la" {
+		t.Fatalf("expected searchQuery to be 'la', got %q", m.searchQuery)
+	}
+}
+
+func TestEscExitsPersistentSearchMode(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mm := NewModel(nil, cfg, "dev", false)
+	mm.searchMode = true
+	mm.searchEditing = false
+	mm.searchQuery = "launch"
+
+	next, _ := mm.handleMainKey(createKeyMsg("esc"))
+	m := next.(Model)
+
+	if m.searchMode {
+		t.Fatal("expected searchMode to be false after Esc")
+	}
+	if m.searchEditing {
+		t.Fatal("expected searchEditing to be false after Esc")
+	}
+	if m.searchQuery != "" {
+		t.Fatalf("expected searchQuery to be empty after Esc, got %q", m.searchQuery)
+	}
+}
+
+func TestEnterStopsEditingButKeepsSearchMode(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mm := NewModel(nil, cfg, "dev", false)
+	mm.searchMode = true
+	mm.searchEditing = true
+	mm.searchQuery = "launch"
+
+	next, _ := mm.handleMainKey(createKeyMsg("enter"))
+	m := next.(Model)
+
+	if !m.searchMode {
+		t.Fatal("expected searchMode to stay true after Enter")
+	}
+	if m.searchEditing {
+		t.Fatal("expected searchEditing to be false after Enter")
+	}
+	if m.searchQuery != "launch" {
+		t.Fatalf("expected searchQuery preserved after Enter, got %q", m.searchQuery)
+	}
+}
+
+func TestEmptyQueryKeepsSearchModeActive(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mm := NewModel(nil, cfg, "dev", false)
+	mm.searchMode = true
+	mm.searchEditing = true
+	mm.searchQuery = "x"
+
+	// Backspace to clear query.
+	next, _ := mm.handleMainKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	m := next.(Model)
+
+	if !m.searchMode {
+		t.Fatal("expected searchMode to stay true after clearing query")
+	}
+	if !m.searchEditing {
+		t.Fatal("expected searchEditing to stay true after clearing query")
+	}
+	if m.searchQuery != "" {
+		t.Fatalf("expected searchQuery to be empty after backspace on single char, got %q", m.searchQuery)
+	}
+}
+
+func createKeyMsg(s string) tea.KeyMsg {
+	switch s {
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEscape}
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	default:
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+}
+
+// Issue #29: a background update that emptied the message view (a failed
+// account reload, a mailbox reload with nothing selected) cleared content
+// search, and clearing content search closed whatever overlay was open,
+// throwing away a half-filled account form along with its status line.
+func TestBackgroundViewResetKeepsOpenOverlay(t *testing.T) {
+	for _, overlay := range []overlayMode{overlayAccountManager, overlaySettings, overlayCompose} {
+		m := NewModel(nil, config.DefaultConfig(), "dev", false)
+		m.overlay = overlay
+		m.accountManager.mode = amAdd
+		m.accountManager.nameInput.SetValue("Work")
+
+		next, _ := m.Update(AccountsLoadedMsg{Err: errors.New("sync failed: dial tcp: connection refused")})
+		m = next.(Model)
+		if m.overlay != overlay {
+			t.Fatalf("overlay %d closed by a background accounts reload", overlay)
+		}
+		next, _ = m.Update(readRemoteCompletedMsg{IDs: []int64{1}, Success: []MessageReadBatchEntry{{MessageID: 1, Read: true}}})
+		m = next.(Model)
+		if m.overlay != overlay {
+			t.Fatalf("overlay %d closed by a background read-state update", overlay)
+		}
+		if overlay == overlayAccountManager && m.accountManager.nameInput.Value() != "Work" {
+			t.Fatalf("account form lost its input: %q", m.accountManager.nameInput.Value())
+		}
+	}
+}
+
+func TestClearContentSearchClosesOnlyContentSearch(t *testing.T) {
+	m := NewModel(nil, config.DefaultConfig(), "dev", false)
+	m.overlay = overlayContentSearch
+	m.clearContentSearch()
+	if m.overlay != overlayNone {
+		t.Fatalf("expected content search overlay closed, got %d", m.overlay)
+	}
+}

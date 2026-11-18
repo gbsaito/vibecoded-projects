@@ -1,0 +1,730 @@
+package imap
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net/textproto"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-message"
+	// Registers the global message.CharsetReader so non-UTF-8 parts
+	// (ISO-8859-1, Windows-1252, Shift_JIS, …) decode to UTF-8 instead of
+	// producing U+FFFD replacement chars — and so an unknown charset no longer
+	// aborts NextPart and drops the rest of the message.
+	_ "github.com/emersion/go-message/charset"
+	"github.com/emersion/go-message/mail"
+)
+
+type bodyAttachment struct {
+	Filename        string
+	ContentType     string
+	ContentID       string
+	Disposition     string
+	ContentLocation string
+	Inline          bool
+	Data            []byte
+}
+
+func (c *Client) fetchMessages(ctx context.Context, mailboxName string, limit int, since time.Time) ([]db.Message, error) {
+	msgs, _, err := c.FetchSincePage(ctx, mailboxName, since, limit, nil)
+	return msgs, err
+}
+
+// FetchSincePage fetches at most limit bodies. Known UIDs are skipped during
+// incremental sync; more reports whether another page is needed before advancing
+// the sync watermark. A cold mailbox still loads only its newest history page.
+func (c *Client) FetchSincePage(ctx context.Context, mailboxName string, since time.Time, limit int, known map[uint32]bool) ([]db.Message, bool, error) {
+	more := false
+	if c.conn == nil {
+		return nil, false, fmt.Errorf("not connected")
+	}
+	defer c.applyDeadline(ctx)()
+
+	selectData, err := c.conn.Select(mailboxName, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return nil, false, fmt.Errorf("select %s: %w", mailboxName, err)
+	}
+
+	total := selectData.NumMessages
+	if total == 0 {
+		return nil, false, nil
+	}
+
+	var numSet imap.NumSet
+
+	if !since.IsZero() {
+		// Incremental sync: use UID SEARCH SINCE to ask the server for
+		// only messages received since the last sync. This avoids fetching
+		// and discarding the full body of every previously-seen message.
+		criteria := &imap.SearchCriteria{Since: since}
+		// A move/APPEND can preserve an old INTERNALDATE while assigning a new
+		// destination UID. Fill unknown UIDs above the cached history floor as
+		// well, so subsequent pages also recover old-dated moves.
+		var oldest uint32
+		for uid := range known {
+			if uid != 0 && (oldest == 0 || uid < oldest) {
+				oldest = uid
+			}
+		}
+		if oldest != 0 {
+			criteria = &imap.SearchCriteria{Or: [][2]imap.SearchCriteria{{
+				{Since: since}, {UID: []imap.UIDSet{{{Start: imap.UID(oldest), Stop: 0}}}},
+			}}}
+		}
+		searchData, err := c.conn.UIDSearch(criteria, nil).Wait()
+		if err != nil {
+			return nil, false, fmt.Errorf("uid search: %w", err)
+		}
+		uids := searchData.AllUIDs()
+		remaining := uids[:0]
+		for _, uid := range uids {
+			if !known[uint32(uid)] {
+				remaining = append(remaining, uid)
+			}
+		}
+		uids = remaining
+		sort.Slice(uids, func(i, j int) bool { return uids[i] > uids[j] })
+		if limit <= 0 {
+			limit = MessagesPerInitialSync
+		}
+		if len(uids) > limit {
+			more = true
+			uids = uids[:limit]
+		}
+		if len(uids) == 0 {
+			return nil, false, nil
+		}
+		numSet = imap.UIDSetNum(uids...)
+	} else {
+		// Initial sync: fetch last N messages by sequence number.
+		start := uint32(1)
+		if limit > 0 && total > uint32(limit) {
+			start = total - uint32(limit) + 1
+		}
+		seqSet := imap.SeqSetNum()
+		for i := start; i <= total; i++ {
+			seqSet.AddNum(i)
+		}
+		numSet = seqSet
+	}
+
+	msgs, err := c.fetchNumSet(numSet)
+	if err == nil && more && len(msgs) == 0 {
+		err = fmt.Errorf("incremental page made no progress")
+	}
+	return msgs, more, err
+}
+
+// FetchOlderThan fetches up to limit messages immediately below beforeUID, used
+// to page further back into a mailbox than the initial sync reached. Callers
+// pass the oldest UID they already hold, so the result is the next page of
+// history rather than anything already cached.
+//
+// The mailbox must already be selected by the caller's connection or this
+// selects it read-only itself.
+func (c *Client) FetchOlderThan(ctx context.Context, mailboxName string, beforeUID uint32, limit int) ([]db.Message, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	if beforeUID <= 1 || limit <= 0 {
+		return nil, nil
+	}
+	defer c.applyDeadline(ctx)()
+
+	if _, err := c.conn.Select(mailboxName, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return nil, fmt.Errorf("select %s: %w", mailboxName, err)
+	}
+
+	// Ask which UIDs actually exist below the cutoff rather than assuming a
+	// contiguous range — UIDs are sparse wherever mail has been deleted or
+	// moved, so a blind 1:beforeUID-1 fetch would mostly request nothing.
+	searchData, err := c.conn.UIDSearch(&imap.SearchCriteria{
+		UID: []imap.UIDSet{{imap.UIDRange{Start: 1, Stop: imap.UID(beforeUID - 1)}}},
+	}, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("uid search: %w", err)
+	}
+	uids := searchData.AllUIDs()
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	// AllUIDs is ascending; the newest of the older messages are the ones the
+	// user is about to scroll into, so take from the tail.
+	if len(uids) > limit {
+		uids = uids[len(uids)-limit:]
+	}
+	return c.fetchNumSet(imap.UIDSetNum(uids...))
+}
+
+// FetchByUID fetches one message for a detail view without downloading a
+// whole page of the mailbox. The UID, not a sequence number, identifies it.
+func (c *Client) FetchByUID(ctx context.Context, mailboxName string, uid uint32) (db.Message, error) {
+	if c.conn == nil {
+		return db.Message{}, fmt.Errorf("not connected")
+	}
+	defer c.applyDeadline(ctx)()
+
+	if _, err := c.conn.Select(mailboxName, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return db.Message{}, fmt.Errorf("select %s: %w", mailboxName, err)
+	}
+	msgs, err := c.fetchNumSet(imap.UIDSetNum(imap.UID(uid)))
+	if err != nil {
+		return db.Message{}, err
+	}
+	if len(msgs) == 0 {
+		return db.Message{}, fmt.Errorf("message uid %d not found", uid)
+	}
+	return msgs[0], nil
+}
+
+// FetchRaw returns one message's complete RFC 822 bytes without marking it
+// read. It is for features that need the exact bytes, such as verifying a
+// signature; the caller must not store the result.
+func (c *Client) FetchRaw(ctx context.Context, mailboxName string, uid uint32) ([]byte, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	defer c.applyDeadline(ctx)()
+
+	if _, err := c.conn.Select(mailboxName, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return nil, fmt.Errorf("select %s: %w", mailboxName, err)
+	}
+	section := &imap.FetchItemBodySection{Peek: true}
+	msgs, err := c.conn.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{section},
+	}).Collect()
+	if err != nil {
+		return nil, fmt.Errorf("fetch: %w", err)
+	}
+	for _, msg := range msgs {
+		for _, s := range msg.BodySection {
+			if len(s.Bytes) > 0 {
+				return s.Bytes, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("message uid %d not found", uid)
+}
+
+// fetchNumSet fetches and parses a set of messages. Parse failures skip the
+// individual message rather than failing the batch — one malformed message
+// must not cost the user the whole page.
+func (c *Client) fetchNumSet(numSet imap.NumSet) ([]db.Message, error) {
+	bodySection := &imap.FetchItemBodySection{}
+	headerSection := &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader}
+	// No BODYSTRUCTURE: the body is parsed from BodySection, and iCloud sends
+	// multipart structures go-imap can't parse, failing the whole fetch (#62).
+	fetchOptions := &imap.FetchOptions{
+		UID:          true,
+		Flags:        true,
+		Envelope:     true,
+		InternalDate: true,
+		BodySection:  []*imap.FetchItemBodySection{bodySection, headerSection},
+	}
+
+	cmd := c.conn.Fetch(numSet, fetchOptions)
+	msgs, err := cmd.Collect()
+	if err != nil {
+		return nil, fmt.Errorf("fetch: %w", err)
+	}
+
+	var results []db.Message
+	for _, msg := range msgs {
+		parsed, err := parseIMAPMessage(msg)
+		if err != nil {
+			continue
+		}
+		results = append(results, parsed)
+	}
+	return results, nil
+}
+
+func parseIMAPMessage(msg *imapclient.FetchMessageBuffer) (db.Message, error) {
+	m := db.Message{
+		UID: uint32(msg.UID),
+	}
+
+	for _, f := range msg.Flags {
+		m.Flags = append(m.Flags, string(f))
+		if f == imap.FlagSeen {
+			m.Read = true
+		}
+		if f == imap.FlagFlagged {
+			m.Starred = true
+		}
+	}
+
+	if env := msg.Envelope; env != nil {
+		m.Subject = sanitizeControl(env.Subject)
+		m.MessageID = sanitizeControl(env.MessageID)
+		if len(env.InReplyTo) > 0 {
+			m.InReplyTo = sanitizeControl(strings.Join(env.InReplyTo, " "))
+		}
+		if !env.Date.IsZero() {
+			m.Date = env.Date
+		}
+		m.From = sanitizeControl(addressList(env.From))
+		m.To = sanitizeControl(addressList(env.To))
+		m.CC = sanitizeControl(addressList(env.Cc))
+		m.ReplyTo = sanitizeControl(addressList(env.ReplyTo))
+	}
+	// Fallback: some servers (Dovecot) may omit envelope date for system messages.
+	// INTERNALDATE is always present and never zero.
+	if m.Date.IsZero() && !msg.InternalDate.IsZero() {
+		m.Date = msg.InternalDate
+	}
+
+	for _, section := range msg.BodySection {
+		raw := section.Bytes
+		if len(raw) == 0 {
+			continue
+		}
+		// Distinguish header section from body section
+		if section.Section != nil && section.Section.Specifier == imap.PartSpecifierHeader {
+			m.Headers = sanitizeControl(parseAuthHeaders(raw))
+			m.RawHeaders = sanitizeControl(string(raw[:min(len(raw), maxRawHeaders)]))
+			m.References = sanitizeControl(parseHeaderValue(raw, "References"))
+			continue
+		}
+		applyBody(&m, raw)
+	}
+
+	return m, nil
+}
+
+// applyBody parses a raw RFC 822 body into m's text, HTML, and attachments,
+// sanitizing the text the same way for every caller.
+func applyBody(m *db.Message, raw []byte) {
+	text, html, atts := parseBody(raw)
+	if text != "" {
+		m.BodyText = sanitizeControl(text)
+	}
+	if html != "" {
+		// Raw control bytes are stripped here; HTML entity-encoded escapes
+		// (e.g. &#27;) are neutralized downstream after decoding, before the
+		// text is styled and written to the terminal.
+		m.BodyHTML = sanitizeControl(html)
+	}
+	if len(atts) > 0 {
+		m.HasAttachment = true
+		m.AttachmentData = make([]db.Attachment, len(atts))
+		for i, a := range atts {
+			m.AttachmentData[i] = db.Attachment{
+				Filename:        sanitizeControl(a.Filename),
+				ContentType:     a.ContentType,
+				ContentID:       sanitizeControl(a.ContentID),
+				Disposition:     a.Disposition,
+				ContentLocation: sanitizeControl(a.ContentLocation),
+				Inline:          a.Inline,
+				Data:            a.Data,
+				Size:            int64(len(a.Data)),
+			}
+		}
+	}
+}
+
+// DecodeBody parses a raw MIME entity into a message carrying only the body
+// fields (BodyText, BodyHTML, HasAttachment, AttachmentData), exactly as sync
+// would store them. It is used for content that never reaches the database,
+// such as a decrypted message.
+func DecodeBody(raw []byte) db.Message {
+	var m db.Message
+	applyBody(&m, raw)
+	return m
+}
+
+// sanitizeControl strips C0 control bytes (and DEL) that a terminal would
+// interpret as escape sequences from untrusted message text, preserving only
+// tab and newline. CRLF retains its newline; bare CR is removed. Message content is rendered straight to
+// the user's terminal, so without this an attacker could embed ANSI/OSC
+// sequences in a subject, address, filename, or body and — when the message is
+// viewed — hijack the clipboard (OSC 52), spoof the UI, or move the cursor.
+// C1 controls (U+0080–U+009F) are intentionally left alone: on a UTF-8 terminal
+// they are not control-interpreted, and dropping them would corrupt decoded text.
+func sanitizeControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\t', '\n':
+			return r
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// maxRawHeaders caps the raw header block kept for display; real headers are a few KB.
+const maxRawHeaders = 64 << 10
+
+func parseHeaderValue(raw []byte, name string) string {
+	tr := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw)))
+	hdr, err := tr.ReadMIMEHeader()
+	if err != nil {
+		return ""
+	}
+	return normalizeHeaderWhitespace(hdr.Get(name))
+}
+
+func normalizeHeaderWhitespace(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+}
+
+// parseAuthHeaders extracts SPF, DKIM, DMARC, Return-Path, Received, and
+// List-Unsubscribe headers from raw MIME header text. Returns a compact
+// display string of "Label\nvalue\n" pairs.
+func parseAuthHeaders(raw []byte) string {
+	// Parse headers using net/textproto
+	tr := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw)))
+	hdr, err := tr.ReadMIMEHeader()
+	if err != nil {
+		return ""
+	}
+
+	type authLine struct{ label, value string }
+	var lines []authLine
+
+	// Authentication-Results: compound auth info
+	if v := hdr.Get("Authentication-Results"); v != "" {
+		lines = append(lines, authLine{"Authentication-Results", v})
+	}
+	// Received-SPF: SPF check result
+	if v := hdr.Get("Received-SPF"); v != "" {
+		lines = append(lines, authLine{"Received-SPF", v})
+	}
+	// DKIM-Signature (truncated — just show presence and domain)
+	if v := hdr.Get("DKIM-Signature"); v != "" {
+		// Extract d= tag if present
+		domain := ""
+		for _, part := range strings.Split(v, ";") {
+			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+			if len(kv) == 2 && strings.TrimSpace(kv[0]) == "d" {
+				domain = strings.TrimSpace(kv[1])
+			}
+		}
+		if domain != "" {
+			lines = append(lines, authLine{"DKIM-Signature", "present (d=" + domain + ")"})
+		} else {
+			lines = append(lines, authLine{"DKIM-Signature", "present"})
+		}
+	}
+	// Return-Path
+	if v := hdr.Get("Return-Path"); v != "" {
+		lines = append(lines, authLine{"Return-Path", v})
+	}
+	// Received: most recent hop only
+	if v := hdr.Get("Received"); v != "" {
+		// Show only first Received header (most recent hop)
+		lines = append(lines, authLine{"Received", v})
+	}
+	// X-Spam headers
+	if v := hdr.Get("X-Spam-Status"); v != "" {
+		lines = append(lines, authLine{"X-Spam-Status", v})
+	}
+	if v := hdr.Get("X-Spam-Score"); v != "" {
+		lines = append(lines, authLine{"X-Spam-Score", v})
+	}
+	// List-Unsubscribe: kept so the UI can offer one-key unsubscribe. The
+	// -Post companion marks RFC 8058 one-click support (unsubscribe via a
+	// single background POST instead of a browser round-trip).
+	if v := hdr.Get("List-Unsubscribe"); v != "" {
+		lines = append(lines, authLine{"List-Unsubscribe", v})
+		if p := hdr.Get("List-Unsubscribe-Post"); p != "" {
+			lines = append(lines, authLine{"List-Unsubscribe-Post", p})
+		}
+	}
+
+	if len(lines) == 0 {
+		return ""
+	}
+
+	var out strings.Builder
+	for _, l := range lines {
+		out.WriteString(l.label)
+		out.WriteByte('\n')
+		out.WriteString(l.value)
+		out.WriteByte('\n')
+	}
+	return out.String()
+}
+
+func parseBody(raw []byte) (text, html string, attachments []bodyAttachment) {
+	r, err := mail.CreateReader(bytes.NewReader(raw))
+	if err != nil {
+		return strings.TrimSpace(string(raw)), "", nil
+	}
+
+	for {
+		part, err := r.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		// An unknown charset still yields a usable part whose body reads as raw
+		// bytes, so keep going; only a genuine error aborts the message.
+		if err != nil && !message.IsUnknownCharset(err) {
+			break
+		}
+		ct, params, _ := mime.ParseMediaType(part.Header.Get("Content-Type"))
+		if ct == "" {
+			ct = "text/plain"
+		}
+		data, readErr := io.ReadAll(part.Body)
+		if readErr != nil {
+			continue
+		}
+		contentID := normalizeCID(part.Header.Get("Content-ID"))
+		disposition := contentDisposition(part)
+		addAttachment := func() {
+			attachments = append(attachments, bodyAttachment{
+				Filename:        filenameFromPart(part, params, ct),
+				ContentType:     ct,
+				ContentID:       contentID,
+				Disposition:     disposition,
+				ContentLocation: normalizeContentLocation(part.Header.Get("Content-Location")),
+				Inline:          disposition == "inline" || (contentID != "" && disposition != "attachment"),
+				Data:            data,
+			})
+		}
+		switch {
+		case strings.HasPrefix(ct, "multipart/"):
+		// A text part explicitly marked as an attachment (e.g. a .txt file) is a
+		// file, not the message body.
+		case disposition == "attachment":
+			addAttachment()
+		case ct == "text/plain":
+			if text == "" {
+				text = strings.TrimSpace(string(data))
+			}
+		case ct == "text/html":
+			if html == "" {
+				html = string(data)
+				if text == "" {
+					if stripped := stripHTML(string(data)); meaningfulBodyText(stripped) {
+						text = stripped
+					}
+				}
+			}
+		default:
+			addAttachment()
+		}
+	}
+	return text, html, attachments
+}
+
+// ExtractHTML returns the original decoded HTML body, without the terminal
+// control-character filtering applied to stored messages. MIME attachments
+// are excluded using the same parser as message synchronization.
+func ExtractHTML(raw []byte) string {
+	_, html, _ := parseBody(raw)
+	return html
+}
+
+// normalizeCID strips the RFC 2045 angle brackets and surrounding whitespace
+// from a Content-ID header. HTML addresses these parts as src="cid:<id>",
+// where the id is the bare form, so the stored value must be the bare form too.
+// Returns "" for missing or empty values.
+func normalizeCID(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// A malformed header can name several ids; the first is the part's own.
+	if i := strings.IndexAny(s, " \t\r\n,"); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '<' && s[len(s)-1] == '>' {
+		s = s[1 : len(s)-1]
+	}
+	s = strings.Trim(s, "<>")
+	return strings.TrimSpace(s)
+}
+
+// contentDisposition returns the lower-cased disposition type of a part, with
+// parameters stripped ("inline", "attachment", or "" when absent).
+func contentDisposition(part *mail.Part) string {
+	raw := strings.TrimSpace(part.Header.Get("Content-Disposition"))
+	if raw == "" {
+		return ""
+	}
+	disp, _, err := mime.ParseMediaType(raw)
+	if err != nil {
+		// A malformed parameter list still has a usable leading token.
+		disp = strings.TrimSpace(strings.SplitN(raw, ";", 2)[0])
+	}
+	return strings.ToLower(strings.TrimSpace(disp))
+}
+
+// normalizeContentLocation trims whitespace and quotes from a Content-Location
+// header so it can be matched against an HTML src value.
+func normalizeContentLocation(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, "<>")
+	s = strings.Trim(s, `"`)
+	return strings.TrimSpace(s)
+}
+
+// filenameFromPart extracts a filename from a MIME part's Content-Disposition
+// or Content-Type params, falling back to "attachment.ext" based on content type.
+func filenameFromPart(part *mail.Part, ctParams map[string]string, ct string) string {
+	if fn := part.Header.Get("Content-Disposition"); fn != "" {
+		if _, dispParams, err := mime.ParseMediaType(fn); err == nil {
+			if name := dispParams["filename"]; name != "" {
+				return name
+			}
+		}
+	}
+	if name := ctParams["name"]; name != "" {
+		return name
+	}
+	// Fallback based on Content-Type
+	ext := ".bin"
+	switch {
+	case strings.HasPrefix(ct, "application/pdf"):
+		ext = ".pdf"
+	case strings.HasPrefix(ct, "application/zip"):
+		ext = ".zip"
+	case strings.HasPrefix(ct, "image/"):
+		parts := strings.Split(ct, "/")
+		if len(parts) == 2 {
+			ext = "." + parts[1]
+		}
+	case strings.HasPrefix(ct, "text/"):
+		parts := strings.Split(ct, "/")
+		if len(parts) == 2 {
+			ext = "." + parts[1]
+		}
+	}
+	return "attachment" + ext
+}
+
+func addressList(addrs []imap.Address) string {
+	parts := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if a.Name != "" {
+			parts = append(parts, fmt.Sprintf("%s <%s@%s>", a.Name, a.Mailbox, a.Host))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s@%s", a.Mailbox, a.Host))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func stripHTML(s string) string {
+	var b strings.Builder
+	inTag := false
+	skipContent := false
+	tagBuf := strings.Builder{}
+	for _, r := range s {
+		switch {
+		case r == '<':
+			inTag = true
+			tagBuf.Reset()
+		case r == '>':
+			inTag = false
+			tagName := strings.ToLower(strings.TrimSpace(tagBuf.String()))
+			// Strip leading /
+			tagName = strings.TrimPrefix(tagName, "/")
+			// Get just the tag name (first word)
+			if idx := strings.IndexAny(tagName, " \t\n"); idx >= 0 {
+				tagName = tagName[:idx]
+			}
+			switch tagName {
+			case "script", "style":
+				// Opening tag: skip content until closing tag
+				// Closing tag: resume output
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(tagBuf.String())), "/") {
+					skipContent = false
+				} else {
+					skipContent = true
+				}
+			case "br", "p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6":
+				b.WriteByte('\n')
+			}
+		case inTag:
+			tagBuf.WriteRune(r)
+		case !skipContent && !inTag:
+			b.WriteRune(r)
+		}
+	}
+	lines := strings.Split(b.String(), "\n")
+	var out []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func meaningfulBodyText(s string) bool {
+	text := strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	if text == "" {
+		return false
+	}
+	phrase := strings.ToLower(text)
+	switch phrase {
+	case "view in browser", "open in browser", "view this email in your browser", "unsubscribe", "manage preferences":
+		return false
+	}
+	words := strings.Fields(strings.NewReplacer(
+		"[", " ",
+		"]", " ",
+		":", " ",
+		"|", " ",
+		"-", " ",
+		"_", " ",
+	).Replace(phrase))
+	contentWords := 0
+	for _, word := range words {
+		switch word {
+		case "image", "logo", "icon", "spacer", "pixel", "tracking", "open", "view", "browser":
+			continue
+		default:
+			contentWords++
+		}
+	}
+	return contentWords > 0
+}
+
+// SearchText finds messages in mailboxName whose headers or body contain text, newest first, and
+// fetches at most limit of them. The server does the matching (IMAP TEXT search), so it covers the
+// whole mailbox and not only what the client has already downloaded.
+func (c *Client) SearchText(ctx context.Context, mailboxName string, text string, limit int) ([]db.Message, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	if strings.TrimSpace(text) == "" || limit <= 0 {
+		return nil, nil
+	}
+	defer c.applyDeadline(ctx)()
+
+	if _, err := c.conn.Select(mailboxName, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return nil, fmt.Errorf("select %s: %w", mailboxName, err)
+	}
+	data, err := c.conn.UIDSearch(&imap.SearchCriteria{Text: []string{text}}, nil).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("uid search: %w", err)
+	}
+	uids := data.AllUIDs()
+	if len(uids) == 0 {
+		return nil, nil
+	}
+	sort.Slice(uids, func(i, j int) bool { return uids[i] > uids[j] })
+	if len(uids) > limit {
+		uids = uids[:limit]
+	}
+	return c.fetchNumSet(imap.UIDSetNum(uids...))
+}

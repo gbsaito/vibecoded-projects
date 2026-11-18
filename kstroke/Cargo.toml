@@ -1,0 +1,21 @@
+[package]
+name = "kstroke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kstroke"
+path = "src/main.rs"
+
+[[bin]]
+name = "kstroke-toggle"
+path = "src/bin/kstroke-toggle.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = "0.32"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = "0.9"
+cairo-rs = "0.22"
+libc = "0.2"
+evdev = "0.13.2"

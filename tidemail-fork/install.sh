@@ -1,0 +1,266 @@
+#!/bin/sh
+set -e
+
+REPO="allisonhere/tidemail"
+BINARY="tidemail"
+if [ -z "${INSTALL_DIR:-}" ]; then
+  if [ -z "${HOME:-}" ]; then
+    INSTALL_DIR=""
+  else
+    INSTALL_DIR="${HOME}/.local/bin"
+  fi
+fi
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()    { printf "  ${CYAN}→${NC} %s\n" "$1"; }
+success() { printf "  ${GREEN}✓${NC} %s\n" "$1"; }
+warn()    { printf "  ${DIM}!${NC} %s\n" "$1"; }
+notice()  { printf "  ${YELLOW}${BOLD}! %s${NC}\n" "$1"; }
+error()   { printf "  ${RED}✗${NC} %s\n" "$1" >&2; exit 1; }
+
+quote_path() {
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Delete a path we can't unlink ourselves, escalating with sudo. sudo reads
+# its prompt straight from the terminal, so this works even when the script
+# is piped into sh. Returns non-zero if the file is still there afterward.
+sudo_rm() {
+  command -v sudo >/dev/null 2>&1 || return 1
+  { : </dev/tty; } 2>/dev/null || return 1
+  info "Removing $1 (needs sudo)"
+  sudo rm -f -- "$1" </dev/tty >/dev/tty 2>&1 || true
+  [ ! -e "$1" ]
+}
+
+# Detect OS
+case "$(uname -s)" in
+  Linux*)  OS="linux" ;;
+  Darwin*) OS="darwin" ;;
+  *)       error "Unsupported OS: $(uname -s)" ;;
+esac
+
+# Detect architecture
+case "$(uname -m)" in
+  x86_64|amd64)   ARCH="x86_64" ;;
+  aarch64|arm64)  ARCH="aarch64" ;;
+  *)              error "Unsupported architecture: $(uname -m)" ;;
+esac
+
+ASSET="${BINARY}-${OS}-${ARCH}"
+
+printf "\n  ${BOLD}TideMail Installer${NC}\n"
+printf "  ${DIM}──────────────────────────────${NC}\n"
+info "Platform: ${OS}/${ARCH}"
+
+# ── Download ──────────────────────────────────────────────────────────────
+# Use GitHub's /latest/download/ redirect URL — no API call needed, so no
+# rate limiting and no fragile grep/sed parsing of the releases JSON.
+URL="https://github.com/${REPO}/releases/latest/download/${ASSET}.tar.gz"
+TMP=$(mktemp -d)
+INSTALL_TMP=""
+cleanup() {
+  rm -rf "$TMP"
+  if [ -n "$INSTALL_TMP" ]; then
+    rm -f "$INSTALL_TMP"
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+info "Downloading latest release..."
+if ! curl -fsSL -o "${TMP}/${ASSET}.tar.gz" "$URL"; then
+  rm -rf "$TMP"
+  error "Download failed — no release asset at ${URL}\n         Check that a release exists: https://github.com/${REPO}/releases"
+fi
+
+# Verify we got a real gzip archive (not an HTML error page from a redirect).
+if ! gzip -t "${TMP}/${ASSET}.tar.gz" 2>/dev/null; then
+  rm -rf "$TMP"
+  error "Downloaded file is not a valid archive. The latest release may be missing ${OS}/${ARCH} assets.\n         See: https://github.com/${REPO}/releases"
+fi
+
+# ── Extract ───────────────────────────────────────────────────────────────
+info "Extracting..."
+if ! tar -xzf "${TMP}/${ASSET}.tar.gz" -C "$TMP"; then
+  rm -rf "$TMP"
+  error "Failed to extract ${ASSET}.tar.gz — the archive may be corrupt."
+fi
+
+if [ ! -f "${TMP}/${ASSET}" ]; then
+  contents=$(ls -A "$TMP" 2>/dev/null | tr '\n' ' ')
+  error "Archive does not contain expected binary '${ASSET}'.\n         Found instead: ${contents}"
+fi
+
+chmod +x "${TMP}/${ASSET}"
+
+# Verify the staged binary before touching any existing installation.
+if ! "${TMP}/${ASSET}" --version >/dev/null 2>&1; then
+  error "Downloaded binary failed its version check; existing installation left untouched."
+fi
+
+# ── Install ───────────────────────────────────────────────────────────────
+if [ -z "$INSTALL_DIR" ]; then
+  error "No install directory selected. Set INSTALL_DIR to a writable directory."
+fi
+
+if [ ! -d "$INSTALL_DIR" ]; then
+  info "Creating ${INSTALL_DIR}"
+  if ! mkdir -p "$INSTALL_DIR"; then
+    error "Could not create ${INSTALL_DIR}. Set INSTALL_DIR to a writable directory."
+  fi
+fi
+
+if [ ! -w "$INSTALL_DIR" ]; then
+  error "${INSTALL_DIR} is not writable. Existing installation left untouched.\n         Try: INSTALL_DIR=\"\$HOME/.local/bin\" sh install.sh"
+fi
+
+INSTALL_TMP="${INSTALL_DIR}/.${BINARY}.tmp.$$"
+info "Installing to ${INSTALL_DIR}/${BINARY}"
+if ! install -m 0755 "${TMP}/${ASSET}" "$INSTALL_TMP"; then
+  error "Could not stage binary in ${INSTALL_DIR}. Existing installation left untouched."
+fi
+
+if ! VERSION=$("$INSTALL_TMP" --version 2>/dev/null); then
+  error "Staged binary failed its version check; existing installation left untouched."
+fi
+
+mv -f "$INSTALL_TMP" "${INSTALL_DIR}/${BINARY}"
+INSTALL_TMP=""
+
+# ── Verify ────────────────────────────────────────────────────────────────
+success "Installed ${VERSION} to ${INSTALL_DIR}/${BINARY}"
+notice "Google OAuth is waiting for Google's approval. Use a Google App Password for Gmail."
+
+# ── Man page ──────────────────────────────────────────────────────────────
+# The page is embedded in the binary, so it always matches this version. Best
+# effort: a failure here never fails the install. man-db finds
+# ~/.local/share/man from a ~/.local/bin entry on PATH.
+if [ -n "${XDG_DATA_HOME:-}" ] || [ -n "${HOME:-}" ]; then
+  MAN_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/man/man1"
+  if mkdir -p "$MAN_DIR" 2>/dev/null \
+    && "${INSTALL_DIR}/${BINARY}" man > "${TMP}/${BINARY}.1" 2>/dev/null \
+    && [ -s "${TMP}/${BINARY}.1" ] \
+    && install -m 0644 "${TMP}/${BINARY}.1" "${MAN_DIR}/${BINARY}.1" 2>/dev/null; then
+    success "Installed the manual page: man ${BINARY}"
+  else
+    warn "Could not install the manual page; read it with: ${BINARY} man | man -l -"
+  fi
+fi
+
+# ── Launcher entry (Linux) ────────────────────────────────────────────────
+# Adds TideMail to the app launcher (Omarchy's Walker, GNOME, KDE, rofi...).
+# Best effort: a failure here never fails the install. The entry runs the
+# installed binary by absolute path in the user's default terminal.
+if [ "$OS" = "linux" ] && { [ -n "${XDG_DATA_HOME:-}" ] || [ -n "${HOME:-}" ]; }; then
+  DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}"
+  ICON_URL="https://raw.githubusercontent.com/${REPO}/main/images/tidemail-icon.png"
+  APP_DIR="${DATA_DIR}/applications"
+  ICON_DIR="${DATA_DIR}/icons"
+  ICON_OK=""
+  if mkdir -p "$APP_DIR" "$ICON_DIR" 2>/dev/null \
+    && curl -fsSL -o "${TMP}/${BINARY}.png" "$ICON_URL" 2>/dev/null \
+    && [ -s "${TMP}/${BINARY}.png" ] \
+    && install -m 0644 "${TMP}/${BINARY}.png" "${ICON_DIR}/${BINARY}.png" 2>/dev/null; then
+    ICON_OK=1
+  fi
+  cat > "${TMP}/${BINARY}.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=TideMail
+GenericName=Mail Client
+Comment=Keyboard-first terminal email client
+Exec="${INSTALL_DIR}/${BINARY}"
+Icon=${ICON_OK:+${ICON_DIR}/${BINARY}.png}
+Terminal=true
+Categories=Network;Email;ConsoleOnly;
+Keywords=mail;email;imap;smtp;inbox;terminal;
+DESKTOP
+  if [ -z "$ICON_OK" ]; then
+    sed -i 's/^Icon=$/Icon=mail-unread/' "${TMP}/${BINARY}.desktop"
+  fi
+  if install -m 0644 "${TMP}/${BINARY}.desktop" "${APP_DIR}/${BINARY}.desktop" 2>/dev/null; then
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+    success "Added TideMail to your app launcher"
+  else
+    warn "Could not add the launcher entry; see the App launcher section of docs/guide.md"
+  fi
+fi
+
+# Resolve a directory to its canonical, symlink-free form so alternate
+# spellings of the same directory on PATH ("..", symlinks, trailing slashes)
+# are recognised as our install dir and never deleted as a "stale" copy.
+canon_dir() { ( CDPATH= cd -- "$1" 2>/dev/null && pwd -P ); }
+INSTALL_DIR_CANON=$(canon_dir "$INSTALL_DIR") || INSTALL_DIR_CANON=""
+[ -n "$INSTALL_DIR_CANON" ] || INSTALL_DIR_CANON="$INSTALL_DIR"
+
+# Walk *every* directory on PATH — not just the ones before our install dir.
+# Copies earlier on PATH would shadow the new build; copies later are already
+# shadowed by it but are still removed so `which -a ${BINARY}` stays clean.
+SHADOWED=""
+SHADOWED_CMD=""
+FOUND_INSTALLED=""
+PASSED_INSTALL_DIR=""
+LATER_LEFT=""
+OLD_IFS=$IFS
+IFS=:
+for dir in $PATH; do
+  [ -n "$dir" ] || dir="."
+
+  dir_canon=$(canon_dir "$dir") || dir_canon=""
+  [ -n "$dir_canon" ] || dir_canon="$dir"
+  if [ "$dir_canon" = "$INSTALL_DIR_CANON" ]; then
+    FOUND_INSTALLED=1
+    PASSED_INSTALL_DIR=1
+    continue
+  fi
+
+  candidate="${dir}/${BINARY}"
+  if [ ! -f "$candidate" ] || [ ! -x "$candidate" ]; then
+    continue
+  fi
+
+  if { [ -w "$dir" ] && rm -f "$candidate"; } || sudo_rm "$candidate"; then
+    if [ -n "$PASSED_INSTALL_DIR" ]; then
+      success "Removed shadowed ${candidate} that appeared later on PATH"
+    else
+      success "Removed stale ${candidate} that appeared earlier on PATH"
+    fi
+    continue
+  fi
+
+  # Still there — no sudo, no terminal to prompt on, or the user declined.
+  # A later copy is harmless (ours already wins); just note it. An earlier
+  # copy still shadows us: print the command to finish the job and stop.
+  if [ -n "$PASSED_INSTALL_DIR" ]; then
+    LATER_LEFT="$candidate"
+    continue
+  fi
+  SHADOWED="$candidate"
+  SHADOWED_CMD="sudo rm -f $(quote_path "$candidate")"
+  break
+done
+IFS=$OLD_IFS
+
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) warn "${INSTALL_DIR} is not on PATH; add it before running ${BINARY} by name." ;;
+esac
+if [ -n "$SHADOWED" ]; then
+  warn "${SHADOWED} appears before ${INSTALL_DIR}/${BINARY} on PATH, so it may still run first."
+  warn "Remove it with: ${SHADOWED_CMD}"
+elif [ -n "$LATER_LEFT" ]; then
+  warn "${LATER_LEFT} is still on PATH but shadowed by ${INSTALL_DIR}/${BINARY}; remove it at your leisure."
+elif [ -z "$FOUND_INSTALLED" ]; then
+  warn "${INSTALL_DIR}/${BINARY} is not before other ${BINARY} entries on PATH."
+fi
+printf "\n  Run ${BOLD}tidemail${NC} to get started.\n\n"

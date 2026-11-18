@@ -1,0 +1,20 @@
+[package]
+name = "rauncha"
+version = "0.1.0"
+edition = "2021"
+description = "A fast Wayland launcher menu (fuzzel-like) built on iced + layer-shell"
+
+[dependencies]
+# tiny-skia over wgpu: wlroots compositors honour alpha in wl_shm buffers
+# (like fuzzel), but not always in GPU buffers — this is the translucency fix.
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "web-colors", "thread-pool", "wayland"] }
+iced_layershell = "0.19"
+wayland-client = "0.31"
+# iced_layershell 0.19.1's exdevtools mishandles winit-core beta.4's keymap; hold back.
+winit-core = "=0.31.0-beta.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+strip = true

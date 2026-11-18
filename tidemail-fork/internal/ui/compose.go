@@ -1,0 +1,1738 @@
+package ui
+
+import (
+	"fmt"
+	"mime"
+	"net/mail"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/allisonhere/ripple"
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/allisonhere/tidemail/internal/conversation"
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/allisonhere/tidemail/internal/mailapp"
+	"github.com/allisonhere/tidemail/internal/mailtemplate"
+)
+
+type composeField int
+
+const (
+	composeFieldFrom composeField = iota
+	composeFieldTo
+	composeFieldCC
+	composeFieldBCC
+	composeFieldSubject
+	composeFieldBody
+	composeFieldCount
+)
+
+type attachmentFile struct {
+	Name string
+	Path string
+	Data []byte
+}
+
+// filePicker is a yazi-inspired directory browser for picking attachment files.
+type filePicker struct {
+	entries    []fileEntry
+	cursor     int
+	currentDir string
+	active     bool
+	showHidden bool // when true, dotfiles/dirs are listed
+}
+
+type fileEntry struct {
+	name  string
+	isDir bool
+	size  int64
+}
+
+type composeBackgroundKey struct{ panes, status string }
+
+// composeBackdropCache owns compose's background stages. Other modals still use
+// the uncached reference path. All entries survive Model's value receivers.
+type composeBackdropCache struct {
+	panes           string
+	valid           bool
+	paneStage       renderCache[displayKey, string]
+	statusStage     renderCache[composeStatusState, string]
+	backgroundStage renderCache[composeBackgroundKey, string]
+	composite       modalComposite
+	finish          modalFinish
+	labelsExpire    time.Time
+	clockRevision   uint64
+}
+
+func (c *composeBackdropCache) Invalidate() {
+	c.valid = false
+	c.labelsExpire = time.Time{}
+	c.panes = ""
+	c.paneStage.Invalidate()
+	c.statusStage.Invalidate()
+	c.backgroundStage.Invalidate()
+	c.composite.prepared.Invalidate()
+	c.finish.rows = nil
+}
+
+type ComposeModel struct {
+	toInput      textinput.Model
+	ccInput      textinput.Model
+	bccInput     textinput.Model
+	subjectInput textinput.Model
+	bodyInput    editorArea
+	bodyMouse    composeMouseState
+
+	maximized    bool // Session-only; every new composer starts compact.
+	focusedField composeField
+	inReplyTo    string
+	references   string
+	isForward    bool // distinguishes a forward from a plain compose (no inReplyTo)
+	accountCfg   config.AccountConfig
+
+	accounts     []config.AccountConfig
+	accountIndex int
+
+	// senderPickerOpen exposes the account choice behind the From row without
+	// changing accountIndex until the highlighted option is confirmed.
+	senderPickerOpen bool
+
+	// Offline spell check panel (see spell.go). spellAdded collects words the
+	// user added to their dictionary; the model persists and clears them.
+	spellOpen    bool
+	spellIdx     int
+	spellPick    int
+	spellFixed   int
+	spellSuggest []string
+	spellAdded   []string
+	senderCursor int
+
+	// Template picker (see templates.go).
+	tmplOpen    bool
+	tmplList    []mailtemplate.Template
+	tmplIdx     int
+	tmplEd      editorArea // preview (browse) or editor (tmplEditing) for tmplList[tmplIdx]
+	tmplEditing bool
+	tmplNaming  bool            // prompting for the name of a new template
+	tmplName    textinput.Model // that prompt's input
+
+	// Recipient autocomplete: addressBook holds "Name <addr>" candidates;
+	// suggestions is the dropdown for the segment being typed in the focused
+	// To/CC/BCC field. Esc dismisses the dropdown until the value changes.
+	addressBook      []string
+	suggestions      []string
+	suggestCursor    int
+	suggestDismissed bool
+
+	attachments      []attachmentFile
+	picker           filePicker
+	draftID          int64
+	dirty            bool
+	lastAutosaved    time.Time
+	saveSession      uint64
+	saveRevision     uint64
+	savingRevision   uint64
+	saving           bool
+	closeAfterSave   bool
+	discardAfterSave bool
+	sendAfterSave    *SendQueuedMsg
+
+	// PGP toggles (see pgp_compose.go). pgpAvailable is set by the model from
+	// the installed plugins before each update and render.
+	pgpAvailable bool
+	pgpSign      bool
+	pgpEncrypt   bool
+
+	grammarRequest *grammarRequest
+	busy           bool
+	statusMsg      string
+	routedStatus   string // Ownership of a transient application-footer message.
+	isErr          bool
+}
+
+func NewCompose(acfg config.AccountConfig, accounts []config.AccountConfig, addressBook []string) ComposeModel {
+	c := ComposeModel{accountCfg: acfg, accounts: accounts}
+	if len(accounts) > 1 {
+		// Find the given acfg in the list; default to 0 if not found. Match on
+		// the stable ID first: two accounts can share a host and login (an
+		// alias setup), and the sender that actually sends is accounts[index].
+		matched := false
+		if acfg.ID != "" {
+			for i, a := range accounts {
+				if a.ID == acfg.ID {
+					c.accountIndex = i
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			for i, a := range accounts {
+				if a.IMAPHost == acfg.IMAPHost && a.User == acfg.User {
+					c.accountIndex = i
+					break
+				}
+			}
+		}
+	}
+	c.toInput = newComposeInput("to@example.com")
+	c.ccInput = newComposeInput("")
+	c.ccInput.Placeholder = "cc (optional)"
+	c.bccInput = newComposeInput("")
+	c.bccInput.Placeholder = "bcc (optional)"
+	c.subjectInput = newComposeInput("Subject")
+	c.bodyInput = newEditorArea() // wraps per Settings → Editor → Wrap at word boundaries
+	// The compose footer draws the body's Find/Replace bar, so opening search
+	// never takes rows away from the message text.
+	c.bodyInput.ed.SetSearchBarExternal(true)
+	c.bodyInput.SetPlaceholder("Write your message here...")
+	c.setInitialBody("", "")
+	c.focusedField = c.firstHeaderField()
+	if c.focusedField == composeFieldTo {
+		c.toInput.Focus()
+	}
+	c.SetAddressBook(addressBook)
+	return c
+}
+
+func NewComposeFromDraft(draft db.Draft, accounts []config.AccountConfig, addressBook []string) ComposeModel {
+	acfg := config.AccountConfig{ID: draft.AccountConfigID, Name: draft.AccountName, User: draft.AccountUser}
+	// Resolve by stable ID first: it survives the rename that the (name, user)
+	// pair does not. Trust the stored index only if it still points at the same
+	// account; the config may have been reordered since the draft was saved.
+	// Otherwise fall back to name/user, which is all a pre-ID draft row has.
+	switch {
+	case draft.AccountConfigID != "" && draft.AccountIndex >= 0 && draft.AccountIndex < len(accounts) &&
+		accounts[draft.AccountIndex].ID == draft.AccountConfigID:
+		acfg = accounts[draft.AccountIndex]
+	case draft.AccountConfigID != "":
+		for i, account := range accounts {
+			if account.ID == draft.AccountConfigID {
+				acfg = account
+				draft.AccountIndex = i
+				break
+			}
+		}
+	case draft.AccountIndex >= 0 && draft.AccountIndex < len(accounts) &&
+		accounts[draft.AccountIndex].Name == draft.AccountName &&
+		accounts[draft.AccountIndex].User == draft.AccountUser:
+		acfg = accounts[draft.AccountIndex]
+	default:
+		for i, account := range accounts {
+			if account.Name == draft.AccountName && account.User == draft.AccountUser {
+				acfg = account
+				draft.AccountIndex = i
+				break
+			}
+		}
+	}
+	c := NewCompose(acfg, accounts, addressBook)
+	c.draftID = draft.ID
+	c.accountIndex = draft.AccountIndex
+	c.toInput.SetValue(draft.To)
+	c.ccInput.SetValue(draft.CC)
+	c.bccInput.SetValue(draft.BCC)
+	c.subjectInput.SetValue(draft.Subject)
+	c.bodyInput.SetValue(draft.BodyText)
+	c.inReplyTo = draft.InReplyTo
+	c.references = draft.References
+	c.dirty = false
+	for _, att := range draft.Attachments {
+		c.attachments = append(c.attachments, attachmentFile{Name: att.Filename, Path: att.Path, Data: att.Data})
+	}
+	return c
+}
+
+// SetAddressBook populates autocomplete candidates for the To/CC/BCC fields.
+func (c *ComposeModel) SetAddressBook(addrs []string) {
+	c.addressBook = addrs
+}
+
+// NewReply creates a compose model pre-filled for replying to a message.
+func NewReply(original db.Message, acfg config.AccountConfig, accounts []config.AccountConfig, addressBook []string) ComposeModel {
+	c := newReplyBase(original, acfg, accounts, addressBook)
+	replyTo := original.ReplyTo
+	if replyTo == "" {
+		replyTo = original.From
+	}
+	c.toInput.SetValue(formatAddressField(replyTo))
+	return c
+}
+
+// formatAddressField rewrites a stored address header into a list To/Cc can
+// send. Stored headers are decoded for display, so a display name holding a
+// comma ("Merk, Philipp <p@x>") comes back unquoted and would not parse as one
+// address; formatting each participant quotes such names again. A value no
+// address can be recovered from is left as it was.
+func formatAddressField(raw string) string {
+	parts := conversation.ParseParticipants(raw)
+	if len(parts) == 0 {
+		return raw
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, formatParticipant(p))
+	}
+	return strings.Join(out, ", ")
+}
+
+// NewReplyAll is NewReply plus the original's other recipients on Cc. To is
+// the Reply-To (or From); Cc is the original To and Cc minus every address
+// that belongs to one of the configured accounts and minus anyone already in
+// To. Replying to your own message goes back to its recipients.
+func NewReplyAll(original db.Message, acfg config.AccountConfig, accounts []config.AccountConfig, addressBook []string) ComposeModel {
+	c := newReplyBase(original, acfg, accounts, addressBook)
+
+	var raw []string
+	for _, a := range accounts {
+		raw = append(raw, a.User, a.From)
+	}
+	raw = append(raw, acfg.User, acfg.From)
+	me := conversation.MyAddresses(raw...)
+
+	replyTo := original.ReplyTo
+	if replyTo == "" {
+		replyTo = original.From
+	}
+	seen := map[string]bool{}
+	var to, cc []string
+	add := func(dst *[]string, fields ...string) {
+		for _, p := range conversation.ParseParticipants(fields...) {
+			if me[p.Addr] || seen[p.Addr] {
+				continue
+			}
+			seen[p.Addr] = true
+			*dst = append(*dst, formatParticipant(p))
+		}
+	}
+	add(&to, replyTo)
+	if len(to) == 0 {
+		// The original came from one of my addresses: answer its recipients.
+		add(&to, original.To)
+	}
+	add(&cc, original.To, original.CC)
+
+	c.toInput.SetValue(strings.Join(to, ", "))
+	c.ccInput.SetValue(strings.Join(cc, ", "))
+	return c
+}
+
+func formatParticipant(p conversation.Participant) string {
+	if p.Name == "" {
+		return p.Addr
+	}
+	return (&mail.Address{Name: p.Name, Address: p.Addr}).String()
+}
+
+// newReplyBase fills everything reply and reply all share: subject, threading
+// headers, and the quoted original.
+func newReplyBase(original db.Message, acfg config.AccountConfig, accounts []config.AccountConfig, addressBook []string) ComposeModel {
+	c := NewCompose(acfg, accounts, addressBook)
+	subject := original.Subject
+	if !strings.HasPrefix(strings.ToLower(subject), "re:") {
+		subject = "Re: " + subject
+	}
+	c.subjectInput.SetValue(subject)
+	c.inReplyTo = original.MessageID
+	c.references = strings.TrimSpace(original.References + " " + original.MessageID)
+
+	// Quote the original body text
+	if plain := quotableText(original); plain != "" {
+		c.setInitialBody("", quoteReply(plain, original.From))
+	}
+
+	// Park the body caret above the quote so typing lands there once focus
+	// reaches the body.
+	c.moveBodyCursorToStart()
+	return c
+}
+
+// NewForward creates a compose model for forwarding a message.
+// To field is left empty for the user to fill in. Subject is prefixed with "Fwd:".
+// The original body is quoted with a "Forwarded message" header and original attachments are included.
+func NewForward(original db.Message, acfg config.AccountConfig, accounts []config.AccountConfig, addressBook []string) ComposeModel {
+	c := NewCompose(acfg, accounts, addressBook)
+	c.isForward = true
+
+	subject := original.Subject
+	if !strings.HasPrefix(strings.ToLower(subject), "fwd:") {
+		subject = "Fwd: " + subject
+	}
+	c.subjectInput.SetValue(subject)
+
+	// Quote the original body text with a forward header
+	if plain := quotableText(original); plain != "" {
+		c.setInitialBody("", quoteForward(plain, original))
+		c.moveBodyCursorToStart()
+	}
+
+	// Include original attachments
+	for i, att := range original.AttachmentData {
+		name := att.Filename
+		if name == "" { // embedded images often have no filename
+			name = fmt.Sprintf("attachment-%d", i+1)
+			if exts, _ := mime.ExtensionsByType(att.ContentType); len(exts) > 0 {
+				name += exts[0]
+			}
+		}
+		c.attachments = append(c.attachments, attachmentFile{
+			Name: name,
+			Path: "",
+			Data: att.Data,
+		})
+	}
+
+	return c
+}
+
+// setInitialBody is only for new compositions, never draft reopening. The
+// quote builders already supply their leading blank-line separator.
+func (c *ComposeModel) setInitialBody(prefill, quote string) {
+	body := prefill
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	if !strings.HasSuffix(body, "\n\n") {
+		body += "\n"
+	}
+	body += mailapp.SignatureMarker + "\n"
+	if quote != "" {
+		body = strings.TrimRight(body, "\n") + quote
+	}
+	c.bodyInput.SetValue(body)
+	c.moveBodyCursorToStart()
+}
+
+func (c *ComposeModel) moveBodyCursorToStart() {
+	c.bodyInput.Focus()
+	c.bodyInput, _ = c.bodyInput.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+	c.bodyInput.Blur()
+}
+
+// focusBodyAtStart moves focus into the message body with the caret at the top
+// (above any quoted text) and, in vim mode, Insert mode — so the user sees a
+// cursor and can type immediately. Used for replies, where To/Subject are
+// already filled in.
+func (c *ComposeModel) focusBodyAtStart() {
+	c.toInput.Blur()
+	c.ccInput.Blur()
+	c.bccInput.Blur()
+	c.subjectInput.Blur()
+	c.focusedField = composeFieldBody
+	c.bodyInput.Focus()
+	c.bodyInput, _ = c.bodyInput.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+	c.bodyInput.EnterInsert()
+}
+
+// quotableText is the original message as plain text for quoting. It uses the
+// same HTML rendering the reader shows (so alt text, link targets and spacer
+// markup don't pile up as they do in tag-stripped text), falling back to the
+// stored plain body. Image-only lines and runs of blank lines are dropped.
+func quotableText(m db.Message) string {
+	text := ""
+	if m.BodyHTML != "" {
+		text = ansi.Strip(renderHTMLBodyOpts(m.BodyHTML, 76, Theme{}, true, true))
+	}
+	if strings.TrimSpace(text) == "" {
+		text = ansi.Strip(m.BodyText)
+	}
+	var out []string
+	blank := true // also trims leading blank lines
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimRight(line, " \t")
+		if t := strings.TrimSpace(line); imageOnlyLineRe.MatchString(t) {
+			continue
+		} else if t == "" {
+			if blank {
+				continue
+			}
+			blank = true
+		} else {
+			blank = false
+		}
+		out = append(out, line)
+	}
+	return strings.TrimRight(strings.Join(out, "\n"), "\n")
+}
+
+// imageOnlyLineRe matches a line that is just an image placeholder or a bare
+// image URL, as left by HTML-to-text conversion.
+var imageOnlyLineRe = regexp.MustCompile(`(?i)^(!\[[^\]]*\]\([^)]*\)|\[?(image|img|photo)[^\]]{0,40}\]?|https?://\S+\.(png|jpe?g|gif|webp)(\?\S*)?)$`)
+
+// quoteSafe swaps the reserved signature marker for the visually similar low
+// asterism, so a glyph in quoted mail cannot become a second marker.
+func quoteSafe(body string) string {
+	return strings.ReplaceAll(body, mailapp.SignatureMarker, "\u204e")
+}
+
+// quoteReply formats a quoted reply block from the original message.
+func quoteReply(body, from string) string {
+	var buf strings.Builder
+	buf.WriteString("\n\n")
+	buf.WriteString("On " + from + " wrote:\n")
+	for _, line := range strings.Split(strings.TrimRight(quoteSafe(body), "\n"), "\n") {
+		buf.WriteString("> ")
+		buf.WriteString(line)
+		buf.WriteString("\n")
+	}
+	return buf.String()
+}
+
+// splitReplyAndQuote separates the reply the user wrote from the quoted or
+// forwarded original below it, so grammar check only touches the user's text.
+// quote keeps its leading blank-line separator and attribution line, so
+// reply+quote reconstructs the original body exactly. quote is "" when there is
+// no quoted block.
+func splitReplyAndQuote(body string) (reply, quote string) {
+	lines := strings.Split(body, "\n")
+	boundary := -1
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if (strings.HasPrefix(t, "On ") && strings.HasSuffix(t, "wrote:")) ||
+			strings.Contains(t, "---------- Forwarded message") ||
+			strings.HasPrefix(ln, "> ") {
+			boundary = i
+			break
+		}
+	}
+	if boundary < 0 {
+		return body, ""
+	}
+	idx := 0
+	for i := 0; i < boundary; i++ {
+		idx += len(lines[i]) + 1 // +1 for the '\n' that Split removed
+	}
+	// Pull the blank-line separator into the quote so reply+quote round-trips.
+	for idx > 0 && body[idx-1] == '\n' {
+		idx--
+	}
+	return body[:idx], body[idx:]
+}
+
+// quoteForward formats a forwarded message block with headers.
+func quoteForward(body string, original db.Message) string {
+	var buf strings.Builder
+	buf.WriteString("\n\n")
+	buf.WriteString("---------- Forwarded message ----------\n")
+	buf.WriteString("From: " + original.From + "\n")
+	if original.Date != (time.Time{}) {
+		buf.WriteString("Date: " + original.Date.Format(time.RFC1123Z) + "\n")
+	}
+	buf.WriteString("Subject: " + original.Subject + "\n")
+	if original.To != "" {
+		buf.WriteString("To: " + original.To + "\n")
+	}
+	if original.CC != "" {
+		buf.WriteString("CC: " + original.CC + "\n")
+	}
+	buf.WriteString("\n")
+	for _, line := range strings.Split(strings.TrimRight(quoteSafe(body), "\n"), "\n") {
+		buf.WriteString("> ")
+		buf.WriteString(line)
+		buf.WriteString("\n")
+	}
+	return buf.String()
+}
+
+func newComposeInput(placeholder string) textinput.Model {
+	ti := textinput.New()
+	ti.Cursor.SetMode(cursor.CursorStatic)
+	ti.Placeholder = placeholder
+	ti.CharLimit = 512
+	// Drop the default "> " prompt: the soft rows carry their own label column,
+	// and renderTextInput (used by the soft-panel View) doesn't clear it.
+	ti.Prompt = ""
+	return ti
+}
+
+// softTitle returns the lowercase mode word embedded in the compose overlay's
+// rounded border (mirrors accountManager.softTitle): "reply" for a reply,
+// "forward" for a forward, else "compose".
+func (c ComposeModel) softTitle() string {
+	switch {
+	case c.inReplyTo != "":
+		return "reply"
+	case c.isForward:
+		return "forward"
+	default:
+		return "compose"
+	}
+}
+
+// listDirEntries reads dir into fileEntry values, dirs-first then alphabetical,
+// prefixed with a ".." parent entry unless at the filesystem root. Dotfiles are
+// included only when showHidden is true.
+func listDirEntries(dir string, showHidden bool) ([]fileEntry, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var fe []fileEntry
+	// Add parent-dir entry unless we're at filesystem root
+	if dir != "/" {
+		fe = append(fe, fileEntry{name: "..", isDir: true})
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		// Skip hidden files unless the user has toggled them on
+		if !showHidden && strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		fe = append(fe, fileEntry{
+			name:  e.Name(),
+			isDir: e.IsDir(),
+			size:  info.Size(),
+		})
+	}
+
+	// Sort: dirs first, then files; alphabetically within each group
+	sort.Slice(fe, func(i, j int) bool {
+		if fe[i].isDir != fe[j].isDir {
+			return fe[i].isDir
+		}
+		return strings.ToLower(fe[i].name) < strings.ToLower(fe[j].name)
+	})
+
+	return fe, nil
+}
+
+// openPicker reads the given directory and populates the file picker.
+func (c *ComposeModel) openPicker(dir string) {
+	fe, err := listDirEntries(dir, c.picker.showHidden)
+	if err != nil {
+		c.statusMsg = fmt.Sprintf("pick: %v", err)
+		c.isErr = true
+		c.picker.active = false
+		return
+	}
+
+	c.picker.currentDir = dir
+	c.picker.entries = fe
+	c.picker.cursor = 0
+	c.picker.active = true
+}
+
+// pickerSelected attaches the currently selected file.
+func (c *ComposeModel) pickerAttachSelected() {
+	if c.picker.cursor < 0 || c.picker.cursor >= len(c.picker.entries) {
+		return
+	}
+	entry := c.picker.entries[c.picker.cursor]
+	if entry.isDir {
+		return
+	}
+	path := filepath.Join(c.picker.currentDir, entry.name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.statusMsg = fmt.Sprintf("read: %v", err)
+		c.isErr = true
+		return
+	}
+	c.attachments = append(c.attachments, attachmentFile{
+		Name: entry.name,
+		Path: path,
+		Data: data,
+	})
+	c.statusMsg = fmt.Sprintf("attached: %s (%s)", entry.name, humanSize(len(data)))
+	c.isErr = false
+	c.picker.active = false
+}
+
+func humanSize(b int) string {
+	switch {
+	case b < 1024:
+		return fmt.Sprintf("%d B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	}
+}
+
+// pickerUp moves cursor up.
+func (c *ComposeModel) pickerUp() {
+	if c.picker.cursor > 0 {
+		c.picker.cursor--
+	}
+}
+
+// pickerDown moves cursor down.
+func (c *ComposeModel) pickerDown() {
+	if c.picker.cursor < len(c.picker.entries)-1 {
+		c.picker.cursor++
+	}
+}
+
+// pickerEnter enters a directory or selects a file.
+func (c *ComposeModel) pickerEnter() {
+	entry := c.picker.entries[c.picker.cursor]
+	if entry.isDir && entry.name == ".." {
+		parent := filepath.Dir(c.picker.currentDir)
+		c.openPicker(parent)
+		return
+	}
+	if entry.isDir {
+		sub := filepath.Join(c.picker.currentDir, entry.name)
+		c.openPicker(sub)
+		return
+	}
+	c.pickerAttachSelected()
+}
+
+// pickerUpDir goes to the parent directory.
+func (c *ComposeModel) pickerUpDir() {
+	parent := filepath.Dir(c.picker.currentDir)
+	if parent == c.picker.currentDir {
+		// Can't go higher (filesystem root) — close picker
+		c.picker.active = false
+		return
+	}
+	c.openPicker(parent)
+}
+
+func (c ComposeModel) Update(msg tea.Msg, keys KeyMap) (ComposeModel, tea.Cmd, bool) {
+	if c.busy {
+		return c, nil, false
+	}
+	// Host intents emitted by the vim body editor: :w/:wq/:x send; :q or a second
+	// Esc in Normal mode cancels (routed through the normal exit/draft-confirm).
+	switch msg.(type) {
+	case ripple.SubmitMsg:
+		return c.send()
+	case ripple.CancelMsg:
+		return c, nil, true
+	}
+	km, ok := msg.(tea.KeyMsg)
+	if !ok {
+		var cmd tea.Cmd
+		if c.tmplOpen && c.tmplEditing {
+			c.tmplEd, cmd = c.tmplEd.Update(msg)
+			return c, cmd, false
+		}
+		switch c.focusedField {
+		case composeFieldTo:
+			c.toInput, cmd = c.toInput.Update(msg)
+		case composeFieldCC:
+			c.ccInput, cmd = c.ccInput.Update(msg)
+		case composeFieldBCC:
+			c.bccInput, cmd = c.bccInput.Update(msg)
+		case composeFieldSubject:
+			c.subjectInput, cmd = c.subjectInput.Update(msg)
+		case composeFieldBody:
+			c.bodyInput, cmd = c.bodyInput.Update(msg)
+		}
+		return c, cmd, false
+	}
+
+	// File picker mode
+	if c.picker.active {
+		return c.updatePicker(km, keys)
+	}
+	if c.senderPickerOpen {
+		return c.updateSenderPicker(km, keys)
+	}
+	if c.spellOpen {
+		return c.updateSpell(km, keys)
+	}
+	if c.tmplOpen {
+		return c.updateTemplates(km, keys)
+	}
+
+	// While the editor's search bar owns input, Esc and Tab belong to it rather
+	// than the compose form. Explicit send shortcuts remain available.
+	if c.focusedField == composeFieldBody && c.bodyInput.ed.SearchActive() && km.String() != "ctrl+s" && km.String() != "ctrl+d" {
+		var cmd tea.Cmd
+		c.bodyInput, cmd = c.bodyInput.Update(msg)
+		return c, cmd, false
+	}
+
+	// Normal compose mode
+	switch {
+	case keyMatches(km, keys.Cancel):
+		// With the autocomplete dropdown open, Esc dismisses it (until the
+		// field value changes again) rather than closing compose.
+		if c.suggestionsVisible() {
+			c.suggestDismissed = true
+			return c, nil, false
+		}
+		// In vim mode the body editor owns Esc (Insert→Normal; a second Esc in
+		// Normal or :q emits ripple.CancelMsg, handled above). Route it to the
+		// editor instead of closing compose outright.
+		if c.focusedField == composeFieldBody && c.bodyInput.vimMode() {
+			var cmd tea.Cmd
+			c.bodyInput, cmd = c.bodyInput.Update(msg)
+			return c, cmd, false
+		}
+		return c, nil, true
+
+	case km.String() == "ctrl+s" || km.String() == "ctrl+d":
+		return c.send()
+
+	case keyMatches(km, keys.SpellCheck):
+		c.openSpell()
+		return c, nil, false
+
+	case keyMatches(km, keys.Templates):
+		c.openTemplates()
+		return c, nil, false
+
+	case keyMatches(km, keys.PGPSign):
+		return c.togglePGP("sign"), nil, false
+
+	case keyMatches(km, keys.PGPEncrypt):
+		return c.togglePGP("encrypt"), nil, false
+
+	case keyMatches(km, keys.Tab):
+		// With the dropdown open, Tab accepts the selected suggestion, then
+		// advances to the next field either way.
+		if c.suggestionsVisible() {
+			c.acceptSuggestion()
+		}
+		c.advanceField(1)
+		return c, nil, false
+
+	case km.String() == "shift+tab":
+		c.advanceField(-1)
+		return c, nil, false
+
+	case c.focusedField == composeFieldFrom && (keyMatches(km, keys.Confirm) || keyMatches(km, keys.Space)):
+		c.openSenderPicker()
+		return c, nil, false
+
+	// Dropdown navigation. Only the raw arrow/emacs keys — keys.Up/Down also
+	// bind j/k, which must keep inserting into the address field.
+	case c.suggestionsVisible() && (km.String() == "down" || km.String() == "ctrl+n"):
+		c.suggestCursor = (c.suggestCursor + 1) % len(c.suggestions)
+		return c, nil, false
+
+	case c.suggestionsVisible() && (km.String() == "up" || km.String() == "ctrl+p"):
+		c.suggestCursor = (c.suggestCursor - 1 + len(c.suggestions)) % len(c.suggestions)
+		return c, nil, false
+
+	// Up/Down walk the header fields. Raw arrow keys only (keys.Up/Down also bind
+	// j/k, which must keep inserting). The body keeps them for cursor movement,
+	// and Up stops at the first header rather than wrapping down into the body.
+	case c.focusedField != composeFieldBody && km.String() == "down":
+		c.advanceField(1)
+		return c, nil, false
+
+	case c.focusedField != composeFieldBody && km.String() == "up":
+		if c.focusedField != c.firstHeaderField() {
+			c.advanceField(-1)
+		}
+		return c, nil, false
+
+	case keyMatches(km, keys.AttachFile):
+		// Start picker in user's home directory
+		home, err := os.UserHomeDir()
+		startDir := home
+		if err != nil {
+			startDir = "/"
+		}
+		c.openPicker(startDir)
+		return c, nil, false
+
+	case keyMatches(km, keys.RemoveAttach):
+		if len(c.attachments) > 0 {
+			removed := c.attachments[len(c.attachments)-1].Name
+			c.attachments = c.attachments[:len(c.attachments)-1]
+			c.statusMsg = fmt.Sprintf("removed: %s", removed)
+			c.isErr = false
+		}
+		return c, nil, false
+
+	case keyMatches(km, keys.CycleSender):
+		if len(c.accounts) > 1 {
+			c.accountIndex = (c.accountIndex + 1) % len(c.accounts)
+			c.statusMsg = fmt.Sprintf("sender: %s", c.selectedAccountLabel())
+			c.isErr = false
+		}
+		return c, nil, false
+
+	default:
+		var cmd tea.Cmd
+		switch c.focusedField {
+		case composeFieldTo:
+			if keyMatches(km, keys.Confirm) {
+				// Enter picks the highlighted suggestion and stays in the
+				// field so another recipient can follow after a comma.
+				if c.suggestionsVisible() {
+					c.acceptSuggestion()
+					return c, nil, false
+				}
+				c.advanceField(1)
+				return c, nil, false
+			}
+			before := c.toInput.Value()
+			c.toInput, cmd = c.toInput.Update(msg)
+			c.refreshSuggestions(c.toInput.Value(), before)
+		case composeFieldCC:
+			if keyMatches(km, keys.Confirm) {
+				if c.suggestionsVisible() {
+					c.acceptSuggestion()
+					return c, nil, false
+				}
+				c.advanceField(1)
+				return c, nil, false
+			}
+			before := c.ccInput.Value()
+			c.ccInput, cmd = c.ccInput.Update(msg)
+			c.refreshSuggestions(c.ccInput.Value(), before)
+		case composeFieldBCC:
+			if keyMatches(km, keys.Confirm) {
+				if c.suggestionsVisible() {
+					c.acceptSuggestion()
+					return c, nil, false
+				}
+				c.advanceField(1)
+				return c, nil, false
+			}
+			before := c.bccInput.Value()
+			c.bccInput, cmd = c.bccInput.Update(msg)
+			c.refreshSuggestions(c.bccInput.Value(), before)
+		case composeFieldSubject:
+			if keyMatches(km, keys.Confirm) {
+				c.advanceField(1)
+				return c, nil, false
+			}
+			c.subjectInput, cmd = c.subjectInput.Update(msg)
+		case composeFieldBody:
+			// Copy/cut/paste are handled inside the editor, which emits the
+			// clipboard command through Update.
+			c.bodyInput, cmd = c.bodyInput.Update(msg)
+		}
+		return c, cmd, false
+	}
+}
+
+// maxRecipientSuggestions caps the autocomplete dropdown height.
+const maxRecipientSuggestions = 5
+
+// suggestionsVisible reports whether the autocomplete dropdown should render
+// and own its navigation keys.
+func (c ComposeModel) suggestionsVisible() bool {
+	if c.suggestDismissed || len(c.suggestions) == 0 {
+		return false
+	}
+	switch c.focusedField {
+	case composeFieldTo, composeFieldCC, composeFieldBCC:
+		return true
+	default:
+		return false
+	}
+}
+
+// splitActiveSegment splits a comma-separated recipient list into the part
+// already committed (through the last comma and any following spaces) and the
+// segment still being typed.
+func splitActiveSegment(value string) (prefix, seg string) {
+	i := strings.LastIndex(value, ",") + 1
+	prefix, seg = value[:i], value[i:]
+	trimmed := strings.TrimLeft(seg, " ")
+	prefix += seg[:len(seg)-len(trimmed)]
+	return prefix, trimmed
+}
+
+// matchAddresses returns address-book entries whose "Name <addr>" form
+// contains seg (case-insensitive), skipping an already-complete match.
+func matchAddresses(book []string, seg string) []string {
+	if seg == "" {
+		return nil
+	}
+	needle := strings.ToLower(seg)
+	var out []string
+	for _, cand := range book {
+		if strings.EqualFold(strings.TrimSpace(cand), seg) {
+			continue
+		}
+		if strings.Contains(strings.ToLower(cand), needle) {
+			out = append(out, cand)
+			if len(out) == maxRecipientSuggestions {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// refreshSuggestions recomputes the dropdown after a keystroke moved the
+// focused recipient field from oldValue to newValue. Unchanged values (cursor
+// movement) leave the dropdown — and an Esc dismissal — as they were.
+func (c *ComposeModel) refreshSuggestions(newValue, oldValue string) {
+	if newValue == oldValue {
+		return
+	}
+	c.suggestDismissed = false
+	c.suggestCursor = 0
+	_, seg := splitActiveSegment(newValue)
+	c.suggestions = matchAddresses(c.addressBook, seg)
+}
+
+// acceptSuggestion replaces the segment being typed with the highlighted
+// candidate, leaving earlier comma-separated recipients intact.
+func (c *ComposeModel) acceptSuggestion() {
+	input := c.focusedRecipientInput()
+	if input == nil || c.suggestCursor >= len(c.suggestions) {
+		return
+	}
+	prefix, _ := splitActiveSegment(input.Value())
+	input.SetValue(prefix + c.suggestions[c.suggestCursor])
+	input.CursorEnd()
+	c.suggestions = nil
+	c.suggestCursor = 0
+	c.dirty = true
+}
+
+func (c *ComposeModel) focusedRecipientInput() *textinput.Model {
+	switch c.focusedField {
+	case composeFieldTo:
+		return &c.toInput
+	case composeFieldCC:
+		return &c.ccInput
+	case composeFieldBCC:
+		return &c.bccInput
+	default:
+		return nil
+	}
+}
+
+// updatePicker handles key events in the file picker overlay.
+func (c ComposeModel) updatePicker(km tea.KeyMsg, keys KeyMap) (ComposeModel, tea.Cmd, bool) {
+	switch {
+	case keyMatches(km, keys.Cancel):
+		c.picker.active = false
+		return c, nil, false
+
+	case keyMatches(km, keys.Up):
+		c.pickerUp()
+		return c, nil, false
+
+	case keyMatches(km, keys.Down):
+		c.pickerDown()
+		return c, nil, false
+
+	case keyMatches(km, keys.Confirm):
+		c.pickerEnter()
+		return c, nil, false
+
+	case keyMatches(km, keys.Left), keyMatches(km, keys.Back):
+		c.pickerUpDir()
+		return c, nil, false
+
+	case km.String() == ".":
+		c.picker.showHidden = !c.picker.showHidden
+		c.openPicker(c.picker.currentDir)
+		return c, nil, false
+
+	default:
+		// Single-key quick-jump: press a letter to jump to first entry starting with it
+		if len(km.String()) == 1 && km.String() >= "a" && km.String() <= "z" || km.String() >= "A" && km.String() <= "Z" {
+			lower := strings.ToLower(km.String())
+			for i, e := range c.picker.entries {
+				if strings.HasPrefix(strings.ToLower(e.name), lower) {
+					c.picker.cursor = i
+					return c, nil, false
+				}
+			}
+		}
+		return c, nil, false
+	}
+}
+
+// firstHeaderField is the topmost field Tab can reach: From only exists in the
+// cycle when there is more than one account to choose from.
+func (c ComposeModel) firstHeaderField() composeField {
+	if len(c.accounts) > 1 {
+		return composeFieldFrom
+	}
+	return composeFieldTo
+}
+
+func (c *ComposeModel) advanceField(delta int) {
+	c.senderPickerOpen = false
+	c.suggestions = nil
+	c.suggestCursor = 0
+	c.suggestDismissed = false
+	next := int(c.focusedField)
+	for {
+		next = (next + delta + int(composeFieldCount)) % int(composeFieldCount)
+		if composeField(next) != composeFieldFrom || len(c.accounts) > 1 {
+			break
+		}
+	}
+	c.focusedField = composeField(next)
+	c.toInput.Blur()
+	c.ccInput.Blur()
+	c.bccInput.Blur()
+	c.subjectInput.Blur()
+	c.bodyInput.Blur()
+	switch c.focusedField {
+	case composeFieldTo:
+		c.toInput.Focus()
+	case composeFieldCC:
+		c.ccInput.Focus()
+	case composeFieldBCC:
+		c.bccInput.Focus()
+	case composeFieldSubject:
+		c.subjectInput.Focus()
+	case composeFieldBody:
+		c.bodyInput.Focus()
+		// In vim mode, land in Insert so the user types right away; Esc then
+		// goes Insert→Normal, and a second Esc closes (the double-Esc design).
+		// Without this the body sits in Normal and the first Esc closes outright.
+		c.bodyInput.EnterInsert()
+	}
+}
+
+const maxSenderOptions = 5
+
+func (c *ComposeModel) openSenderPicker() {
+	if len(c.accounts) < 2 {
+		return
+	}
+	c.senderCursor = clamp(c.accountIndex, 0, len(c.accounts)-1)
+	c.senderPickerOpen = true
+}
+
+func (c ComposeModel) updateSenderPicker(km tea.KeyMsg, keys KeyMap) (ComposeModel, tea.Cmd, bool) {
+	switch {
+	case keyMatches(km, keys.Cancel):
+		c.senderPickerOpen = false
+	case keyMatches(km, keys.Up):
+		c.senderCursor = (c.senderCursor - 1 + len(c.accounts)) % len(c.accounts)
+	case keyMatches(km, keys.Down):
+		c.senderCursor = (c.senderCursor + 1) % len(c.accounts)
+	case keyMatches(km, keys.Confirm):
+		c.accountIndex = clamp(c.senderCursor, 0, len(c.accounts)-1)
+		c.senderPickerOpen = false
+		c.statusMsg = fmt.Sprintf("sender: %s", c.selectedAccountLabel())
+		c.isErr = false
+	}
+	return c, nil, false
+}
+
+func (c ComposeModel) visibleSenderRange() (start, end int) {
+	count := min(maxSenderOptions, len(c.accounts))
+	if count == 0 {
+		return 0, 0
+	}
+	start = clamp(c.senderCursor-count/2, 0, len(c.accounts)-count)
+	return start, start + count
+}
+
+func (c ComposeModel) selectedAccount() config.AccountConfig {
+	if c.accountIndex >= 0 && c.accountIndex < len(c.accounts) {
+		return c.accounts[c.accountIndex]
+	}
+	return c.accountCfg
+}
+
+// A generated marker alone is not an authored message or template.
+func hasComposeBodyContent(body string) bool {
+	text := strings.TrimSpace(body)
+	return text != "" && text != mailapp.SignatureMarker
+}
+
+func (c ComposeModel) hasContent() bool {
+	return strings.TrimSpace(c.toInput.Value()) != "" ||
+		strings.TrimSpace(c.ccInput.Value()) != "" ||
+		strings.TrimSpace(c.subjectInput.Value()) != "" ||
+		hasComposeBodyContent(c.bodyInput.Value()) ||
+		len(c.attachments) > 0
+}
+
+func (c ComposeModel) toDraftRecord() db.Draft {
+	account := c.selectedAccount()
+	draft := db.Draft{
+		ID:              c.draftID,
+		AccountConfigID: account.ID,
+		AccountName:     account.Name,
+		AccountUser:     account.User,
+		AccountIndex:    c.accountIndex,
+		To:              strings.TrimSpace(c.toInput.Value()),
+		CC:              strings.TrimSpace(c.ccInput.Value()),
+		BCC:             strings.TrimSpace(c.bccInput.Value()),
+		Subject:         c.subjectInput.Value(),
+		BodyText:        c.bodyInput.Value(),
+		InReplyTo:       c.inReplyTo,
+		References:      c.references,
+		Dirty:           true,
+	}
+	for i, att := range c.attachments {
+		draft.Attachments = append(draft.Attachments, db.DraftAttachment{
+			Filename: att.Name,
+			Path:     att.Path,
+			Data:     att.Data,
+			Size:     int64(len(att.Data)),
+			Position: i,
+		})
+	}
+	return draft
+}
+
+func (c ComposeModel) send() (ComposeModel, tea.Cmd, bool) {
+	to := strings.TrimSpace(c.toInput.Value())
+	if to == "" {
+		c.statusMsg = "TO is required"
+		c.isErr = true
+		return c, nil, false
+	}
+	// Validate email addresses
+	if err := validateAddressList(to); err != "" {
+		c.statusMsg = err
+		c.isErr = true
+		return c, nil, false
+	}
+	cc := strings.TrimSpace(c.ccInput.Value())
+	if cc != "" {
+		if err := validateAddressList(cc); err != "" {
+			c.statusMsg = err
+			c.isErr = true
+			return c, nil, false
+		}
+	}
+	bcc := strings.TrimSpace(c.bccInput.Value())
+	if bcc != "" {
+		if err := validateAddressList(bcc); err != "" {
+			c.statusMsg = err
+			c.isErr = true
+			return c, nil, false
+		}
+	}
+	acfg := c.selectedAccount()
+
+	msg, err := mailapp.PrepareCompose(acfg, c.toDraftRecord())
+	if err != nil {
+		c.statusMsg = err.Error()
+		c.isErr = true
+		return c, nil, false
+	}
+	if (c.pgpSign || c.pgpEncrypt) && !c.pgpAvailable {
+		c.statusMsg = "PGP is on but no PGP plugin is installed; turn it off or install one"
+		c.isErr = true
+		return c, nil, false
+	}
+	c.busy = true
+	c.statusMsg = "Sending..."
+	c.isErr = false
+	sign, encrypt := c.pgpSign, c.pgpEncrypt
+	// The model owns dispatch: it either sends immediately or holds the
+	// message for the send-delay undo window (see handleSendQueued).
+	return c, func() tea.Msg { return SendQueuedMsg{Account: acfg, Msg: msg, Sign: sign, Encrypt: encrypt} }, false
+}
+
+func parseAddressList(s string) []string {
+	addresses, err := mail.ParseAddressList(s)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		out = append(out, address.Address)
+	}
+	return out
+}
+
+func validateAddressList(s string) string {
+	if _, err := mail.ParseAddressList(s); err != nil {
+		return fmt.Sprintf("invalid email: %s", err)
+	}
+	return ""
+}
+
+func fileIcon(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".pdf":
+		return "📄 "
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg":
+		return "🖼 "
+	case ".zip", ".tar", ".gz", ".7z", ".rar", ".bz2", ".xz":
+		return "📦 "
+	case ".doc", ".docx":
+		return "📝 "
+	case ".xls", ".xlsx", ".csv":
+		return "📊 "
+	case ".mp3", ".wav", ".flac", ".ogg", ".m4a":
+		return "🎵 "
+	case ".mp4", ".mov", ".avi", ".mkv", ".webm":
+		return "🎬 "
+	case ".go", ".py", ".js", ".ts", ".rs", ".java", ".c", ".cpp", ".h", ".sh":
+		return "💻 "
+	default:
+		return "📎 "
+	}
+}
+
+// renderSuggestionRows renders the autocomplete dropdown rows shown under the
+// focused recipient field: a rail marks the highlighted candidate, indented to
+// line up with the field's control column.
+func (c ComposeModel) renderSuggestionRows(width, labelW int, chrome managerChrome) []string {
+	rows := make([]string, 0, len(c.suggestions))
+	rowW := max(1, width-2) // minus the 2-cell rail
+	indent := strings.Repeat(" ", max(0, labelW))
+	for i, s := range c.suggestions {
+		selected := i == c.suggestCursor
+		bg := chrome.baseBg
+		fg := chrome.muted
+		if selected {
+			bg = chrome.fieldBg
+			fg = chrome.text
+		}
+		label := lipgloss.NewStyle().Background(bg).Foreground(fg).
+			Render(indent + " " + truncate(s, max(1, rowW-labelW-2)))
+		rows = append(rows, softRail(chrome, selected, bg)+padStyled(label, rowW, bg))
+	}
+	return rows
+}
+
+func (c ComposeModel) selectedAccountLabel() string {
+	acfg := c.selectedAccount()
+	s := acfg.From
+	if s == "" {
+		s = acfg.User
+	}
+	if s == "" {
+		s = acfg.Name
+	}
+	return s
+}
+
+func senderOptionLabel(acfg config.AccountConfig) string {
+	identity := acfg.From
+	if identity == "" {
+		identity = acfg.User
+	}
+	if acfg.Name == "" || acfg.Name == identity {
+		return identity
+	}
+	if identity == "" {
+		return acfg.Name
+	}
+	return acfg.Name + " — " + identity
+}
+
+func (c ComposeModel) renderSenderRows(width, labelW int, chrome managerChrome) []string {
+	start, end := c.visibleSenderRange()
+	rows := make([]string, 0, end-start)
+	rowW := max(1, width-2)
+	indent := strings.Repeat(" ", max(0, labelW))
+	for i := start; i < end; i++ {
+		selected := i == c.senderCursor
+		bg := chrome.baseBg
+		fg := chrome.muted
+		if selected {
+			bg = chrome.fieldBg
+			fg = chrome.text
+		}
+		label := lipgloss.NewStyle().Background(bg).Foreground(fg).
+			Render(indent + "  " + truncate(senderOptionLabel(c.accounts[i]), max(1, rowW-labelW-4)))
+		rows = append(rows, softRail(chrome, selected, bg)+padStyled(label, rowW, bg))
+	}
+	return rows
+}
+
+// composeOverlayWidth is the width of the compose overlay box for a given
+// terminal width. renderOverlay (overlays.go) and the body-editor sizing must
+// agree on this value.
+func composeOverlayWidth(termWidth int) int {
+	return max(1, min(termWidth-4, 110))
+}
+
+// composeOverlayHeight shares the compose height budget between render and input.
+func composeOverlayHeight(termHeight int) int {
+	return max(1, min(termHeight-4, 48))
+}
+
+// overlayDimensions shares content geometry between rendering and stored inputs.
+// The maximized panel fills the terminal, including its two border rows.
+func (c ComposeModel) overlayDimensions(termWidth, termHeight int) (int, int) {
+	if c.maximized {
+		return max(1, termWidth-2), max(1, termHeight-2)
+	}
+	return composeOverlayWidth(termWidth), composeOverlayHeight(termHeight)
+}
+
+// composeFieldWidths returns the width of a To/CC/BCC/Subject row's control and
+// of the text inside it, for an overlay width.
+func composeFieldWidths(width int) (rowFieldW, textW int) {
+	labelW := min(10, formLabelWidth(width))
+	rowFieldW = max(1, width-2-labelW)
+	return rowFieldW, max(1, rowFieldW-4)
+}
+
+// SetWidth tells the single-line fields how wide they render. The bubbles
+// input only scrolls its text window (keeping the cursor visible) while
+// handling edits, using its own Width, so the stored inputs need it up front;
+// the render-time copy alone cannot scroll.
+func (c *ComposeModel) SetWidth(width int) {
+	_, textW := composeFieldWidths(width)
+	textW = max(1, textW-1) // the cursor cell at the end of the text
+	for _, in := range []*textinput.Model{&c.toInput, &c.ccInput, &c.bccInput, &c.subjectInput} {
+		if in.Width == textW {
+			continue
+		}
+		in.Width = textW
+		in.SetCursor(in.Position())
+	}
+}
+
+// composeBodyWidth is the content width of the body editor inside the compose
+// overlay. handleCompose uses it to keep the stored editor wrapping identically
+// to the rendered copy, so vertical navigation matches what the user sees.
+func composeBodyWidth(termWidth int) int {
+	return max(1, composeOverlayWidth(termWidth)-4)
+}
+
+// composeLayout builds the soft-panel hint footer and computes the body editor's
+// content width and visible height for the given overlay content size. It is the
+// single source of the height budget: View renders with these values, and
+// handleCompose sizes the *stored* editor to the same bodyW/bodyH so vertical
+// navigation and the rendered viewport stay in lockstep. (View sizes only a
+// copy — it is a value receiver — so the stored editor must be synced separately,
+// and if it isn't, it keeps height 1 and the caret sticks to the top of the body.)
+//
+// The soft look has no header bar: the mode/title lives in the overlay border and
+// the sender lives in the From row. fixedLines below must match, one-for-one, the
+// non-body lines View appends — if they drift, clampView clips the footer or the
+// caret desyncs from the viewport.
+func (c ComposeModel) composeLayout(width, height int, styles Styles) (hints string, bodyW, bodyH int, senderSpacer bool) {
+	chrome := newManagerChrome(width, styles.Theme, styles.PlainUI)
+	hints = c.composeHints(width, chrome)
+
+	fixedLines := 0
+	fixedLines += 4 // From / To / CC / BCC
+	fixedLines++    // gap between recipients and Subject
+	fixedLines++    // Subject
+	fixedLines++    // spacer before body
+	if c.suggestionsVisible() {
+		fixedLines += len(c.suggestions) // autocomplete dropdown rows
+	}
+	if c.senderPickerOpen {
+		start, end := c.visibleSenderRange()
+		fixedLines += end - start
+	}
+	if len(c.attachments) > 0 {
+		fixedLines += 3 + len(c.attachments) // gap + group title + blank + one row per file
+	}
+	// The footer is a fixed three rows (status messages ride in its first row),
+	// so focus changes, Find, and transient messages never resize the body.
+	fixedLines += lipgloss.Height(hints)
+
+	// The blank row below the From block is cosmetic, so it is the first thing
+	// dropped when the overlay is short — the send/attach hints matter more than
+	// the breathing room. It is only drawn when a body line survives paying for
+	// it; View must honour senderSpacer or the two line counts drift and
+	// clampView clips the footer.
+	senderSpacer = height-fixedLines >= 2
+	if senderSpacer {
+		fixedLines++
+	}
+
+	bodyH = max(1, height-fixedLines)
+	// Body editor content width = overlay width minus internal padding.
+	bodyW = max(1, width-4)
+	return hints, bodyW, bodyH, senderSpacer
+}
+
+func (c ComposeModel) View(width, height int, styles Styles) string {
+	view, _ := c.viewWithBodyTop(width, height, styles)
+	return view
+}
+
+// viewWithBodyTop renders the compose view and also reports the row, within the
+// returned view, where the message body editor starts (-1 when the body is not
+// on screen, such as the attachment picker). Mouse handling uses it so click
+// positions follow the real layout instead of a hand-kept copy of it.
+func (c ComposeModel) viewWithBodyTop(width, height int, styles Styles) (string, int) {
+	// c is a copy: size its inputs so freshly opened (prefilled) fields scroll
+	// to their cursor without waiting for a keypress.
+	c.SetWidth(width)
+	chrome := newManagerChrome(width, styles.Theme, styles.PlainUI)
+
+	// File picker view
+	if c.picker.active {
+		return c.pickerView(width, height, chrome), -1
+	}
+
+	hints, bodyInputW, bodyH, senderSpacer := c.composeLayout(width, height, styles)
+
+	// Soft-panel rows share a short label column; the input text is inset 2 cells
+	// to match the settings / account-manager forms.
+	labelW := min(10, formLabelWidth(width))
+
+	blankRow := func(bg lipgloss.Color) string {
+		return lipgloss.NewStyle().Background(bg).Width(width).Render("")
+	}
+
+	// softInput renders one To/CC/BCC/Subject field as a soft row: an accent rail
+	// marks focus and the bubbles textinput sits inset in the control column.
+	softInput := func(label string, ti textinput.Model, field composeField) string {
+		focused := c.focusedField == field
+		rowFieldW, textW := composeFieldWidths(width)
+		control := renderInsetControl(renderTextInput(ti, textW, focused, false, chrome), rowFieldW, 2, chrome)
+		return renderSoftRow(label, focused, control, width, labelW, chrome)
+	}
+
+	c.bodyInput.SetSize(bodyInputW, bodyH)
+
+	// The body is a form field like the rest: surfaceBg at rest, fieldBg when
+	// focused, matching renderTextInput. Its 2-cell frame stays baseBg so the
+	// field block is inset exactly like the To/CC/BCC/Subject controls.
+	bodyBg := chrome.surfaceBg
+	if c.focusedField == composeFieldBody {
+		bodyBg = chrome.fieldBg
+	}
+
+	// Style the owned editor for this render: accent block cursor, a muted
+	// selection highlight, and a dim placeholder. The per-line background
+	// wrapping below covers the remainder of each line.
+	c.bodyInput.CursorStyle = lipgloss.NewStyle().Background(chrome.cursor).Foreground(bodyBg)
+	// Other matches get a soft tint rather than an underline, which spell
+	// check already uses for typos; the current match is solid accent.
+	c.bodyInput.SearchMatchStyle = lipgloss.NewStyle().Background(mixColors(bodyBg, chrome.accent, 0.3)).Foreground(chrome.text)
+	c.bodyInput.SearchCurrentStyle = lipgloss.NewStyle().Background(chrome.accent).Foreground(bodyBg)
+	c.bodyInput.SearchControlStyle = lipgloss.NewStyle().Background(chrome.cursor).Foreground(bodyBg)
+	c.bodyInput.SearchErrorStyle = lipgloss.NewStyle().Background(bodyBg).Foreground(chrome.accent).Bold(true)
+	c.bodyInput.SelectedStyle = lipgloss.NewStyle().Background(chrome.muted).Foreground(chrome.text)
+	c.bodyInput.PlaceholderStyle = lipgloss.NewStyle().Background(bodyBg).Foreground(chrome.muted)
+
+	// Gate the cursor to the focused field — a blurred body renders no cursor,
+	// so inactive compose fields leave no cursor artifact. This is the render
+	// copy; advanceField keeps the model's focus state in sync.
+	if c.focusedField == composeFieldBody {
+		c.bodyInput.Focus()
+	} else {
+		c.bodyInput.Blur()
+	}
+
+	raw := c.bodyInput.View()
+	if c.tmplOpen && len(c.tmplList) > 0 {
+		raw = c.templatePreview()
+	}
+	// The editor is authoritative on wrapping — it has already fit each line to
+	// bodyInputW. We must only FRAME that output, never re-wrap it: letting
+	// lipgloss.Width() reflow the lines re-measures grapheme widths with a
+	// different model (x/ansi vs the editor's go-runewidth), and for emoji/flags
+	// the two disagree, so a line the editor considered full overflows and the
+	// wrapped remainder escapes to the app's left edge. Instead, clip and pad
+	// each line to the content width using the terminal's own width measure, so
+	// nothing can overflow, then frame with bodyBg padding.
+	bgWrap := lipgloss.NewStyle().Background(bodyBg).Foreground(chrome.text)
+	pad := lipgloss.NewStyle().Background(chrome.baseBg).Render("  ")
+	var lines []string
+	for _, line := range strings.Split(raw, "\n") {
+		// fillLineBg re-applies bodyBg after every reset so the cursor/selection
+		// styles (whose trailing \033[0m clears the background) don't punch holes.
+		lines = append(lines, pad+fillLineBg(line, bodyInputW, bgWrap)+pad)
+	}
+	bodyRow := strings.Join(lines, "\n")
+
+	// ── Build rows ── (line count must match composeLayout's fixedLines)
+	// The field labels name every row, so recipients and the message need no
+	// group titles; one blank row between BCC and Subject separates them.
+	var rows []string
+
+	fromFocused := c.focusedField == composeFieldFrom
+	fromW := max(1, width-2-labelW)
+	fromLabel := senderOptionLabel(c.selectedAccount())
+	// Inset by 2 exactly like the To/CC/BCC controls below, so the sender value
+	// starts in the same column as the recipient text and stops at the same
+	// right edge instead of sitting one cell out from the rest of the block.
+	fromInner := renderSoftDropdown(max(1, fromW-4), fromLabel, fromFocused, c.senderPickerOpen, chrome)
+	fromControl := renderInsetControl(fromInner, fromW, 2, chrome)
+	if len(c.accounts) < 2 {
+		fromText := lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted).Render(fromLabel)
+		fromControl = renderInsetControl(fromText, fromW, 2, chrome)
+	}
+	rows = append(rows, renderSoftRow("From", fromFocused, fromControl, width, labelW, chrome))
+	if c.senderPickerOpen {
+		rows = append(rows, c.renderSenderRows(width, labelW, chrome)...)
+	}
+	// Spacer below the From block so the sender control reads as its own
+	// control rather than the first of four stacked recipient fields.
+	if senderSpacer {
+		rows = append(rows, blankRow(chrome.baseBg))
+	}
+	// Each recipient row is followed by the autocomplete dropdown when it is
+	// the focused field; composeLayout budgets the extra lines.
+	suggestionRows := func(field composeField) {
+		if c.suggestionsVisible() && c.focusedField == field {
+			rows = append(rows, c.renderSuggestionRows(width, labelW, chrome)...)
+		}
+	}
+	rows = append(rows, softInput("To", c.toInput, composeFieldTo))
+	suggestionRows(composeFieldTo)
+	rows = append(rows, softInput("CC", c.ccInput, composeFieldCC))
+	suggestionRows(composeFieldCC)
+	rows = append(rows, softInput("BCC", c.bccInput, composeFieldBCC))
+	suggestionRows(composeFieldBCC)
+
+	rows = append(rows, blankRow(chrome.baseBg)) // gap between recipients and Subject
+	rows = append(rows, softInput("Subject", c.subjectInput, composeFieldSubject))
+	rows = append(rows, blankRow(chrome.baseBg)) // spacer before body
+	bodyTop := 0
+	for _, row := range rows {
+		bodyTop += lipgloss.Height(row)
+	}
+	rows = append(rows, bodyRow)
+
+	// attachments
+	if len(c.attachments) > 0 {
+		rows = append(rows, blankRow(chrome.baseBg)) // gap before group
+		rows = append(rows, renderSoftGroupTitle("attachments", width, chrome))
+		rows = append(rows, blankRow(chrome.baseBg))
+		for _, af := range c.attachments {
+			txt := fmt.Sprintf("  %s%s  %s", fileIcon(af.Name), af.Name, humanSize(len(af.Data)))
+			line := lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.text).Render(txt)
+			rows = append(rows, padStyled(line, width, chrome.baseBg))
+		}
+	}
+
+	rows = append(rows, hints)
+
+	content := lipgloss.JoinVertical(lipgloss.Left, rows...)
+	return clampView(content, width, height, chrome.baseBg), bodyTop
+}
+
+// pickerView renders the yazi-style file browser.
+func (c ComposeModel) pickerView(width, height int, chrome managerChrome) string {
+	// Current directory breadcrumb (the "attach file" title lives in the overlay
+	// border via ComposeModel.softTitle when the picker is active).
+	pathLine := padStyled(
+		lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.accent).Render("  "+c.picker.currentDir),
+		width, chrome.baseBg)
+
+	// Quiet soft footer — render first so the file list can reserve its true height.
+	hints := renderSoftHints(width, chrome, "↑↓", "navigate", "enter", "open/attach", "esc/h", "up dir", ".", "hidden")
+	if c.routedStatus != "" && c.statusMsg == c.routedStatus {
+		hints = lipgloss.JoinVertical(lipgloss.Left, c.composeStateLine(width, chrome), hints)
+	}
+
+	// File listing — fit within available height (path line + footer).
+	availH := height - lipgloss.Height(pathLine) - lipgloss.Height(hints)
+	if availH < 1 {
+		availH = 1
+	}
+
+	// Scroll offset
+	start := 0
+	if c.picker.cursor >= availH {
+		start = c.picker.cursor - availH + 1
+	}
+	shown := c.picker.entries
+	if start > len(shown) {
+		start = len(shown) - availH
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + availH
+	if end > len(shown) {
+		end = len(shown)
+	}
+	visible := shown[start:end]
+
+	railW := 2
+	contentW := max(1, width-railW)
+	var lines []string
+	for i, entry := range visible {
+		idx := start + i
+		focused := idx == c.picker.cursor
+
+		// Selection is a left accent rail (soft-panel convention) — no full-width
+		// accent fill. The label brightens to text when focused.
+		fg := chrome.text
+		var label, size string
+		switch {
+		case entry.isDir && entry.name == "..":
+			label = "../"
+			if !focused {
+				fg = chrome.muted
+			}
+		case entry.isDir:
+			label = entry.name + "/"
+			if !focused {
+				fg = chrome.accent
+			}
+		default:
+			label = entry.name
+			size = humanSize(int(entry.size))
+			if !focused {
+				fg = chrome.text
+			}
+		}
+
+		labelStyle := lipgloss.NewStyle().Background(chrome.baseBg).Foreground(fg)
+		var content string
+		if size != "" {
+			sizeCell := lipgloss.NewStyle().Background(chrome.baseBg).Foreground(chrome.muted).Render(size + " ")
+			left := labelStyle.Render(" " + truncate(label, max(1, contentW-lipgloss.Width(sizeCell)-2)))
+			gap := max(1, contentW-lipgloss.Width(left)-lipgloss.Width(sizeCell))
+			content = left + lipgloss.NewStyle().Background(chrome.baseBg).Render(strings.Repeat(" ", gap)) + sizeCell
+		} else {
+			content = labelStyle.Render(" " + truncate(label, max(1, contentW-1)))
+		}
+		lines = append(lines, softRail(chrome, focused, chrome.baseBg)+padStyled(content, contentW, chrome.baseBg))
+	}
+
+	// Fill remaining space
+	for len(lines) < availH {
+		lines = append(lines, lipgloss.NewStyle().
+			Background(chrome.baseBg).
+			Width(width).
+			Render(strings.Repeat(" ", width)))
+	}
+
+	fileList := lipgloss.JoinVertical(lipgloss.Left, lines...)
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		pathLine,
+		fileList,
+		hints,
+	)
+	return clampView(content, width, height, chrome.baseBg)
+}
+
+// statusMsg helpers used by model.go
+func (c ComposeModel) StatusMsg() string { return c.statusMsg }
+func (c ComposeModel) IsErr() bool       { return c.isErr }
+
+// togglePGP flips one PGP option, or explains why it can't be turned on.
+func (c ComposeModel) togglePGP(name string) ComposeModel {
+	if !c.pgpAvailable {
+		c.statusMsg = "No PGP plugin installed (it must declare the message_compose permission)"
+		c.isErr = true
+		return c
+	}
+	on := &c.pgpSign
+	if name == "encrypt" {
+		on = &c.pgpEncrypt
+	}
+	*on = !*on
+	c.isErr = false
+	state := "off"
+	if *on {
+		state = "on"
+	}
+	c.statusMsg = fmt.Sprintf("PGP %s: %s", name, state)
+	if name == "encrypt" && *on {
+		// Short enough to sit beside the toggles on the footer's state line.
+		c.statusMsg += " — subject not encrypted"
+	}
+	return c
+}

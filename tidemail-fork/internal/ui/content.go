@@ -1,0 +1,1230 @@
+package ui
+
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+)
+
+func (m *Model) renderContentPane() string {
+	w := m.contentPaneContentWidth()
+	paneH := m.contentBodyHeight() + m.paneHeaderHeight()
+	bodyH := m.contentBodyHeight()
+	bg := m.styles.Theme.Bg
+
+	focused := m.focused == paneContent
+	searching := m.overlay == overlayContentSearch
+
+	vpH := bodyH
+	if searching {
+		vpH = max(1, bodyH-1)
+	}
+
+	vp := m.viewport
+	vp.Width = w
+	vp.Height = vpH
+	vp.Style = lipgloss.NewStyle().Background(bg)
+	body := m.renderContentFocusLine(vp.View(), w, vpH, focused)
+	body = m.renderReaderMouseSelection(body)
+	body = clampView(body, w, vpH, bg)
+
+	content := body
+	if m.cfg.Display.ShowPaneHeaders {
+		header := m.renderPaneHeader(paneContent, "Content", focused, w)
+		content = header + "\n" + body
+	}
+
+	if searching {
+		matchInfo := ""
+		if len(m.contentSearchMatches) > 0 {
+			matchInfo = fmt.Sprintf("  [%d/%d]", m.contentSearchIdx+1, len(m.contentSearchMatches))
+		} else if m.contentSearchQuery != "" {
+			matchInfo = "  [no matches]"
+		}
+		input := m.contentSearchInput
+		searchBg := m.styles.ContentBody.GetBackground()
+		input.PromptStyle = lipgloss.NewStyle().Background(searchBg).Foreground(m.styles.Theme.BorderFocus)
+		input.TextStyle = lipgloss.NewStyle().Background(searchBg).Foreground(m.styles.Theme.Fg)
+		input.PlaceholderStyle = lipgloss.NewStyle().Background(searchBg).Foreground(m.styles.Theme.Fg)
+		input.Cursor.Style = lipgloss.NewStyle().Background(m.styles.Theme.BorderFocus).Foreground(accentReadableOn(m.styles.Theme.Fg, m.styles.Theme.BorderFocus, 4.5))
+		searchBar := m.styles.ContentBody.Width(w).Render(inputViewWithCursor(input, true) + matchInfo)
+		content = searchBar + "\n" + body
+		if m.cfg.Display.ShowPaneHeaders {
+			header := m.renderPaneHeader(paneContent, "Content", focused, w)
+			content = header + "\n" + content
+		}
+	}
+
+	return m.styles.PaneFrame(focused).
+		Width(w).
+		Height(paneH).
+		Render(content)
+}
+
+func (m Model) renderMessageContent(msg db.Message) string {
+	content, _ := m.renderMessageContentImages(msg)
+	return content
+}
+
+func (m Model) renderMessageContentImages(msg db.Message) (string, []renderImage) {
+	rendered := m.renderMessageContentLayout(msg)
+	return rendered.content, rendered.images
+}
+
+func (m Model) renderMessageContentLayout(msg db.Message) renderedContent {
+	paneWidth := m.contentPaneContentWidth()
+	contentWidth := m.contentBodyWidth()
+	bodyWidth := m.contentBodyWidth()
+	titleWidth := max(1, paneWidth-m.styles.ContentTitle.GetHorizontalFrameSize())
+	metaWidth := max(1, contentWidth-m.styles.ContentMeta.GetHorizontalFrameSize())
+	title := m.styles.ContentTitle.Width(paneWidth).Render(truncate(messageListDisplayText(unescapeDisplayText(msg.Subject)), titleWidth))
+	metaStr := msg.Date.Format("Mon, 02 Jan 2006 15:04")
+	if msg.From != "" {
+		metaStr += "  From: " + msg.From
+	}
+	meta := " " + m.styles.ContentMeta.Width(contentWidth).Render(truncate(metaStr, metaWidth))
+	if tags := m.renderContentMessageTags(msg, contentWidth); tags != "" {
+		meta += "\n" + tags
+	}
+	if line := m.pgpStatusLine(msg, contentWidth); line != "" {
+		meta += "\n" + line
+	}
+
+	// Full headers block (togglable via ctrl+e)
+	var fullHeaders string
+	if m.contentShowHeaders {
+		if block := m.renderFullHeaders(msg, contentWidth); block != "" {
+			fullHeaders = block + "\n"
+		}
+	}
+
+	body, images := m.renderMessageBodyImages(msg, bodyWidth)
+
+	body = collapseQuoteBlocks(body, m.contentQuotesCollapsed)
+
+	prefix := title + "\n" + meta + "\n\n" + fullHeaders
+	linkStart := -1
+	if m.actionableLinksEnabled() && len(m.contentLinks) > 0 {
+		linkStart = strings.Count(normalizeHardBreaks(prefix+body+"\n\n"), "\n") + 1
+		m.contentLinkIdx = -1 // cache layout independently of selection
+		body += "\n\n" + m.renderContentLinks(bodyWidth)
+	}
+
+	// The attachment list hides inline images that were drawn in the body, but
+	// m.contentAttachments (used for saving) keeps them, so hiding never
+	// removes access.
+	if visible := filterRenderedInline(m.contentAttachments, images); len(visible) > 0 {
+		body += "\n\n" + m.renderAttachmentListFor(visible, bodyWidth)
+	}
+
+	content := prefix + body
+	content = normalizeHardBreaks(content)
+	return renderedContent{content: fillViewWidth(content, paneWidth, m.styles.Theme.Bg), images: images, linkStart: linkStart}
+}
+
+func (m Model) renderMessageBody(msg db.Message, bodyWidth int) string {
+	body, _ := m.renderMessageBodyImages(msg, bodyWidth)
+	return body
+}
+
+func (m Model) renderMessageBodyImages(msg db.Message, bodyWidth int) (string, []renderImage) {
+	res := m.renderMessageForDisplay(msg, bodyWidth)
+	return res.body, res.images
+}
+
+func isRedditMessage(msg db.Message) bool {
+	from := strings.ToLower(msg.From)
+	return strings.Contains(from, "redditmail.com") || strings.Contains(from, "reddit <")
+}
+
+func (m Model) renderAttachmentList(width int) string {
+	return m.renderAttachmentListFor(m.contentAttachments, width)
+}
+
+func (m Model) renderAttachmentListFor(atts []db.Attachment, width int) string {
+	if len(atts) == 0 {
+		return ""
+	}
+	th := m.styles.Theme
+	accent := lipgloss.NewStyle().Background(th.Bg).Foreground(messageLinkColor(th))
+	dimmed := lipgloss.NewStyle().Background(th.Bg).Foreground(messageMutedColor(th))
+	body := m.styles.ContentBody
+	indent := lipgloss.NewStyle().Background(th.Bg).Render(" ")
+
+	header := accent.Render("── " + strings.ToUpper("Attachments") + " ──")
+	lines := []string{
+		header + dimmed.Render(strings.Repeat("─", max(0, width-ansi.StringWidth(header)))),
+	}
+	maxSizeLen := 0
+	for _, a := range atts {
+		if l := len(formatFileSize(a.Size)); l > maxSizeLen {
+			maxSizeLen = l
+		}
+	}
+	for _, a := range atts {
+		icon := fileTypeIcon(a.Filename, a.ContentType)
+		sizeStr := formatFileSize(a.Size)
+		iconStyled := accent.Render(" " + icon + " ")
+		// Truncate the filename so a long name can't overflow the pane and shove
+		// the size column off-screen; leave room for the icon, size, and gap.
+		nameW := max(1, width-ansi.StringWidth(iconStyled)-maxSizeLen-3)
+		name := truncate(a.Filename, nameW)
+		paddedSize := fmt.Sprintf("%*s", maxSizeLen, sizeStr)
+		// Right-align size by padding to column end
+		used := ansi.StringWidth(iconStyled) + ansi.StringWidth(name)
+		pad := width - used - maxSizeLen - 2
+		if pad < 1 {
+			pad = 1
+		}
+		line := iconStyled + body.Render(name+strings.Repeat(" ", pad)) + dimmed.Render(paddedSize)
+		lines = append(lines, line)
+	}
+	lines = append(lines, "")
+	lines = append(lines, dimmed.Render("  ctrl+d  save all to folder"))
+	for i, line := range lines {
+		line = ansi.Truncate(line, width, "")
+		if pad := width - ansi.StringWidth(line); pad > 0 {
+			line += body.Render(strings.Repeat(" ", pad))
+		}
+		lines[i] = indent + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderContentLinks(width int) string {
+	bodyWidth := max(1, width-1) // reserve the existing one-cell block indent
+	lines := make([]string, 0, len(m.contentLinks)+1)
+	lines = append(lines, indentBlock(m.styles.ContentBody.Width(bodyWidth).Render(truncate("LINKS", bodyWidth)), 1))
+	for i := range m.contentLinks {
+		lines = append(lines, m.renderContentLinkRow(i, width, i == m.contentLinkIdx))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) contentLinkText(index, width int, selected bool) string {
+	link := m.contentLinks[index]
+	prefix := "  "
+	if selected {
+		prefix = "> "
+	}
+	label := m.contentLinkLabels[link]
+	if isMailtoDestination(link) {
+		if label == "" {
+			label = "email action"
+		}
+		label = "[mailto: " + label + "]"
+		return truncate(prefix+label, width)
+	}
+	if label == "" || label == link {
+		return truncate(prefix+link, width)
+	}
+	// The label is chosen by the sender, so always show where the link really
+	// goes, and warn when the label names a different site than the target.
+	suffix := linkDestinationSuffix(link)
+	if linkLabelMismatch(label, link) {
+		label = "! " + label
+	}
+	room := width - lipgloss.Width(suffix)
+	if room < 8 {
+		return truncate(prefix+label+suffix, width)
+	}
+	return truncate(prefix+label, room) + suffix
+}
+
+func (m Model) renderContentLinkRow(index, width int, selected bool) string {
+	width = max(1, width-1)
+	link := m.contentLinks[index]
+	line := m.contentLinkText(index, width, selected)
+	style := lipgloss.NewStyle().Foreground(messageLinkColor(m.styles.Theme))
+	if selected {
+		style = lipgloss.NewStyle().
+			Background(m.styles.Theme.BorderFocus).
+			Foreground(accentReadableOn(m.styles.Theme.Fg, m.styles.Theme.BorderFocus, 4.5)).
+			Bold(true)
+	}
+	// The click target is the full URI even when the visible label is cut.
+	line = osc8Link(link, style.Render(line), m.styles.PlainUI)
+	return indentBlock(m.styles.ContentBody.Width(width).Render(line), 1)
+}
+
+// Cached layout contains neutral footer rows. Keep the selectable text view in
+// sync without mutating the cache's shared line index or rebuilding its body.
+func (m *Model) updateContentLinkLine() {
+	if m.contentLinkIdx < 0 || m.contentLinkIdx >= len(m.contentLinkRows) {
+		return
+	}
+	row := m.contentLinkRows[m.contentLinkIdx]
+	m.contentLines = append([]string(nil), m.contentLines...)
+	m.contentLines[row] = " " + m.contentLinkText(m.contentLinkIdx, max(1, m.contentBodyWidth()-1), true)
+}
+
+func (m Model) actionableLinksEnabled() bool {
+	return m.cfg.Display.ActionableLinks
+}
+
+// focusedLineLink resolves the internal reading position independently of its
+// visual highlight. Activation separately requires deliberate selection or focus.
+// contentDisplayLines splits rendered content into the stripped display lines
+// used for focus and selection indexing, plus a parallel slice holding the OSC 8
+// hyperlink target on each line. The slices are index-aligned, so
+// contentFocusLine addresses both. If an escape ever swallowed a newline and
+// broke that 1:1 mapping, the link slice is dropped rather than silently
+// attributing a link to the wrong row.
+func contentDisplayLines(content string) (lines, lineLinks []string) {
+	lines = strings.Split(ansi.Strip(content), "\n")
+	for i, line := range lines {
+		lines[i] = stripImagePlaceholders(line)
+	}
+	raw := strings.Split(content, "\n")
+	if len(raw) != len(lines) {
+		return lines, nil
+	}
+	lineLinks = make([]string, len(raw))
+	for i := range raw {
+		lineLinks[i] = firstOSC8Target(raw[i])
+	}
+	return lines, lineLinks
+}
+
+func (m Model) focusedLineLink() (string, bool) {
+	if m.contentFocusPending {
+		return "", false
+	}
+	if m.contentFocusLine < 0 || m.contentFocusLine >= len(m.contentLines) {
+		return "", false
+	}
+	// LINKS rows have explicit targets, including URLs too long for OSC 8.
+	if link, ok := m.contentListLinkAt(m.contentFocusLine); ok {
+		return link, true
+	}
+	// Visible text wins elsewhere: what the reader sees is what they meant to open.
+	if links := extractActionableLinks(m.contentLines[m.contentFocusLine], ""); len(links) > 0 {
+		return links[0], true
+	}
+	// Otherwise fall back to a hyperlink the terminal can see but ansi.Strip
+	// removed. Reddit digest titles and their [Read post] action carry their
+	// URL only there. Checked separately because a caller may have set
+	// contentLines without the parallel slice.
+	if m.contentFocusLine < len(m.contentLineLinks) {
+		if link := cleanDetectedURL(m.contentLineLinks[m.contentFocusLine]); link != "" {
+			return link, true
+		}
+	}
+	return "", false
+}
+
+// viewportContentKey builds the cache key for the reading pane. It covers the
+// item shown plus every setting that changes how it is laid out, so a hit is
+// only ever returned for an identical render.
+func (m Model) viewportContentKey(id string, fingerprint int, imageKey string) viewportCacheKey {
+	return viewportCacheKey{
+		id:                      id,
+		width:                   m.contentBodyWidth(),
+		paneWidth:               m.contentPaneContentWidth(),
+		theme:                   m.styles.Theme.Name,
+		plainUI:                 m.styles.PlainUI,
+		filterLinks:             m.cfg.Display.FilterLinks,
+		showHeaders:             m.contentShowHeaders,
+		showMessageTagsInHeader: m.cfg.Display.ShowMessageTagsInHeader,
+		quotesCollapsed:         m.contentQuotesCollapsed,
+		actionableLinks:         m.actionableLinksEnabled(),
+		fingerprint:             fingerprint,
+		imageKey:                imageKey,
+	}
+}
+
+// viewportContentFor returns the finished reading-pane content, rendering it
+// only when this exact view has not been built before. Laying out a message
+// costs milliseconds even with its body already rendered — mostly ansi width
+// scans over the whole content — and moving the cursor back onto a message
+// should not pay for it twice.
+func (m *Model) viewportContentFor(key viewportCacheKey, render func() renderedContent) viewportContent {
+	if vc, ok := m.viewportCache.get(key); ok {
+		return vc
+	}
+	rendered := render()
+	content, images := rendered.content, rendered.images
+	lines, lineLinks := contentDisplayLines(content)
+	var linkRows []int
+	if rendered.linkStart >= 0 {
+		for i, target := range m.contentLinks {
+			row := rendered.linkStart + i
+			if row >= len(lines) {
+				break
+			}
+			linkRows = append(linkRows, row)
+			if row < len(lineLinks) {
+				lineLinks[row] = target
+			}
+		}
+	}
+	vc := viewportContent{
+		linkRows:  linkRows,
+		content:   content,
+		lines:     lines,
+		lineLinks: lineLinks,
+		focusable: focusableFromLines(lines),
+		images:    images,
+	}
+	m.viewportCache.put(key, vc)
+	return vc
+}
+
+// prefetchMessageContent warms the reading-pane render cache for msg on a
+// background task, so cursor navigation onto a message that is not rendered
+// yet moves the cold HTML→ANSI conversion off the UI thread instead of paying
+// it inside the selection update. A cache hit makes this a no-op.
+func (m *Model) prefetchMessageContent(msg db.Message) {
+	key := m.viewportContentKey(
+		fmt.Sprintf("msg:%d", msg.ID),
+		len(msg.BodyHTML)+len(msg.BodyText)+m.messageAttachmentCount(msg),
+		m.imageRenderKey(msg.ID),
+	)
+	if _, ok := m.viewportCache.get(key); ok {
+		return
+	}
+	m.viewportContentFor(key, func() renderedContent { return m.renderMessageContentLayout(msg) })
+}
+
+func (m *Model) messageAttachmentCount(msg db.Message) int {
+	if !msg.HasAttachment || m.db == nil {
+		return 0
+	}
+	atts, err := m.db.GetAttachmentsMeta(msg.ID)
+	if err != nil {
+		return 0
+	}
+	return len(atts)
+}
+
+// prefetchMessageContentCmd schedules the warm; the task itself reads the
+// cache through the mutex-guarded bounded cache and renders through value
+// receivers, so no pane state is touched here.
+func (m *Model) prefetchMessageContentCmd(msg db.Message) tea.Cmd {
+	return func() tea.Msg {
+		m.prefetchMessageContent(msg)
+		return nil
+	}
+}
+
+func (m *Model) setViewportMessage(msg db.Message) {
+	m.invalidateComposePanes()
+	sameMsg := m.contentMessageID == msg.ID && m.contentLineCount > 0
+	m.setContentLinkContext(fmt.Sprintf("msg:%d", msg.ID))
+	m.syncContentLinks(msg)
+	m.contentAttachments = nil
+	m.clearContentSelection()
+	if !sameMsg {
+		// Quote collapse is per-message. It must NOT reset on a same-message
+		// re-render, or the z toggle would immediately undo itself.
+		m.contentQuotesCollapsed = false
+	}
+	if msg.HasAttachment {
+		// Metadata only: the pane shows names and sizes, and the contents are
+		// loaded at save time. This runs on every cursor move. The full list is
+		// kept — including inline images — so saving always has something to
+		// work with even when those images cannot be drawn.
+		if atts, err := m.db.GetAttachmentsMeta(msg.ID); err == nil {
+			m.contentAttachments = atts
+		}
+	}
+	key := m.viewportContentKey(
+		fmt.Sprintf("msg:%d", msg.ID),
+		len(msg.BodyHTML)+len(msg.BodyText)+len(m.contentAttachments),
+		m.imageRenderKey(msg.ID),
+	)
+	vc := m.viewportContentFor(key, func() renderedContent { return m.renderMessageContentLayout(msg) })
+	m.contentSearchMatches = collectSearchMatches(vc.content, m.contentSearchQuery)
+	m.viewport.SetContent(vc.content)
+	m.applyViewportImages(vc.images)
+	m.contentMessageID = msg.ID
+	m.contentDraftID = 0
+	m.clearReaderMouseSelection()
+	m.contentLines, m.contentLineLinks = vc.lines, vc.lineLinks
+	m.contentLinkRows = vc.linkRows
+	m.updateContentLinkLine()
+	m.contentLineCount = len(m.contentLines)
+	m.contentFocusable = vc.focusable
+	m.contentFocusLine = clamp(m.contentFocusLine, 0, max(0, m.contentLineCount-1))
+	if !sameMsg {
+		m.contentFocusLine = firstFocusableLine(m.contentFocusable)
+		m.viewport.GotoTop()
+	}
+	m.ensureContentFocusVisible()
+}
+
+// renderDraftContent renders an unsent draft for the reading pane. A draft is
+// not a db.Message — it has no sender and no received date — so it gets its own
+// header showing the recipients and when it was last saved. The body is run
+// through the normal plain-text renderer so wrapping and links match the rest
+// of the pane.
+// draftPreviewLimit caps how much of a draft body the reading pane renders.
+// Wrapping runs on the UI thread, and a runaway body (a 30 MB single line
+// left by repeated Replace All) froze it for seconds on every cursor visit.
+const draftPreviewLimit = 64 << 10
+
+// draftPreviewText returns at most draftPreviewLimit bytes of body, cut on a
+// rune boundary, and whether anything was left out.
+func draftPreviewText(body string) (string, bool) {
+	if len(body) <= draftPreviewLimit {
+		return body, false
+	}
+	cut := draftPreviewLimit
+	for cut > 0 && !utf8.RuneStart(body[cut]) {
+		cut--
+	}
+	return body[:cut], true
+}
+
+func (m Model) renderDraftContent(d db.Draft) string {
+	paneWidth := m.contentPaneContentWidth()
+	contentWidth := m.contentBodyWidth()
+	titleWidth := max(1, paneWidth-m.styles.ContentTitle.GetHorizontalFrameSize())
+	metaWidth := max(1, contentWidth-m.styles.ContentMeta.GetHorizontalFrameSize())
+
+	title := m.styles.ContentTitle.Width(paneWidth).
+		Render(truncate(messageListDisplayText(unescapeDisplayText(draftSubject(d))), titleWidth))
+
+	metaStr := "Draft"
+	if !d.UpdatedAt.IsZero() {
+		metaStr += "  Saved: " + d.UpdatedAt.Format("Mon, 02 Jan 2006 15:04")
+	}
+	meta := " " + m.styles.ContentMeta.Width(contentWidth).Render(truncate(metaStr, metaWidth))
+
+	dim := readableText(m.styles.Theme.Dimmed, m.styles.Theme.Bg, 3.0)
+	var headerLines []string
+	for _, f := range []struct{ label, value string }{
+		{"To", d.To},
+		{"CC", d.CC},
+		{"BCC", d.BCC},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			continue
+		}
+		headerLines = append(headerLines, lipgloss.NewStyle().
+			Background(m.styles.Theme.Bg).Foreground(dim).Width(contentWidth).
+			Render(fmt.Sprintf("  %-5s %s", f.label+":", f.value)))
+	}
+	if len(headerLines) == 0 {
+		// An unaddressed draft still needs to say so, or the pane looks like it
+		// simply failed to load.
+		headerLines = append(headerLines, lipgloss.NewStyle().
+			Background(m.styles.Theme.Bg).Foreground(dim).Width(contentWidth).
+			Render("  To:   (no recipient yet)"))
+	}
+	header := strings.Join(headerLines, "\n") + "\n"
+
+	previewText, truncated := draftPreviewText(d.BodyText)
+	body := m.renderMessageBody(db.Message{BodyText: previewText}, m.contentBodyWidth())
+	if strings.TrimSpace(ansi.Strip(body)) == "" {
+		body = m.styles.ContentBody.Width(m.contentBodyWidth()).Render("  (empty draft)")
+	}
+	if truncated {
+		body += "\n\n" + lipgloss.NewStyle().
+			Background(m.styles.Theme.Bg).Foreground(dim).Width(contentWidth).
+			Render(fmt.Sprintf("  … preview shows the first %s of %s", humanSize(len(previewText)), humanSize(len(d.BodyText))))
+	}
+
+	if len(d.Attachments) > 0 {
+		names := make([]string, 0, len(d.Attachments))
+		for _, a := range d.Attachments {
+			names = append(names, a.Filename)
+		}
+		body += "\n\n" + m.styles.ContentBody.Width(m.contentBodyWidth()).
+			Render("  Attachments: "+strings.Join(names, ", "))
+	}
+
+	content := title + "\n" + meta + "\n\n" + header + "\n" + body
+	content = normalizeHardBreaks(content)
+	return fillViewWidth(content, paneWidth, m.styles.Theme.Bg)
+}
+
+// setViewportDraft shows a draft in the reading pane. It deliberately leaves
+// contentMessageID at zero: that field is looked up against filteredMessages,
+// and a draft ID reused there would resolve to an unrelated message.
+func (m *Model) setViewportDraft(d db.Draft) {
+	m.invalidateComposePanes()
+	sameDraft := m.contentDraftID == d.ID && m.contentLineCount > 0
+	m.setContentLinkContext(fmt.Sprintf("draft:%d", d.ID))
+	previewText, _ := draftPreviewText(d.BodyText)
+	m.syncContentLinks(db.Message{BodyText: previewText})
+	m.contentAttachments = nil
+	m.clearContentSelection()
+	if !sameDraft {
+		m.contentQuotesCollapsed = false
+	}
+	// The Drafts list reloads on entry and after every sync of the folder, and
+	// each reload lands here; without the cache every one re-wrapped the body.
+	key := m.viewportContentKey(
+		fmt.Sprintf("draft:%d", d.ID),
+		int(d.UpdatedAt.UnixNano())+len(d.BodyText)+len(d.Attachments),
+		"",
+	)
+	vc := m.viewportContentFor(key, func() renderedContent {
+		return renderedContent{content: m.renderDraftContent(d), linkStart: -1}
+	})
+	m.contentSearchMatches = collectSearchMatches(vc.content, m.contentSearchQuery)
+	m.viewport.SetContent(vc.content)
+	m.contentMessageID = 0
+	m.contentDraftID = d.ID
+	m.clearReaderMouseSelection()
+	m.contentLines, m.contentLineLinks = vc.lines, vc.lineLinks
+	m.contentLinkRows = nil
+	m.contentLineCount = len(m.contentLines)
+	m.contentFocusable = vc.focusable
+	m.contentFocusLine = clamp(m.contentFocusLine, 0, max(0, m.contentLineCount-1))
+	if !sameDraft {
+		m.contentFocusLine = firstFocusableLine(m.contentFocusable)
+		m.viewport.GotoTop()
+	}
+	m.ensureContentFocusVisible()
+}
+
+func (m *Model) setViewportThread(thread messageThread) {
+	m.invalidateComposePanes()
+	rep := thread.Representative
+	sameMsg := m.contentMessageID == rep.ID && m.contentLineCount > 0
+	m.setContentLinkContext("thread:" + thread.Key)
+	m.syncThreadContentLinks(thread)
+	m.contentAttachments = nil
+	m.clearContentSelection()
+	if !sameMsg {
+		m.contentQuotesCollapsed = false
+	}
+	m.contentAttachments = m.threadAttachments(thread)
+	fingerprint := len(thread.Messages) + len(m.contentAttachments)
+	for _, tm := range thread.Messages {
+		fingerprint += len(tm.BodyHTML) + len(tm.BodyText)
+	}
+	key := m.viewportContentKey("thread:"+thread.Key, fingerprint, m.threadImageRenderKey(thread))
+	vc := m.viewportContentFor(key, func() renderedContent { return m.renderThreadContentLayout(thread) })
+	m.contentSearchMatches = collectSearchMatches(vc.content, m.contentSearchQuery)
+	m.viewport.SetContent(vc.content)
+	m.applyViewportImages(vc.images)
+	m.contentMessageID = rep.ID
+	m.contentDraftID = 0
+	m.clearReaderMouseSelection()
+	m.contentLines, m.contentLineLinks = vc.lines, vc.lineLinks
+	m.contentLinkRows = vc.linkRows
+	m.updateContentLinkLine()
+	m.contentLineCount = len(m.contentLines)
+	m.contentFocusable = vc.focusable
+	m.contentFocusLine = clamp(m.contentFocusLine, 0, max(0, m.contentLineCount-1))
+	if !sameMsg {
+		m.contentFocusLine = firstFocusableLine(m.contentFocusable)
+		m.viewport.GotoTop()
+	}
+	m.ensureContentFocusVisible()
+}
+
+// threadAttachments collects the attachments of every message in a thread. A
+// thread reads as one document in the pane, so an attachment on the third
+// reply has to be reachable too — and ctrl+d saving the whole conversation is
+// what "save attachments" means there.
+func (m Model) threadAttachments(thread messageThread) []db.Attachment {
+	if m.db == nil {
+		return nil
+	}
+	var atts []db.Attachment
+	for _, msg := range thread.Messages {
+		if !msg.HasAttachment {
+			continue
+		}
+		got, err := m.db.GetAttachmentsMeta(msg.ID)
+		if err != nil {
+			continue
+		}
+		atts = append(atts, got...)
+	}
+	return atts
+}
+
+func (m *Model) setViewportForCurrentRow() {
+	// Drafts live in their own list, not in filteredMessages, so they have to
+	// be resolved before the message paths below.
+	if m.selectedDraftsMailbox() {
+		if d := m.currentRowDraft(); d != nil {
+			m.setViewportDraft(*d)
+		} else {
+			m.clearViewportMessage()
+		}
+		return
+	}
+	if msg := m.currentRowMessage(); msg != nil {
+		m.setViewportMessage(*msg)
+	}
+}
+
+func (m *Model) clearViewportMessage() {
+	m.invalidateComposePanes()
+	m.contentLinkContext = ""
+	m.contentFocusedLink = ""
+	m.clearViewportImages()
+	m.viewport.SetContent("")
+	m.contentLinks = nil
+	m.contentLinkLabels = nil
+	m.contentLinkRows = nil
+	m.contentLinkIdx = -1
+	m.contentMessageID = 0
+	m.contentDraftID = 0
+	m.contentFocusLine = 0
+	m.contentFocusPending = false
+	m.contentLineCount = 0
+	m.contentFocusable = nil
+	m.clearReaderMouseSelection()
+	m.contentLines = nil
+	m.contentLineLinks = nil
+	m.contentAttachments = nil
+	m.clearContentSelection()
+	m.clearContentSearch()
+	m.viewport.GotoTop()
+}
+
+func (m Model) renderThreadContent(thread messageThread) string {
+	content, _ := m.renderThreadContentImages(thread)
+	return content
+}
+
+func (m Model) renderThreadContentImages(thread messageThread) (string, []renderImage) {
+	rendered := m.renderThreadContentLayout(thread)
+	return rendered.content, rendered.images
+}
+
+func (m Model) renderThreadContentLayout(thread messageThread) renderedContent {
+	if len(thread.Messages) == 0 {
+		return renderedContent{linkStart: -1}
+	}
+	paneWidth := m.contentPaneContentWidth()
+	contentWidth := m.contentBodyWidth()
+	titleWidth := max(1, paneWidth-m.styles.ContentTitle.GetHorizontalFrameSize())
+	titleText := messageListDisplayText(unescapeDisplayText(thread.Representative.Subject))
+	if thread.Count > 1 {
+		titleText = fmt.Sprintf("%s (%d messages)", titleText, thread.Count)
+	}
+	title := m.styles.ContentTitle.Width(paneWidth).Render(truncate(titleText, titleWidth))
+
+	var blocks []string
+	var images []renderImage
+	for _, msg := range thread.Messages {
+		header := m.threadMessageHeader(msg, contentWidth)
+		body, msgImages := m.renderMessageBodyImages(msg, contentWidth)
+		if strings.TrimSpace(body) == "" {
+			body = "No message body."
+		}
+		images = append(images, msgImages...)
+		blocks = append(blocks, header+"\n\n"+body)
+	}
+	body := collapseQuoteBlocks(strings.Join(blocks, "\n\n"), m.contentQuotesCollapsed)
+	linkStart := -1
+	if m.actionableLinksEnabled() && len(m.contentLinks) > 0 {
+		linkStart = strings.Count(normalizeHardBreaks(title+"\n\n"+body+"\n\n"), "\n") + 1
+		m.contentLinkIdx = -1 // cache layout independently of selection
+		body += "\n\n" + m.renderContentLinks(contentWidth)
+	}
+	if visible := filterRenderedInline(m.contentAttachments, images); len(visible) > 0 {
+		body += "\n\n" + m.renderAttachmentListFor(visible, contentWidth)
+	}
+	content := title + "\n\n" + body
+	content = normalizeHardBreaks(content)
+	return renderedContent{content: fillViewWidth(content, paneWidth, m.styles.Theme.Bg), images: images, linkStart: linkStart}
+}
+
+func (m Model) threadMessageHeader(msg db.Message, width int) string {
+	meta := msg.Date.Format("Mon, 02 Jan 2006 15:04")
+	if msg.From != "" {
+		meta += "  From: " + msg.From
+	}
+	line := "── " + meta + " ──"
+	if lipgloss.Width(line) > width {
+		line = truncate(line, width)
+	}
+	header := m.styles.ContentMeta.Width(width).Render(line)
+	if tags := m.renderContentMessageTags(msg, width); tags != "" {
+		header += "\n" + tags
+	}
+	if status := m.pgpStatusLine(msg, width); status != "" {
+		header += "\n" + status
+	}
+	if m.contentShowHeaders {
+		if block := m.renderFullHeaders(msg, width); block != "" {
+			header += "\n" + block
+		}
+	}
+	return header
+}
+
+// renderContentMessageTags renders the same combined local and IMAP tags as a
+// message row, but gives them the content header's full reading width. The
+// existing layout progressively compacts tags and ends with +N when needed.
+func (m Model) renderContentMessageTags(msg db.Message, width int) string {
+	if !m.cfg.Display.ShowMessageTagsInHeader || width < 1 {
+		return ""
+	}
+	tags := m.mergeMessageTags(m.annotationTags(msg.ID), msg)
+	chips := layoutTags(tags, m.tagStyle(), m.tagEnds(), m.iconsEnabled() && !m.styles.PlainUI, max(1, width-1))
+	if len(chips) == 0 {
+		return ""
+	}
+	base := lipgloss.NewStyle().Background(m.styles.Theme.Bg).Foreground(m.styles.Theme.Fg)
+	return base.Width(width).Render(" " + m.renderChips(chips, base))
+}
+
+// renderFullHeaders renders the toggleable full-header block (Date, From, To,
+// CC, Reply-To, Message-ID) shared by the single-message and threaded views.
+// Returns "" when the message has no populated header fields.
+func (m Model) renderFullHeaders(msg db.Message, width int) string {
+	dim := readableText(m.styles.Theme.Dimmed, m.styles.Theme.Bg, 3.0)
+	type headerField struct{ label, value string }
+	fields := []headerField{
+		{"Date", msg.Date.Format("Mon, 02 Jan 2006 15:04:05 -0700")},
+		{"From", msg.From},
+		{"To", msg.To},
+		{"CC", msg.CC},
+		{"Reply-To", msg.ReplyTo},
+		{"Message-ID", msg.MessageID},
+	}
+	var headerLines []string
+	for _, f := range fields {
+		if f.value == "" {
+			continue
+		}
+		line := lipgloss.NewStyle().Background(m.styles.Theme.Bg).Foreground(dim).Width(width).Render(fmt.Sprintf("  %-12s %s", f.label+":", f.value))
+		headerLines = append(headerLines, line)
+		if f.label == "Message-ID" {
+			headerLines = append(headerLines, lipgloss.NewStyle().Background(m.styles.Theme.Bg).Width(width).Render(""))
+		}
+	}
+	if len(headerLines) == 0 {
+		return ""
+	}
+	return strings.Join(headerLines, "\n")
+}
+
+func (m *Model) clearContentSearch() {
+	// Background updates reach here through clearViewportMessage, so close
+	// only the search bar itself — never an account form or other overlay the
+	// user is working in.
+	if m.overlay == overlayContentSearch {
+		m.overlay = overlayNone
+	}
+	m.contentSearchQuery = ""
+	m.contentSearchMatches = nil
+	m.contentSearchIdx = -1
+	m.contentSearchInput.Blur()
+	m.clearContentSelection()
+	if msg := m.currentContentMessage(); msg != nil {
+		m.setViewportMessage(*msg)
+	}
+}
+
+func (m *Model) applyContentSearch() {
+	q := strings.ToLower(strings.TrimSpace(m.contentSearchInput.Value()))
+	m.contentSearchQuery = q
+	if msg := m.currentContentMessage(); msg != nil {
+		m.setViewportMessage(*msg)
+	}
+	if len(m.contentSearchMatches) > 0 {
+		m.contentSearchIdx = 0
+		m.scrollToContentMatch(0)
+	} else {
+		m.contentSearchIdx = -1
+	}
+}
+
+func (m *Model) cycleContentSearchMatch(delta int) {
+	if len(m.contentSearchMatches) == 0 {
+		return
+	}
+	n := len(m.contentSearchMatches)
+	m.contentSearchIdx = ((m.contentSearchIdx+delta)%n + n) % n
+	m.scrollToContentMatch(m.contentSearchIdx)
+}
+
+func (m *Model) scrollToContentMatch(idx int) {
+	m.clearContentLinkSelection()
+	if idx < 0 || idx >= len(m.contentSearchMatches) {
+		return
+	}
+	line := m.contentSearchMatches[idx]
+	m.viewport.SetYOffset(max(0, line-m.viewport.Height/2))
+}
+
+func (m *Model) moveContentFocusLine(delta int) {
+	m.clearContentLinkSelection()
+	if m.contentLineCount <= 0 {
+		return
+	}
+	if m.contentFocusPending {
+		m.reconcileContentFocus(delta)
+		if m.contentFocusPending {
+			if delta < 0 {
+				m.viewport.ScrollUp(1)
+			} else if delta > 0 {
+				m.viewport.ScrollDown(1)
+			}
+			m.reconcileContentFocus(delta)
+		}
+		if !m.contentFocusPending && delta != 0 && !m.selectContentLinkAt(m.contentFocusLine) {
+			m.contentFocusedLink, _ = m.focusedLineLink()
+		}
+		return
+	}
+	m.contentFocusLine = nextContentFocusLine(m.contentFocusLine, delta, m.contentFocusable, m.contentLineCount)
+	// Header lines are not focusable, so on the first body line the cursor
+	// cannot go higher. Moving up from there scrolls the header back into view.
+	if delta < 0 && !hasFocusableBefore(m.contentFocusable, m.contentFocusLine) {
+		m.viewport.GotoTop()
+	}
+	m.ensureContentFocusVisible()
+	if delta != 0 && m.contentFocusLine < len(m.contentFocusable) && m.contentFocusable[m.contentFocusLine] && !m.selectContentLinkAt(m.contentFocusLine) {
+		m.contentFocusedLink, _ = m.focusedLineLink()
+	}
+}
+
+func (m *Model) startContentSelection() {
+	if m.contentLineCount == 0 {
+		return
+	}
+	if m.contentSelectionActive && !m.contentSelectionAll {
+		m.clearContentSelection()
+		return
+	}
+	m.contentSelectionActive = true
+	m.contentSelectionAll = false
+	m.contentSelectionAnchor = clamp(m.contentFocusLine, 0, m.contentLineCount-1)
+}
+
+func (m *Model) selectAllContentLines() {
+	if m.contentLineCount == 0 {
+		return
+	}
+	m.contentSelectionActive = true
+	m.contentSelectionAll = true
+	m.contentSelectionAnchor = 0
+}
+
+func (m *Model) clearContentSelection() {
+	m.contentSelectionActive = false
+	m.contentSelectionAll = false
+	m.contentSelectionAnchor = 0
+}
+
+func (m Model) contentSelectionText(fallbackFocused bool) string {
+	if fallbackFocused && !m.contentSelectionActive {
+		if target, ok := m.contentListLinkAt(m.contentFocusLine); ok {
+			return target
+		}
+	}
+	if len(m.contentLines) == 0 {
+		return ""
+	}
+	var start, end int
+	switch {
+	case m.contentSelectionActive && m.contentSelectionAll:
+		start, end = 0, len(m.contentLines)-1
+	case m.contentSelectionActive:
+		start = clamp(m.contentSelectionAnchor, 0, len(m.contentLines)-1)
+		end = clamp(m.contentFocusLine, 0, len(m.contentLines)-1)
+		if start > end {
+			start, end = end, start
+		}
+	case fallbackFocused:
+		start = clamp(m.contentFocusLine, 0, len(m.contentLines)-1)
+		end = start
+	default:
+		return ""
+	}
+
+	lines := make([]string, 0, end-start+1)
+	for _, line := range m.contentLines[start : end+1] {
+		lines = append(lines, strings.TrimRight(line, " \t"))
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) contentLineSelected(line int) bool {
+	if !m.contentSelectionActive || m.contentLineCount == 0 {
+		return false
+	}
+	if m.contentSelectionAll {
+		return line >= 0 && line < m.contentLineCount
+	}
+	start := clamp(m.contentSelectionAnchor, 0, m.contentLineCount-1)
+	end := clamp(m.contentFocusLine, 0, m.contentLineCount-1)
+	if start > end {
+		start, end = end, start
+	}
+	return line >= start && line <= end
+}
+
+func (m Model) renderContentFocusLine(body string, width, height int, focused bool) string {
+	hasSearch := len(m.contentSearchMatches) > 0
+	hasFocus := m.cfg.Display.FocusLine && focused && !m.contentFocusPending && m.contentLineCount > 0
+	hasSelection := m.contentSelectionActive && m.contentLineCount > 0
+	hasLink := m.contentLinkIdx >= 0 && m.contentLinkIdx < len(m.contentLinkRows)
+
+	if !hasSearch && !hasFocus && !hasSelection && !hasLink {
+		return body
+	}
+	if width <= 0 || height <= 0 {
+		return body
+	}
+
+	lines := strings.Split(body, "\n")
+	// Only the visible selected footer row changes; the viewport's stored
+	// content stays neutral and reusable across every link selection.
+	if hasLink {
+		viewIdx := m.contentLinkRows[m.contentLinkIdx] - m.viewport.YOffset
+		if viewIdx >= 0 && viewIdx < height && viewIdx < len(lines) {
+			lines[viewIdx] = m.renderContentLinkRow(m.contentLinkIdx, m.contentBodyWidth(), true)
+		}
+	}
+
+	styleLine := func(lineIdx int, style lipgloss.Style) {
+		viewIdx := lineIdx - m.viewport.YOffset
+		if viewIdx < 0 || viewIdx >= height || viewIdx >= len(lines) {
+			return
+		}
+		// Re-styling a raster placeholder row would strip the foreground color
+		// that carries the image id, so leave those cells untouched.
+		if lineHasImagePlaceholder(lines[viewIdx]) {
+			return
+		}
+		l := ansi.Truncate(ansi.Strip(lines[viewIdx]), width, "")
+		if pad := width - lipgloss.Width(l); pad > 0 {
+			l += strings.Repeat(" ", pad)
+		}
+		lines[viewIdx] = style.Width(width).Render(l)
+		if target, ok := m.contentListLinkAt(lineIdx); ok {
+			lines[viewIdx] = osc8Link(target, lines[viewIdx], m.styles.PlainUI)
+		}
+	}
+
+	if hasSearch {
+		for _, matchLine := range m.contentSearchMatches {
+			styleLine(matchLine, m.styles.SearchMatch)
+		}
+		if m.contentSearchIdx >= 0 && m.contentSearchIdx < len(m.contentSearchMatches) {
+			styleLine(m.contentSearchMatches[m.contentSearchIdx], m.styles.ContentFocusLine)
+		}
+	}
+
+	if hasSelection {
+		for lineIdx := range m.contentLines {
+			if m.contentLineSelected(lineIdx) {
+				styleLine(lineIdx, m.styles.ContentFocusLine)
+			}
+		}
+	}
+
+	if hasFocus {
+		styleLine(m.contentFocusLine, m.styles.ContentFocusLine)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// Only deliberate selection or keyboard focus may arm a link. Clear the copied footer
+// marker too; the cached viewport itself always contains neutral rows.
+func (m *Model) clearContentLinkSelection() {
+	if i := m.contentLinkIdx; i >= 0 && i < len(m.contentLinkRows) && i < len(m.contentLinks) {
+		if row := m.contentLinkRows[i]; row >= 0 && row < len(m.contentLines) {
+			m.contentLines = append([]string(nil), m.contentLines...)
+			m.contentLines[row] = " " + m.contentLinkText(i, max(1, m.contentBodyWidth()-1), false)
+		}
+	}
+	m.contentLinkIdx = -1
+	m.contentFocusedLink = ""
+}
+
+func (m *Model) setContentLinkContext(context string) {
+	if m.contentLinkContext != context {
+		m.clearContentLinkSelection()
+		m.contentLinkContext = context
+		m.contentFocusPending = false
+	}
+	// Layout can move the focus onto different text. Preserve only explicit
+	// footer selection across a same-message rerender, not body-line intent.
+	m.contentFocusedLink = ""
+}
+
+func (m *Model) syncContentLinks(msg db.Message) {
+	if !m.actionableLinksEnabled() {
+		m.contentLinkLabels = nil
+		m.contentLinks = nil
+		m.contentLinkIdx = -1
+		return
+	}
+
+	result := m.renderMessageForDisplay(msg, m.contentBodyWidth())
+	links := result.links
+	m.contentLinkLabels = result.linkLabels
+	if len(links) == 0 {
+		m.contentLinks = nil
+		m.contentLinkIdx = -1
+		return
+	}
+
+	if cur, ok := m.currentContentLink(); ok {
+		for i, link := range links {
+			if link == cur {
+				m.contentLinks = links
+				m.contentLinkIdx = i
+				return
+			}
+		}
+	}
+
+	m.contentLinks = links
+	m.contentLinkIdx = -1
+}
+
+func (m *Model) syncThreadContentLinks(thread messageThread) {
+	if !m.actionableLinksEnabled() {
+		m.contentLinkLabels = nil
+		m.contentLinks = nil
+		m.contentLinkIdx = -1
+		return
+	}
+	var links []string
+	m.contentLinkLabels = make(map[string]string)
+	for _, msg := range thread.Messages {
+		result := m.renderMessageForDisplay(msg, m.contentBodyWidth())
+		links = mergeActionableLinks(links, result.links)
+		for target, label := range result.linkLabels {
+			if m.contentLinkLabels[target] == "" {
+				m.contentLinkLabels[target] = label
+			}
+		}
+	}
+	if len(links) == 0 {
+		m.contentLinks = nil
+		m.contentLinkIdx = -1
+		return
+	}
+	if cur, ok := m.currentContentLink(); ok {
+		for i, link := range links {
+			if link == cur {
+				m.contentLinks = links
+				m.contentLinkIdx = i
+				return
+			}
+		}
+	}
+	m.contentLinks = links
+	m.contentLinkIdx = -1
+}
+
+func mergeActionableLinks(primary, secondary []string) []string {
+	if len(primary) == 0 {
+		return secondary
+	}
+	if len(secondary) == 0 {
+		return primary
+	}
+	seen := make(map[string]struct{}, len(primary)+len(secondary))
+	merged := make([]string, 0, len(primary)+len(secondary))
+	for _, link := range append(primary, secondary...) {
+		if link == "" {
+			continue
+		}
+		if _, ok := seen[link]; ok {
+			continue
+		}
+		seen[link] = struct{}{}
+		merged = append(merged, link)
+	}
+	return merged
+}
+
+func (m *Model) stepContentLink(delta int) {
+	if len(m.contentLinks) == 0 {
+		m.contentLinkIdx = -1
+		return
+	}
+	m.contentFocusedLink = ""
+	if m.contentLinkIdx < 0 {
+		if delta < 0 {
+			m.contentLinkIdx = len(m.contentLinks) - 1
+		} else {
+			m.contentLinkIdx = 0
+		}
+		return
+	}
+	m.contentLinkIdx = (m.contentLinkIdx + delta + len(m.contentLinks)) % len(m.contentLinks)
+}
+
+// Match the cached footer row, never a URL found elsewhere on that line.
+// Duplicate row metadata is ambiguous and must not establish selection.
+func (m Model) contentLinkIndexAt(row int) int {
+	index := -1
+	for i, linkRow := range m.contentLinkRows {
+		if row == linkRow && i < len(m.contentLinks) {
+			if index >= 0 {
+				return -1
+			}
+			index = i
+		}
+	}
+	return index
+}
+
+func (m *Model) selectContentLinkAt(row int) bool {
+	index := m.contentLinkIndexAt(row)
+	if index < 0 {
+		return false
+	}
+	m.clearContentLinkSelection()
+	m.contentLinkIdx = index
+	m.contentFocusPending = false
+	m.contentFocusLine = row
+	m.updateContentLinkLine()
+	return true
+}
+
+// Click selection is restricted to visible text in an unambiguous footer row.
+// Borders, indentation and trailing padding do not identify an entry.
+func (m Model) contentLinkTextHit(row, x int) bool {
+	index := m.contentLinkIndexAt(row)
+	if index < 0 || !m.contentLineVisible(row) {
+		return false
+	}
+	column := x - m.feedsPaneWidth() - 2 // pane border and footer indent
+	text := m.contentLinkText(index, max(1, m.contentBodyWidth()-1), false)
+	if column < 2 || column >= ansi.StringWidth(strings.TrimRight(text, " \t")) || column >= m.contentBodyWidth()-1 {
+		return false
+	}
+	return strings.TrimSpace(ansi.Cut(text, column, column+1)) != ""
+}
+
+// contentListLinkAt resolves only the existing LINKS footer, independent of
+// terminal hyperlink support and of the text chosen for display.
+func (m Model) contentListLinkAt(row int) (string, bool) {
+	if index := m.contentLinkIndexAt(row); index >= 0 {
+		return m.contentLinks[index], true
+	}
+	return "", false
+}
+
+func (m *Model) revealContentLink() {
+	if m.contentLinkIdx < 0 || m.contentLinkIdx >= len(m.contentLinkRows) {
+		return
+	}
+	m.contentFocusPending = false
+	m.contentFocusLine = m.contentLinkRows[m.contentLinkIdx]
+	m.ensureContentFocusVisible()
+}

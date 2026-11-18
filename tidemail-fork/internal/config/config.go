@@ -1,0 +1,897 @@
+package config
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/BurntSushi/toml"
+)
+
+type Config struct {
+	AgentPermissions []string `toml:"agent_permissions"`
+	Theme            string   `toml:"theme"`
+	// DefaultAccountID is the stable ID of the account a brand-new message is
+	// sent from, and the account focused at startup. Empty means "not chosen":
+	// DefaultAccount then falls back to the first account, which is what
+	// tidemail did before the setting existed, and startup keeps landing on
+	// the unified inbox.
+	DefaultAccountID string `toml:"default_account"`
+
+	Display  DisplayConfig   `toml:"display"`
+	Feed     FeedConfig      `toml:"feed"`
+	Updates  UpdatesConfig   `toml:"updates"`
+	AI       AIConfig        `toml:"ai"`
+	OAuth    OAuthConfig     `toml:"oauth"`
+	Accounts []AccountConfig `toml:"account"`
+
+	// Plugins holds per-plugin user settings for the experimental plugin
+	// system, keyed by plugin ID. A missing entry means every setting is off.
+	Plugins PluginSettingsMap `toml:"plugins,omitempty"`
+}
+
+// PluginSettings is one plugin's user settings.
+type PluginSettings struct {
+	// AutoEvents lets the plugin receive message.received automatically.
+	AutoEvents bool `toml:"auto_events"`
+	// Settings holds the plugin's declared non-secret settings (bool and
+	// string values only). Secrets live in the keychain, never here.
+	Settings map[string]any `toml:"settings,omitempty"`
+}
+
+// PluginSettingsMap maps plugin IDs to their settings. It decodes leniently:
+// a malformed [plugins] entry reads as "all off" instead of stopping TideMail
+// from starting, since these settings only ever turn optional features on.
+type PluginSettingsMap map[string]PluginSettings
+
+// UnmarshalTOML implements toml.Unmarshaler.
+func (p *PluginSettingsMap) UnmarshalTOML(data any) error {
+	out := PluginSettingsMap{}
+	if tables, ok := data.(map[string]any); ok {
+		for id, raw := range tables {
+			table, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			auto, _ := table["auto_events"].(bool)
+			ps := PluginSettings{AutoEvents: auto}
+			if values, ok := table["settings"].(map[string]any); ok {
+				for k, v := range values {
+					switch v.(type) {
+					case bool, string:
+						if ps.Settings == nil {
+							ps.Settings = map[string]any{}
+						}
+						ps.Settings[k] = v
+					}
+				}
+			}
+			out[id] = ps
+		}
+	}
+	*p = out
+	return nil
+}
+
+// PluginAutoEvents reports whether the user enabled automatic events for a
+// plugin. Unknown plugins are disabled.
+func (c Config) PluginAutoEvents(pluginID string) bool {
+	return c.Plugins[pluginID].AutoEvents
+}
+
+// SetPluginAutoEvents records the automatic-events switch for a plugin. It
+// copies the map so a Config value shared elsewhere is not changed.
+func (c *Config) SetPluginAutoEvents(pluginID string, on bool) {
+	next, settings := c.clonePlugin(pluginID)
+	settings.AutoEvents = on
+	next[pluginID] = settings
+	c.Plugins = next
+}
+
+// PluginStoredSettings returns a copy of a plugin's stored non-secret
+// setting values (raw, unvalidated; resolve them against the manifest).
+func (c Config) PluginStoredSettings(pluginID string) map[string]any {
+	stored := c.Plugins[pluginID].Settings
+	out := make(map[string]any, len(stored))
+	for k, v := range stored {
+		out[k] = v
+	}
+	return out
+}
+
+// SetPluginSetting stores one non-secret setting value (bool or string). It
+// copies the maps so a Config value shared elsewhere is not changed.
+func (c *Config) SetPluginSetting(pluginID, key string, value any) {
+	next, settings := c.clonePlugin(pluginID)
+	values := make(map[string]any, len(settings.Settings)+1)
+	for k, v := range settings.Settings {
+		values[k] = v
+	}
+	values[key] = value
+	settings.Settings = values
+	next[pluginID] = settings
+	c.Plugins = next
+}
+
+func (c *Config) clonePlugin(pluginID string) (PluginSettingsMap, PluginSettings) {
+	next := make(PluginSettingsMap, len(c.Plugins)+1)
+	for id, s := range c.Plugins {
+		next[id] = s
+	}
+	return next, next[pluginID]
+}
+
+type OAuthConfig struct {
+	GoogleClientID     string `toml:"google_client_id"`
+	GoogleClientSecret string `toml:"google_client_secret"`
+	MSClientID         string `toml:"ms_client_id"`
+	GoogleDisabled     bool   `toml:"-"`
+}
+
+// Official builds set these Desktop app credentials with -ldflags -X. Desktop
+// clients are public clients: a bundled client secret is not a security boundary.
+var (
+	DefaultGoogleClientID     string
+	DefaultGoogleClientSecret string
+)
+
+// resolveOAuth applies developer overrides after decoding saved settings. An
+// explicitly different client ID must never inherit another client's secret.
+func resolveOAuth(saved OAuthConfig) OAuthConfig {
+	id := strings.TrimSpace(saved.GoogleClientID)
+	secret := strings.TrimSpace(saved.GoogleClientSecret)
+	if id == "" {
+		id, secret = DefaultGoogleClientID, DefaultGoogleClientSecret
+	}
+	if envID := strings.TrimSpace(os.Getenv("TIDEMAIL_GOOGLE_CLIENT_ID")); envID != "" {
+		if envID != id {
+			secret = ""
+		}
+		id = envID
+	}
+	if envSecret := strings.TrimSpace(os.Getenv("TIDEMAIL_GOOGLE_CLIENT_SECRET")); envSecret != "" {
+		secret = envSecret
+	}
+	saved.GoogleClientID, saved.GoogleClientSecret = id, secret
+	saved.MSClientID = firstNonEmpty(strings.TrimSpace(os.Getenv("TIDEMAIL_MS_CLIENT_ID")), firstNonEmpty(saved.MSClientID, DefaultMSClientID))
+	return saved
+}
+
+// ThunderbirdMSClientID is Mozilla Thunderbird's Microsoft app registration —
+// the de facto shared public client ID of the open-source mail ecosystem (mutt,
+// getmail, mbsync setups). A public client's ID identifies the app, it is not a
+// secret; Thunderbird's own docs publish it. Microsoft forbids the device-code
+// flow for this registration, so Outlook accounts using it sign in via the
+// authorization-code (paste the code) flow.
+const ThunderbirdMSClientID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+
+// DefaultMSClientID is the client ID Outlook accounts use unless
+// TIDEMAIL_MS_CLIENT_ID overrides it.
+const DefaultMSClientID = ThunderbirdMSClientID
+
+type RetroTerminalTweak struct {
+	Bg     string `toml:"bg"`
+	Fg     string `toml:"fg"`
+	Accent string `toml:"accent"`
+}
+
+type DisplayConfig struct {
+	Icons                   bool   `toml:"icons"`
+	ShowPaneHeaders         bool   `toml:"show_pane_headers"`
+	ShowMessageTagsInHeader bool   `toml:"show_message_tags_in_header"`
+	ShowNeedsYou            bool   `toml:"show_needs_you"` // Needs You sidebar row
+	ShowWaiting             bool   `toml:"show_waiting"`   // Waiting on Them sidebar row
+	DateFormat              string `toml:"date_format"`
+	MarkReadOnOpen          bool   `toml:"mark_read_on_open"`
+	MarkReadOnFocus         bool   `toml:"mark_read_on_focus"`
+	FocusLine               bool   `toml:"focus_line"`
+	SupportReminder         bool   `toml:"support_reminder"`
+	DefaultUnreadOnly       bool   `toml:"default_unread_only"`
+	ActionableLinks         bool   `toml:"actionable_links"`
+	MouseSupport            bool   `toml:"mouse_support"`
+	FilterLinks             bool   `toml:"filter_links"`
+	ShowSender              bool   `toml:"show_sender"`
+	ThreadedConversations   bool   `toml:"threaded_conversations"`
+	ReadingWidth            int    `toml:"reading_width"`
+	AccountsWidthPercent    int    `toml:"accounts_width_percent"`
+	MessagesHeightPercent   int    `toml:"messages_height_percent"`
+	ConfirmQuit             bool   `toml:"confirm_quit"`
+	ShowHeaders             bool   `toml:"show_headers"`
+	UnreadFirst             bool   `toml:"unread_first"`
+	StarredFirst            bool   `toml:"starred_first"`
+	Notifications           bool   `toml:"notifications"`
+	Browser                 string `toml:"browser"`
+	Density                 string `toml:"density"`
+	PaneCorners             string `toml:"pane_corners"` // "square" or "round"
+	Shadow                  bool   `toml:"shadow"`       // drop shadow behind modal overlays
+	Transparent             bool   `toml:"transparent"`  // let the terminal's background opacity show through
+	ComposeVim              bool   `toml:"compose_vim"`
+	ComposeSearchRegex      bool   `toml:"compose_search_regex"` // expose the advanced Regex search toggle
+	ComposeWordWrap         bool   `toml:"compose_word_wrap"`    // wrap compose text at word boundaries (on by default)
+	ComposeSpell            bool   `toml:"compose_spell"`        // offline spell check in compose (off by default)
+	ComposeSpellLang        string `toml:"compose_spell_lang"`   // spell check language code; empty means English
+	// Interactive CLI only; scripted commands ignore these.
+	CLIQuitAfterSend bool               `toml:"cli_quit_after_send"` // leave `tidemail cli` after a successful send or draft
+	CLISkipReview    bool               `toml:"cli_skip_review"`     // skip the wizard's review step when undo or a draft makes it safe
+	CLISignature     bool               `toml:"cli_signature"`       // wizard default for the account signature
+	SendMaxAttempts  int                `toml:"send_max_attempts"`   // total tries, including the first
+	SendDelaySeconds int                `toml:"send_delay_seconds"`  // undo grace period; 0 = send immediately
+	Images           string             `toml:"images"`
+	VT52             RetroTerminalTweak `toml:"vt52"`
+	VT100            RetroTerminalTweak `toml:"vt100"`
+	// TagStyle is how classification and IMAP tags look in message rows and headers: "pills"
+	// (default), "glyph-pills", "compact", "plain", or "tag-icons".
+	TagStyle string `toml:"tag_style"`
+	// TagEnds is how pill tags end: "square" (default; a padded block),
+	// "round" (rounded caps; needs a Nerd Font), or "none" (no padding).
+	TagEnds string `toml:"tag_ends"`
+	// TagColors overrides tag colors by semantic key: "reply", "urgent",
+	// "important", "category", or "category.<name>". Unset keys follow the
+	// theme; invalid values are ignored.
+	TagColors map[string]TagColor `toml:"tag_colors,omitempty"`
+}
+
+// TagColor is a user override for one annotation tag. Either field may be
+// empty to keep the theme's color for it.
+type TagColor struct {
+	Fg string `toml:"fg,omitempty"`
+	Bg string `toml:"bg,omitempty"`
+}
+
+// Message tag styles.
+const (
+	TagStyleIcons      = "tag-icons"
+	TagStyleGlyphPills = "glyph-pills"
+	TagStylePills      = "pills"
+	TagStyleCompact    = "compact"
+	TagStylePlain      = "plain"
+)
+
+// Pill tag ends.
+const (
+	TagEndsSquare = "square"
+	TagEndsRound  = "round"
+	TagEndsNone   = "none"
+)
+
+// NormalizeTagEnds returns a known pill end style, defaulting to square.
+func NormalizeTagEnds(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case TagEndsRound:
+		return TagEndsRound
+	case TagEndsNone:
+		return TagEndsNone
+	}
+	return TagEndsSquare
+}
+
+// NormalizeTagStyle returns a known tag style, defaulting to pills.
+func NormalizeTagStyle(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case TagStyleIcons:
+		return TagStyleIcons
+	case TagStyleGlyphPills:
+		return TagStyleGlyphPills
+	case TagStyleCompact:
+		return TagStyleCompact
+	case TagStylePlain:
+		return TagStylePlain
+	}
+	return TagStylePills
+}
+
+var tagHexPattern = regexp.MustCompile(`^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$`)
+
+// NormalizeTagHex validates a tag color: #rgb or #rrggbb, returned as
+// lower-case #rrggbb. ok is false for anything else, including empty input.
+func NormalizeTagHex(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if !tagHexPattern.MatchString(s) {
+		return "", false
+	}
+	s = strings.ToLower(s)
+	if len(s) == 4 {
+		s = "#" + strings.Repeat(s[1:2], 2) + strings.Repeat(s[2:3], 2) + strings.Repeat(s[3:4], 2)
+	}
+	return s, true
+}
+
+type UpdatesConfig struct {
+	CheckOnStartup     bool `toml:"check_on_startup"`
+	CheckIntervalHours int  `toml:"check_interval_hours"`
+	// The fields below are runtime state, not settings. TideMail keeps them in
+	// its database and no longer writes them here, so a config.toml under
+	// version control stays still. They are still read, once, to carry an older
+	// file's values over.
+	LastCheckedUnix    int64  `toml:"last_checked_unix,omitzero"`
+	DismissedVersion   string `toml:"dismissed_version,omitempty"`
+	AvailableVersion   string `toml:"available_version,omitempty"`
+	AvailableSummary   string `toml:"available_summary,omitempty"`
+	AvailablePublished int64  `toml:"available_published_unix,omitzero"`
+}
+
+type FeedConfig struct {
+	MaxBodyMiB int `toml:"max_body_mib"`
+}
+
+type AIConfig struct {
+	Provider            string `toml:"provider"`
+	OpenAIKey           string `toml:"openai_key"`
+	OpenAIModel         string `toml:"openai_model"`
+	ClaudeKey           string `toml:"claude_key"`
+	ClaudeModel         string `toml:"claude_model"`
+	GeminiKey           string `toml:"gemini_key"`
+	GeminiModel         string `toml:"gemini_model"`
+	OllamaURL           string `toml:"ollama_url"`
+	OllamaModel         string `toml:"ollama_model"`
+	SavePath            string `toml:"save_path"`
+	MarkReadOnSummarize bool   `toml:"mark_read_on_summarize"`
+}
+
+// Auth method values for AccountConfig.AuthMethod.
+const (
+	AuthPassword = "password" // IMAP LOGIN / SMTP PLAIN with an app password
+	AuthOAuth2   = "oauth2"   // SASL XOAUTH2 with a keychain refresh token
+)
+
+type AccountConfig struct {
+	// ID is the account's stable identity. It survives renames and is what the
+	// database row, the keychain items, and the IMAP session pool key off.
+	// Display names are for people, not for joins: keying on them is what let a
+	// second account overwrite its peer and a delete take the survivor's
+	// credentials with it. Configs written before this field existed are
+	// stamped at load by ensureAccountIDs.
+	ID       string `toml:"id"`
+	Name     string `toml:"name"`
+	Provider string `toml:"provider"`
+	// AuthMethod is the explicit, opt-in auth choice: "password" (default) or
+	// "oauth2". An empty value is treated as "password" — a stale keychain
+	// refresh token must never promote an account to OAuth on its own.
+	AuthMethod string `toml:"auth_method"`
+	IMAPHost   string `toml:"imap_host"`
+	IMAPPort   int    `toml:"imap_port"`
+	IMAPTLS    bool   `toml:"imap_tls"`
+	SMTPHost   string `toml:"smtp_host"`
+	SMTPPort   int    `toml:"smtp_port"`
+	SMTPTLS    bool   `toml:"smtp_tls"`
+	User       string `toml:"user"`
+	Password   string `toml:"password"`
+	From       string `toml:"from"`
+	// SyncMinutes selects how the account refreshes in the background:
+	//
+	//	< 0  manual only — no polling and no push connection
+	//	  0  push — IMAP IDLE, plus an infrequent safety poll
+	//	> 0  poll every N minutes, with IDLE accelerating it
+	//
+	// Note that 0 is the "some background work" case, not the "none" case; use
+	// -1 for none.
+	SyncMinutes int `toml:"sync_minutes"`
+	// Signature is appended to outgoing mail after a standard "-- " delimiter.
+	// The account form accepts literal \n escapes for multi-line signatures;
+	// TOML multi-line strings work too when editing the file directly.
+	Signature string `toml:"signature"`
+
+	// OAuth2 — if RefreshToken is set, OAuth2 is used instead of password.
+	// ClientID and ClientSecret are auto-filled from the app-level [oauth] config at load time.
+	RefreshToken string `toml:"refresh_token"`
+
+	// Filled at load time from OAuthConfig — never written to TOML.
+	ClientID     string `toml:"-"`
+	ClientSecret string `toml:"-"`
+}
+
+// UsesOAuth2 returns true if this account opted into OAuth2 auth.
+func (a AccountConfig) UsesOAuth2() bool {
+	return a.AuthMethod == AuthOAuth2
+}
+
+// UsesGoogleOAuth2 reports whether the account authenticates with Gmail XOAUTH2.
+// It keys off the explicit AuthMethod marker, not the presence of a refresh
+// token — a leftover keychain token must not change an account's auth path.
+func (a AccountConfig) UsesGoogleOAuth2() bool {
+	return a.AuthMethod == AuthOAuth2 && a.Provider == "Gmail"
+}
+
+// UsesMicrosoftOAuth2 reports whether the account authenticates with Outlook
+// XOAUTH2 (Microsoft retired basic auth for Outlook.com).
+func (a AccountConfig) UsesMicrosoftOAuth2() bool {
+	return a.AuthMethod == AuthOAuth2 && a.Provider == "Outlook"
+}
+
+// oauthProviders are the providers with an OAuth2 path.
+func isOAuthProvider(provider string) bool {
+	return provider == "Gmail" || provider == "Outlook"
+}
+
+// migrateAuthMethod resolves each account's AuthMethod. It runs on every load —
+// not only for legacy (unset) configs — so it can also *heal* a wrong value: an
+// OAuth-capable account with a refresh token and no password anywhere is OAuth,
+// whatever it is currently stamped. (A prior migration could have stamped
+// "password" while the keychain was briefly unavailable.) A genuine app-password
+// account always has a password, so it is never promoted here — this keeps the
+// v1.0.6 hazard closed, where a stray keychain token would flip a password
+// account to OAuth. Anything still unset falls to "password".
+//
+// "has a token"/"has a password" look at both the decoded TOML (keyless systems
+// keep secrets there) and the keychain. getPassword/getToken are injected so
+// this is testable without a real keychain.
+func migrateAuthMethod(cfg *Config, getPassword, getToken func(id, legacyName string) string) {
+	for i := range cfg.Accounts {
+		a := &cfg.Accounts[i]
+		hasPassword := a.Password != "" || getPassword(a.ID, a.Name) != ""
+		hasToken := a.RefreshToken != "" || getToken(a.ID, a.Name) != ""
+		if isOAuthProvider(a.Provider) && !hasPassword && hasToken {
+			a.AuthMethod = AuthOAuth2
+			continue
+		}
+		if a.AuthMethod == "" {
+			a.AuthMethod = AuthPassword
+		}
+	}
+}
+
+// newAccountID returns an opaque account identifier. It is deliberately not
+// derived from the account's name or address: an ID that encodes the name would
+// change when the name does, which is the whole problem it exists to solve.
+var fallbackAccountIDCounter atomic.Uint64
+
+func newAccountID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// These are local join keys, not secrets. Keep the fallback unique within
+		// the process instead of returning a constant that would make the collision
+		// retry loop below spin forever when crypto/rand is unavailable.
+		return fmt.Sprintf("%016x%016x", uint64(time.Now().UnixNano()), fallbackAccountIDCounter.Add(1))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// EnsureAccountIDs stamps a stable ID on any account that lacks one. Load and
+// Save both do this, but a Config assembled in code (tests, embedders) reaches
+// the model without passing through either.
+func EnsureAccountIDs(cfg *Config) bool { return ensureAccountIDs(cfg) }
+
+// NewAccountID mints an identity for an account being created in the UI. The
+// form needs it before the account is saved, so an OAuth sign-in taken
+// mid-form already caches its token under the final identity.
+func NewAccountID() string { return newAccountID() }
+
+// SessionKey returns the value that identifies this account to per-account
+// caches: the IMAP session pool and the OAuth access-token cache. It is the
+// stable ID, with a user@host fallback for a config built without one. Keying
+// those caches on the display name meant two accounts sharing a name shared one
+// connection slot and one token entry.
+func (a AccountConfig) SessionKey() string {
+	if id := strings.TrimSpace(a.ID); id != "" {
+		return id
+	}
+	return a.User + "@" + a.IMAPHost
+}
+
+// ensureAccountIDs stamps a stable ID on every account that lacks one and
+// resolves any collision, reporting whether it changed anything. It runs on
+// every load so a config hand-edited to add an account (documented as a
+// supported workaround) still gets a usable identity. Load persists a changed
+// identity set before the database can link any rows to it.
+func ensureAccountIDs(cfg *Config) bool {
+	seen := make(map[string]bool, len(cfg.Accounts))
+	changed := false
+	for i := range cfg.Accounts {
+		id := strings.TrimSpace(cfg.Accounts[i].ID)
+		if id == "" || seen[id] {
+			for {
+				id = newAccountID()
+				if !seen[id] {
+					break
+				}
+			}
+			cfg.Accounts[i].ID = id
+			changed = true
+		} else if id != cfg.Accounts[i].ID {
+			cfg.Accounts[i].ID = id
+			changed = true
+		}
+		seen[id] = true
+	}
+	return changed
+}
+
+// AccountByID returns the account with the given stable ID.
+func (c Config) AccountByID(id string) (AccountConfig, bool) {
+	if strings.TrimSpace(id) == "" {
+		return AccountConfig{}, false
+	}
+	for _, a := range c.Accounts {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return AccountConfig{}, false
+}
+
+// DefaultAccount returns the account a new message is sent from: the one
+// marked default, else the first configured account.
+func (c Config) DefaultAccount() (AccountConfig, bool) {
+	if a, ok := c.AccountByID(c.DefaultAccountID); ok {
+		return a, true
+	}
+	if len(c.Accounts) > 0 {
+		return c.Accounts[0], true
+	}
+	return AccountConfig{}, false
+}
+
+// ExplicitDefaultAccountID returns DefaultAccountID only while it still
+// resolves to a configured account, and "" otherwise. The UI stars and focuses
+// a default only when the user actually picked one, so an unset config keeps
+// behaving exactly as it did before.
+func (c Config) ExplicitDefaultAccountID() string {
+	if _, ok := c.AccountByID(c.DefaultAccountID); ok {
+		return c.DefaultAccountID
+	}
+	return ""
+}
+
+// SetDefaultAccount marks the account with the given stable ID as the default
+// sender. An unknown ID clears the setting rather than storing a dangling one.
+func (c *Config) SetDefaultAccount(id string) {
+	if _, ok := c.AccountByID(id); !ok {
+		c.DefaultAccountID = ""
+		return
+	}
+	c.DefaultAccountID = id
+}
+
+// ReorderAccounts rearranges Accounts to match orderedIDs. Unknown IDs are
+// ignored and accounts missing from orderedIDs keep their relative order at the
+// end, so a stale order can never drop an account.
+func (c *Config) ReorderAccounts(orderedIDs []string) {
+	if len(c.Accounts) < 2 {
+		return
+	}
+	next := make([]AccountConfig, 0, len(c.Accounts))
+	taken := make(map[int]bool, len(c.Accounts))
+	for _, id := range orderedIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		for i, a := range c.Accounts {
+			if taken[i] || a.ID != id {
+				continue
+			}
+			next = append(next, a)
+			taken[i] = true
+			break
+		}
+	}
+	for i, a := range c.Accounts {
+		if !taken[i] {
+			next = append(next, a)
+		}
+	}
+	c.Accounts = next
+}
+
+// normalizeDefaultAccount drops a default_account that no longer names a
+// configured account, so the fallback takes over instead of the setting
+// silently pointing at nothing.
+func normalizeDefaultAccount(cfg *Config) {
+	cfg.DefaultAccountID = cfg.ExplicitDefaultAccountID()
+}
+
+func DefaultAccountConfig() AccountConfig {
+	return AccountConfig{
+		ID:       newAccountID(),
+		IMAPPort: 993,
+		IMAPTLS:  true,
+		SMTPPort: 587,
+		SMTPTLS:  true,
+	}
+}
+
+func DefaultConfig() Config {
+	return Config{
+		Theme: "catppuccin-mocha",
+		Display: DisplayConfig{
+			Icons:                   true,
+			ShowPaneHeaders:         true,
+			ShowMessageTagsInHeader: true,
+			ShowNeedsYou:            true,
+			ComposeWordWrap:         true,
+			ShowWaiting:             true,
+			DateFormat:              "relative",
+			MarkReadOnOpen:          true,
+			FocusLine:               true,
+			SupportReminder:         true,
+			ShowSender:              true,
+			AccountsWidthPercent:    28,
+			MessagesHeightPercent:   40,
+			Density:                 "compact",
+			TagStyle:                TagStylePills,
+			TagEnds:                 TagEndsSquare,
+			PaneCorners:             "square",
+			Shadow:                  true,
+			Images:                  "auto",
+			ConfirmQuit:             true,
+			ShowHeaders:             true,
+			Notifications:           true,
+			SendDelaySeconds:        5,
+			SendMaxAttempts:         3,
+			CLISignature:            true,
+		},
+		Updates: UpdatesConfig{
+			CheckOnStartup:     true,
+			CheckIntervalHours: 24,
+		},
+		Feed: FeedConfig{
+			MaxBodyMiB: 10,
+		},
+		AI: AIConfig{
+			OllamaURL:   "http://localhost:11434",
+			OllamaModel: "llama3.2",
+			SavePath:    "~/",
+		},
+		OAuth: resolveOAuth(OAuthConfig{}),
+	}
+}
+
+func Load() (Config, error) {
+	path, err := configPath()
+	if err != nil {
+		return DefaultConfig(), nil
+	}
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return DefaultConfig(), nil
+	}
+	if err != nil {
+		return DefaultConfig(), err
+	}
+
+	cfg := DefaultConfig()
+	// Decode OAuth without defaults so absent/empty saved values cannot erase
+	// build credentials or accidentally mix credentials from different clients.
+	cfg.OAuth = OAuthConfig{}
+	if _, err := toml.Decode(string(data), &cfg); err != nil {
+		return DefaultConfig(), err
+	}
+	cfg.OAuth = resolveOAuth(cfg.OAuth)
+	if cfg.Updates.CheckIntervalHours <= 0 {
+		cfg.Updates.CheckIntervalHours = DefaultConfig().Updates.CheckIntervalHours
+	}
+	cfg.Display.SendMaxAttempts = NormalizeSendMaxAttempts(cfg.Display.SendMaxAttempts)
+	cfg.Display.Density = NormalizeDisplayDensity(cfg.Display.Density)
+	cfg.Display.PaneCorners = NormalizePaneCorners(cfg.Display.PaneCorners)
+	idsChanged := ensureAccountIDs(&cfg)
+	normalizeDefaultAccount(&cfg)
+	migrateAuthMethod(&cfg, GetAccountPassword, GetOAuth2RefreshToken)
+	fillSecrets(&cfg)
+	if idsChanged {
+		if err := backupPreAccountIDConfig(path, data); err != nil {
+			return cfg, fmt.Errorf("back up config before account-ID migration: %w", err)
+		}
+		if err := Save(cfg); err != nil {
+			return cfg, fmt.Errorf("persist account-ID migration: %w", err)
+		}
+	}
+	return cfg, nil
+}
+
+func backupPreAccountIDConfig(path string, data []byte) error {
+	backup := path + ".pre-account-ids.bak"
+	f, err := os.OpenFile(backup, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func NormalizeDisplayDensity(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "comfortable":
+		return "comfortable"
+	default:
+		return "compact"
+	}
+}
+
+func NormalizePaneCorners(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "round":
+		return "round"
+	default:
+		return "square"
+	}
+}
+
+func IsRetroTerminalTheme(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	return n == "vt52" || n == "vt100"
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+func Save(cfg Config) error {
+	// Deep-copy accounts to avoid mutating the caller's slice (stripSecrets
+	// clears Password fields on the shared backing array).
+	// stripSecrets keys the keychain on the ID, so every account must have one
+	// before it runs — a config assembled in code has not been through Load.
+	// This runs before the copy deliberately: cfg.Accounts still shares the
+	// caller's backing array here, so the caller learns the IDs too. Minting a
+	// fresh ID on every Save instead would orphan the keychain item written
+	// under the previous one.
+	ensureAccountIDs(&cfg)
+	accts := make([]AccountConfig, len(cfg.Accounts))
+	copy(accts, cfg.Accounts)
+	cfg.Accounts = accts
+	// Do not pin bundled defaults in config.toml across application upgrades.
+	if cfg.OAuth.GoogleClientID == DefaultGoogleClientID && cfg.OAuth.GoogleClientSecret == DefaultGoogleClientSecret {
+		cfg.OAuth.GoogleClientID, cfg.OAuth.GoogleClientSecret = "", ""
+	}
+	stripSecrets(&cfg)
+	path, err := configPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+
+	f, err := os.CreateTemp(filepath.Dir(path), ".config.toml.*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }() // renamed on success
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := toml.NewEncoder(f).Encode(cfg); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func SecurityWarnings() ([]string, error) {
+	path, err := configPath()
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return []string{fmt.Sprintf("config file %s may contain passwords/API keys and is readable by other users; run: chmod 600 %s", path, path)}, nil
+	}
+	return nil, nil
+}
+
+func RedactSecrets(s string, cfg Config) string {
+	for _, secret := range secretValues(cfg) {
+		s = strings.ReplaceAll(s, secret, "[redacted]")
+	}
+	return s
+}
+
+func secretValues(cfg Config) []string {
+	const minimumRedactedSecretLength = 8
+
+	seen := map[string]struct{}{}
+	var secrets []string
+	add := func(secret string) {
+		secret = strings.TrimSpace(secret)
+		// Very short values are more likely to be ordinary substrings than useful
+		// redaction targets. A one-character password, for example, used to turn
+		// "open ... permission" into an unreadable wall of [redacted] markers.
+		if len(secret) < minimumRedactedSecretLength {
+			return
+		}
+		if _, ok := seen[secret]; ok {
+			return
+		}
+		seen[secret] = struct{}{}
+		secrets = append(secrets, secret)
+	}
+	add(cfg.AI.OpenAIKey)
+	add(cfg.AI.ClaudeKey)
+	add(cfg.AI.GeminiKey)
+	add(cfg.OAuth.GoogleClientSecret)
+	for _, account := range cfg.Accounts {
+		add(account.Password)
+		add(account.RefreshToken)
+		add(account.ClientSecret)
+	}
+	return secrets
+}
+
+func configPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		xdg = filepath.Join(home, ".config")
+	}
+	return filepath.Join(xdg, "tidemail", "config.toml"), nil
+}
+
+// Path returns the path to TideMail's configuration file.
+func Path() (string, error) {
+	return configPath()
+}
+
+// LogPath returns the path to the fetch log file (alongside config.toml).
+func LogPath() (string, error) {
+	cfgPath, err := configPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "fetch.log"), nil
+}
+
+// PluginDir returns the directory scanned for experimental plugins (alongside
+// config.toml). It may not exist.
+func PluginDir() (string, error) {
+	cfgPath, err := configPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "plugins"), nil
+}
+
+// TemplatesDir returns the directory of mail template files (alongside
+// config.toml). It may not exist.
+func TemplatesDir() (string, error) {
+	cfgPath, err := configPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "templates"), nil
+}
+
+// NormalizeSendMaxAttempts bounds automatic delivery attempts. One disables retries.
+func NormalizeSendMaxAttempts(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > 10 {
+		return 10
+	}
+	return n
+}

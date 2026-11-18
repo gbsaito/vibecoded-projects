@@ -1,0 +1,337 @@
+package ui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	md "github.com/JohannesKaufmann/html-to-markdown"
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/allisonhere/tidemail/internal/db"
+	imapClient "github.com/allisonhere/tidemail/internal/imap"
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+var draftSaveSessions atomic.Uint64
+
+// Scheduling happens on the UI loop. Only an acknowledged save can schedule
+// the next snapshot, so a new draft gets its ID before another write starts.
+func (m *Model) saveDraftCmd() tea.Cmd {
+	if m.compose.saveSession == 0 {
+		m.compose.saveSession = draftSaveSessions.Add(1)
+	}
+	m.compose.saveRevision++
+	m.compose.dirty = true
+	if m.compose.saving {
+		return nil
+	}
+	return m.startDraftSave()
+}
+
+func (m *Model) startDraftSave() tea.Cmd {
+	database := m.db
+	draft := m.compose.toDraftRecord()
+	session, revision := m.compose.saveSession, m.compose.saveRevision
+	m.compose.saving = true
+	m.compose.savingRevision = revision
+	return func() tea.Msg {
+		result := DraftSavedMsg{Session: session, Revision: revision, DraftID: draft.ID}
+		if database == nil {
+			result.Err = fmt.Errorf("database unavailable")
+			return result
+		}
+		draft.UpdatedAt = time.Now()
+		result.DraftID, result.Err = database.SaveDraft(draft)
+		return result
+	}
+}
+
+func (m Model) handleDraftSaved(msg DraftSavedMsg) (tea.Model, tea.Cmd) {
+	if msg.Session == 0 || msg.Session != m.compose.saveSession || !m.compose.saving || msg.Revision != m.compose.savingRevision {
+		return m, nil
+	}
+	m.compose.saving = false
+	if msg.Err == nil {
+		m.compose.draftID = msg.DraftID
+	}
+	if m.compose.discardAfterSave {
+		return m.discardComposeDraft()
+	}
+	if msg.Err != nil {
+		if m.compose.closeAfterSave {
+			m.compose.statusMsg = ""
+		}
+		m.compose.closeAfterSave = false
+		m.compose.sendAfterSave = nil
+		m.compose.busy = false
+		m.compose.dirty = true
+		m.overlay = overlayCompose
+		m.setComposeStatus(fmt.Sprintf("draft save failed: %v", msg.Err), true)
+		return m, nil
+	}
+	if msg.Revision != m.compose.saveRevision {
+		cmd := m.startDraftSave()
+		return m, cmd
+	}
+	m.compose.dirty = false
+	m.compose.lastAutosaved = time.Now()
+	if queued := m.compose.sendAfterSave; queued != nil {
+		m.compose.sendAfterSave = nil
+		m.compose.busy = false
+		return m.update(*queued)
+	}
+	if m.compose.closeAfterSave {
+		m.compose = ComposeModel{}
+		m.overlay = overlayNone
+		m.setStatus("draft saved", false)
+	}
+	if mb := m.selectedMailbox(); mb != nil && m.isDraftsMailbox(*mb) {
+		return m, m.loadDraftsCmd(mb.ID)
+	}
+	return m, nil
+}
+
+func (m *Model) deleteDraftCmd(id int64) tea.Cmd {
+	database := m.db
+	if id == 0 || database == nil {
+		return func() tea.Msg { return DraftDeletedMsg{DraftID: id} }
+	}
+	draft, err := database.GetDraft(id)
+	if errors.Is(err, db.ErrDraftNotFound) {
+		return func() tea.Msg { return DraftDeletedMsg{DraftID: id} } // already gone
+	}
+	if err != nil {
+		// Don't blind-delete locally on an unknown error: a mirrored draft's
+		// remote original would survive and re-import on the next sync.
+		return func() tea.Msg { return DraftDeletedMsg{DraftID: id, Err: err} }
+	}
+	// A draft mirrored from the server also has a remote original; delete that
+	// first (remote-first, like message deletes) or it re-imports on next sync.
+	var remote *db.Mailbox
+	var remoteCfg config.AccountConfig
+	var remoteUID uint32
+	if draft.RemoteUID != 0 && draft.MailboxID != 0 {
+		if mb := m.mailboxByID(draft.MailboxID); mb != nil {
+			remote = mb
+			remoteCfg, err = m.accountCfgForMailbox(draft.MailboxID)
+			if err != nil {
+				return func() tea.Msg { return DraftDeletedMsg{DraftID: id, Err: err} }
+			}
+			remoteUID = draft.RemoteUID
+		}
+	}
+	sessions := m.sessions
+	return func() tea.Msg {
+		if remote != nil && remoteCfg.IMAPHost != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			ctx = uidWriteContext(ctx, database, remote.ID, remote.Name)
+			if err := sessions.Do(ctx, remoteCfg, func(client *imapClient.Client) error {
+				return client.DeleteMessages(ctx, remote.Name, []uint32{remoteUID})
+			}); err != nil {
+				return DraftDeletedMsg{DraftID: id, Err: err}
+			}
+			if err := database.DeleteMessageByUID(remote.ID, remoteUID); err != nil {
+				return DraftDeletedMsg{DraftID: id, Err: err}
+			}
+		}
+		return DraftDeletedMsg{DraftID: id, Err: database.DeleteDraft(id)}
+	}
+}
+
+func (m Model) closeComposeSavingDraft() (tea.Model, tea.Cmd) {
+	if !m.compose.hasContent() {
+		return m.discardComposeDraft()
+	}
+	m.compose.closeAfterSave = true
+	m.overlay = overlayCompose
+	m.compose.statusMsg = "saving draft…"
+	m.compose.busy = true
+	cmd := m.saveDraftCmd()
+	return m, cmd
+}
+
+func (m Model) discardComposeDraft() (tea.Model, tea.Cmd) {
+	if m.compose.saving {
+		m.compose.discardAfterSave = true
+		m.compose.busy = true
+		m.overlay = overlayCompose
+		m.compose.statusMsg = "finishing draft save…"
+		return m, nil
+	}
+	id := m.compose.draftID
+	m.overlay = overlayNone
+	m.compose = ComposeModel{}
+	if id != 0 {
+		m.setStatus("draft discarded", false)
+		return m, tea.Batch(m.deleteDraftCmd(id), m.clearStatusCmd())
+	}
+	return m, nil
+}
+
+func draftSubject(d db.Draft) string {
+	if d.Subject != "" {
+		return d.Subject
+	}
+	return "(no subject)"
+}
+
+func (m *Model) selectedDraftsMailbox() bool {
+	mb := m.selectedMailbox()
+	if mb == nil {
+		return false
+	}
+	return m.isDraftsMailbox(*mb)
+}
+
+// currentRowDraft is the draft under the cursor in the drafts list, or nil.
+func (m Model) currentRowDraft() *db.Draft {
+	if m.messageCursor < 0 || m.messageCursor >= len(m.drafts) {
+		return nil
+	}
+	return &m.drafts[m.messageCursor]
+}
+
+func (m Model) isDraftsMailbox(mb db.Mailbox) bool {
+	if hasFlag(mb.Flags, "\\Drafts") {
+		return true
+	}
+	return isCommonDraftsName(mb.Name) || isCommonDraftsName(mb.DisplayName)
+}
+
+func (m Model) draftsSidebarCount(mb db.Mailbox) int64 {
+	if m.db == nil {
+		return 0
+	}
+	accountConfigID, accountName, accountUser := m.draftAccountIdentity(mb.ID)
+	local, _ := m.db.DraftCount(accountConfigID, accountName, accountUser)
+	// Only count remote drafts that haven't been mirrored into the drafts
+	// table yet, so a synced mailbox isn't counted twice.
+	remote, _ := m.db.UnmirroredDraftMessageCount(mb.ID)
+	return local + remote
+}
+
+func isCommonDraftsName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name == "drafts" || strings.HasSuffix(name, "/drafts") || strings.HasSuffix(name, ".drafts")
+}
+
+// draftAccountIdentity returns the owning account's stable config ID plus the
+// legacy (name, user) pair, which still matches draft rows written before the
+// config ID column existed.
+func (m Model) draftAccountIdentity(mailboxID int64) (configID, name, user string) {
+	mb := m.mailboxByID(mailboxID)
+	if mb == nil {
+		return "", "", ""
+	}
+	acc := m.accountByID(mb.AccountID)
+	if acc == nil {
+		return "", m.accountName(mb.AccountID), ""
+	}
+	acfg, err := m.accountConfigFor(*acc)
+	if err != nil {
+		return acc.ConfigID, acc.Name, ""
+	}
+	return acfg.ID, acfg.Name, acfg.User
+}
+
+func (m *Model) loadDraftsCmd(mailboxID int64) tea.Cmd {
+	database := m.db
+	accountConfigID, accountName, accountUser := m.draftAccountIdentity(mailboxID)
+	return func() tea.Msg {
+		if database == nil {
+			return DraftsLoadedMsg{MailboxID: mailboxID}
+		}
+		drafts, err := database.ListDrafts(accountConfigID, accountName, accountUser)
+		return DraftsLoadedMsg{MailboxID: mailboxID, Drafts: drafts, Err: err}
+	}
+}
+
+// importRemoteDraftsCmd mirrors a drafts mailbox's synced messages into the
+// drafts table so server-side drafts (e.g. written in webmail) can be opened,
+// edited, and sent locally. Already-mirrored messages (matched by Message-ID,
+// else mailbox+UID) are skipped, so locally-edited copies are never clobbered.
+// Returns a refreshed DraftsLoadedMsg for the mailbox.
+func (m *Model) importRemoteDraftsCmd(mailboxID int64) tea.Cmd {
+	database := m.db
+	accountConfigID, accountName, accountUser := m.draftAccountIdentity(mailboxID)
+	accountIndex := -1
+	for i, acfg := range m.cfg.Accounts {
+		if acfg.ID == accountConfigID && accountConfigID != "" {
+			accountIndex = i
+			break
+		}
+	}
+	return func() tea.Msg {
+		if database == nil {
+			return DraftsLoadedMsg{MailboxID: mailboxID}
+		}
+		// Can't resolve the owning account (mailbox or account gone since the
+		// sync was queued)? Don't write drafts with an empty/unknown account —
+		// they'd be invisible orphans. Just load whatever already exists.
+		if accountName == "" || accountIndex < 0 {
+			drafts, err := database.ListDrafts(accountConfigID, accountName, accountUser)
+			return DraftsLoadedMsg{MailboxID: mailboxID, Drafts: drafts, Err: err}
+		}
+		msgs, err := database.ListMessages(mailboxID)
+		if err != nil {
+			return DraftsLoadedMsg{MailboxID: mailboxID, Err: err}
+		}
+		for _, msg := range msgs {
+			if msg.UID == 0 {
+				continue // mirror key is mailbox+uid; a real UID is required
+			}
+			draft := db.Draft{
+				AccountConfigID: accountConfigID,
+				AccountName:     accountName,
+				AccountUser:     accountUser,
+				AccountIndex:    accountIndex,
+				MailboxID:       mailboxID,
+				RemoteUID:       msg.UID,
+				RemoteMessageID: msg.MessageID,
+				To:              msg.To,
+				CC:              msg.CC,
+				Subject:         msg.Subject,
+				BodyText:        draftBodyText(msg),
+				CreatedAt:       msg.Date,
+				UpdatedAt:       msg.Date,
+				LastRemoteSync:  time.Now(),
+			}
+			attachments, err := database.GetAttachments(msg.ID)
+			if err != nil {
+				return DraftsLoadedMsg{MailboxID: mailboxID, Err: err}
+			}
+			for i, a := range attachments {
+				draft.Attachments = append(draft.Attachments, db.DraftAttachment{
+					Filename: a.Filename, ContentType: a.ContentType, Data: a.Data, Size: a.Size, Position: i,
+				})
+			}
+			// Idempotent: INSERT OR IGNORE on the unique mirror key, so a
+			// concurrent import can't double-insert.
+			if err := database.ImportRemoteDraft(draft); err != nil {
+				return DraftsLoadedMsg{MailboxID: mailboxID, Err: err}
+			}
+		}
+		drafts, err := database.ListDrafts(accountConfigID, accountName, accountUser)
+		return DraftsLoadedMsg{MailboxID: mailboxID, Drafts: drafts, Err: err}
+	}
+}
+
+// draftBodyText returns an editable plain-text body for a remote draft,
+// converting HTML-only drafts (e.g. composed in webmail) to markdown.
+func draftBodyText(msg db.Message) string {
+	if strings.TrimSpace(msg.BodyText) != "" {
+		return msg.BodyText
+	}
+	if msg.BodyHTML == "" {
+		return ""
+	}
+	markdown, err := md.NewConverter("", true, nil).ConvertString(msg.BodyHTML)
+	if err != nil {
+		return ""
+	}
+	return markdown
+}

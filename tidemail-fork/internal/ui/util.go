@@ -1,0 +1,690 @@
+package ui
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/cellbuf"
+	"github.com/muesli/termenv"
+)
+
+func formatFileSize(size int64) string {
+	switch {
+	case size < 1024:
+		return fmt.Sprintf("%d B", size)
+	case size < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(size)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(size)/(1024*1024))
+	}
+}
+
+func fileTypeIcon(filename, contentType string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch ext {
+	case ".pdf":
+		return "▤"
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg":
+		return "▣"
+	case ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tgz":
+		return "⊞"
+	case ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp":
+		return "◇"
+	case ".go", ".py", ".js", ".ts", ".rs", ".c", ".cpp", ".h", ".hpp",
+		".java", ".rb", ".sh", ".bash", ".zsh", ".fish", ".swift", ".kt",
+		".css", ".scss", ".less", ".html", ".htm", ".xml", ".yaml", ".yml",
+		".json", ".toml", ".ini", ".cfg", ".conf", ".sql", ".r", ".m",
+		".ex", ".exs", ".php", ".pl", ".lua", ".vue", ".svelte", ".tsx", ".jsx":
+		return "⌘"
+	case ".txt", ".md", ".rst", ".adoc", ".org", ".log":
+		return "≡"
+	case ".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".opus", ".wma":
+		return "♫"
+	case ".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v", ".flv", ".wmv":
+		return "▶"
+	case ".csv", ".tsv":
+		return "≡"
+	default:
+		if strings.HasPrefix(contentType, "image/") {
+			return "▣"
+		}
+		if strings.HasPrefix(contentType, "text/") {
+			return "≡"
+		}
+		if strings.HasPrefix(contentType, "audio/") {
+			return "♫"
+		}
+		if strings.HasPrefix(contentType, "video/") {
+			return "▶"
+		}
+		if strings.Contains(contentType, "pdf") ||
+			strings.Contains(contentType, "postscript") {
+			return "▤"
+		}
+		if strings.Contains(contentType, "zip") ||
+			strings.Contains(contentType, "compress") ||
+			strings.Contains(contentType, "tar") ||
+			strings.Contains(contentType, "gzip") {
+			return "⊞"
+		}
+		return "○"
+	}
+}
+
+func collectSearchMatches(content, query string) []int {
+	if query == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	matches := make([]int, 0)
+	for i, line := range lines {
+		if strings.Contains(strings.ToLower(ansi.Strip(line)), query) {
+			matches = append(matches, i)
+		}
+	}
+	return matches
+}
+
+func deleteLastRune(s string) string {
+	if s == "" {
+		return s
+	}
+	_, size := utf8.DecodeLastRuneInString(s)
+	if size <= 0 {
+		return ""
+	}
+	return s[:len(s)-size]
+}
+
+func messageFocusableLines(content string) []bool {
+	return focusableFromLines(strings.Split(ansi.Strip(content), "\n"))
+}
+
+// focusableFromLines is messageFocusableLines over lines that have already been
+// stripped. Callers that also need the display lines pass them in rather than
+// paying for a second ansi.Strip of the whole message — at a 21KB body those
+// full-content scans were half the cost of a keystroke.
+func focusableFromLines(lines []string) []bool {
+	focusable := make([]bool, len(lines))
+	nonEmpty := 0
+	pastHeader := false
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if nonEmpty >= 2 {
+				pastHeader = true
+			}
+			continue
+		}
+		if pastHeader {
+			focusable[i] = true
+		}
+		nonEmpty++
+	}
+	return focusable
+}
+
+func firstFocusableLine(focusable []bool) int {
+	for i, ok := range focusable {
+		if ok {
+			return i
+		}
+	}
+	return 0
+}
+
+// hasFocusableBefore reports whether any focusable line precedes line. When
+// none does, line is the first place the cursor can rest, and everything above
+// it is the message header, which must stay reachable by scrolling.
+func hasFocusableBefore(focusable []bool, line int) bool {
+	for i := 0; i < line && i < len(focusable); i++ {
+		if focusable[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func nextContentFocusLine(current, delta int, focusable []bool, lineCount int) int {
+	if delta == 0 || lineCount <= 0 {
+		return clamp(current, 0, max(0, lineCount-1))
+	}
+	current = clamp(current, 0, max(0, lineCount-1))
+	for next := current + delta; next >= 0 && next < lineCount; next += delta {
+		if next < len(focusable) && focusable[next] {
+			return next
+		}
+	}
+	return current
+}
+
+func overlayOnBase(base, box string, width, height int, bg lipgloss.Color, shadow bool) string {
+	boxLines := strings.Split(box, "\n")
+	boxW := 0
+	for _, l := range boxLines {
+		if w := lipgloss.Width(l); w > boxW {
+			boxW = w
+		}
+	}
+
+	// Center position — matches lipgloss.Center, lipgloss.Center
+	overlayX := max(0, (width-boxW)/2)
+	overlayY := max(0, (height-len(boxLines))/2)
+	return overlayAt(base, box, overlayX, overlayY, width, height, bg, shadow)
+}
+
+// overlayAt composites box over base with its top-left corner at (overlayX,
+// overlayY); the caller keeps it on screen.
+func overlayAt(base, box string, overlayX, overlayY, width, height int, bg lipgloss.Color, shadow bool) string {
+	base = clampView(base, width, height, bg)
+
+	boxLines := strings.Split(box, "\n")
+	boxH := len(boxLines)
+	boxW := 0
+	for _, l := range boxLines {
+		if w := lipgloss.Width(l); w > boxW {
+			boxW = w
+		}
+	}
+	rightStart := overlayX + boxW
+
+	if shadow {
+		base = blendShadowRect(base, overlayX+shadowOffsetX, overlayY+shadowOffsetY, boxW, boxH, width, height, bg, shadowColor(bg))
+	}
+
+	baseLines := strings.Split(base, "\n")
+	for len(baseLines) < height {
+		baseLines = append(baseLines, "")
+	}
+
+	result := make([]string, height)
+	for y := 0; y < height; y++ {
+		baseLine := baseLines[y]
+		boxRow := y - overlayY
+		if boxRow < 0 || boxRow >= boxH {
+			result[y] = baseLine
+			continue
+		}
+		left := ansi.Cut(baseLine, 0, overlayX)
+		right := ansi.Cut(baseLine, rightStart, width)
+		result[y] = left + boxLines[boxRow] + right
+	}
+	// Normalize every row to exactly width. ansi.Cut counts visual columns, and
+	// a wide rune in the (post-shadow) base straddling the cut boundary can make
+	// the trailing slice come back a column or two short — which would drop the
+	// box's right border and shift the shadow sliver on that one row. Re-clamp
+	// so the overlay is always width×height; a pathological row loses a cell or
+	// two of far-right base content rather than the whole line going ragged.
+	return clampView(strings.Join(result, "\n"), width, height, bg)
+}
+
+// shadowOffsetX and shadowOffsetY position the drop shadow relative to the
+// modal's own top-left corner. Both positive (down-and-right) is the classic
+// look: the modal covers all of the shadow rectangle except a bottom-and-right
+// sliver, which reads as the shadow. One cell on each side — a 2-wide vertical
+// band reads as a heavy black bar next to the modal rather than a shadow.
+const shadowOffsetX, shadowOffsetY = 1, 1
+
+// shadowAlpha is how strongly the shadow rectangle darkens whatever's actually
+// behind it (0 = invisible, 1 = the flat shadowBg color with nothing of the
+// original showing through). shadowColor's target is already near-black for
+// most dark themes, and a low alpha on top of an already-dark UI moves
+// brightness by only a few RGB points — real but invisible at normal viewing
+// distance. This needs to be strong enough to actually look like a shadow.
+const shadowAlpha = 0.925
+
+// shadowFgAlpha is deliberately much weaker than shadowAlpha. Blending a
+// cell's glyph foreground toward the same near-black target at full strength
+// collapses fg/bg contrast to near zero — the character disappears into its
+// own background instead of just dimming. 0.55 pushes text well into "dimmed"
+// without erasing it; the sliver is a single cell wide, so any glyph landing
+// in it is decorative rather than something the reader needs to parse.
+const shadowFgAlpha = 0.55
+
+// blendShadowRect darkens the rectangle of base behind the modal's shadow
+// offset by blending each cell's own already-resolved background toward
+// shadowBg, instead of painting an opaque rectangle over it — a real drop
+// shadow rather than a flat cutout. It round-trips only the affected rows
+// through a cellbuf grid: SetContent parses ANSI styling into per-cell
+// Style{Fg,Bg}, and Render serializes the mutated grid back to an ANSI string.
+// Render emits "\r\n" between lines (cellbuf's own convention); normalized back
+// to "\n" so the result still fits the plain strings.Split downstream.
+//
+// Scoped to rows y..y+h rather than the whole viewport: parsing/serializing
+// the entire base render every frame (most of which the shadow never touches)
+// is wasteful, so slice to just the rows the shadow can land on — clampView
+// already guarantees they are self-contained, uniformly width-padded lines
+// safe to split and splice back by index.
+func blendShadowRect(base string, x, y, w, h, totalWidth, totalHeight int, page, shadowBg lipgloss.Color) string {
+	base = clampView(base, totalWidth, totalHeight, page)
+	rowStart, rowEnd := max(0, y), min(totalHeight, y+h)
+	if rowStart >= rowEnd {
+		return base // shadow rectangle doesn't intersect the viewport at all
+	}
+	lines := strings.Split(base, "\n")
+	sliceHeight := rowEnd - rowStart
+	slice := strings.Join(lines[rowStart:rowEnd], "\n")
+
+	buf := cellbuf.NewBuffer(totalWidth, sliceHeight)
+	cellbuf.SetContent(buf, slice)
+	// blendBg always returns a raw 24-bit ansi.RGBColor, but cellbuf.Render has
+	// no color-profile awareness of its own — convert to the same profile every
+	// other Render call in this app downgrades through, or a non-truecolor
+	// terminal would just drop the shadow cells' unsupported SGR codes.
+	profile := activeColorProfile()
+	for row := 0; row < sliceHeight; row++ {
+		for col := max(0, x); col < min(totalWidth, x+w); col++ {
+			cell := buf.Cell(col, row)
+			if cell == nil {
+				continue
+			}
+			blended := *cell
+			blended.Style.Bg = profile.Convert(blendBg(cell.Style.Bg, page, shadowBg, shadowAlpha))
+			// A glyph inside the shadow rectangle needs darkening too, not just
+			// the space around it — otherwise text rendered right up to a
+			// pane's edge (exactly where the shadow's sliver sits) keeps its
+			// bright color. Uses the weaker shadowFgAlpha so it dims without
+			// becoming unreadable; skip a nil Fg rather than fabricating one.
+			if cell.Style.Fg != nil {
+				blended.Style.Fg = profile.Convert(blendBg(cell.Style.Fg, page, shadowBg, shadowFgAlpha))
+			}
+			buf.SetCell(col, row, &blended)
+		}
+	}
+	rendered := strings.Split(strings.ReplaceAll(cellbuf.Render(buf), "\r\n", "\n"), "\n")
+	if len(rendered) != sliceHeight {
+		// Defensive: if cellbuf's line count ever doesn't match what was asked
+		// for, fall back to the unshadowed rows rather than splice a corrupted
+		// line count into the full view.
+		return base
+	}
+	// Splice each re-rendered row back only if cellbuf reproduced it at exactly
+	// totalWidth. Its width model isn't identical to lipgloss/x-ansi's — a wide
+	// rune, an OSC-8 hyperlink, or a trimmed trailing run in the base content
+	// can come back a column or two short, and splicing that in would shift
+	// everything after it on that row (a missing shadow sliver and a visibly
+	// truncated line). Rows cellbuf mangled keep their original unshadowed
+	// content: a one-row gap in the shadow, never a corrupted line.
+	for i, r := range rendered {
+		if lipgloss.Width(r) == totalWidth {
+			lines[rowStart+i] = r
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// activeColorProfile bridges lipgloss's global color profile (a termenv.Profile
+// — the profile every other Render call in this app implicitly downgrades
+// through) to the distinct colorprofile.Profile type cellbuf's Profile.Convert
+// expects. These are two different Charm libraries' own profile enums.
+func activeColorProfile() colorprofile.Profile {
+	switch lipgloss.ColorProfile() {
+	case termenv.TrueColor:
+		return colorprofile.TrueColor
+	case termenv.ANSI256:
+		return colorprofile.ANSI256
+	case termenv.ANSI:
+		return colorprofile.ANSI
+	default:
+		return colorprofile.ASCII
+	}
+}
+
+func safeFilename(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_':
+			b.WriteRune(r)
+		case unicode.IsSpace(r) || r == '-':
+			if b.Len() > 0 {
+				s := b.String()
+				if s[len(s)-1] != '-' {
+					b.WriteByte('-')
+				}
+			}
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		s = "attachment"
+	}
+	if len(s) > 100 {
+		s = s[:100]
+	}
+	return s
+}
+
+func summaryFilename(title string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(title) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case unicode.IsSpace(r) || r == '-':
+			if b.Len() > 0 {
+				s := b.String()
+				if s[len(s)-1] != '-' {
+					b.WriteByte('-')
+				}
+			}
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		s = "summary"
+	}
+	if len(s) > 50 {
+		s = s[:50]
+	}
+	return s + ".md"
+}
+
+func sectionKey(accountID int64, isSystem bool) string {
+	if isSystem {
+		return fmt.Sprintf("system:%d", accountID)
+	}
+	return fmt.Sprintf("personal:%d", accountID)
+}
+
+func mailboxRank(name string) int {
+	lower := strings.ToLower(name)
+	if i := strings.LastIndex(lower, "/"); i >= 0 {
+		lower = strings.TrimSpace(lower[i+1:])
+	}
+	switch lower {
+	case "inbox":
+		return 0
+	case "sent", "sent items", "sent mail":
+		return 1
+	case "drafts":
+		return 2
+	case "archive", "all mail":
+		return 3
+	case "trash", "deleted items", "deleted messages":
+		return 4
+	case "junk", "spam", "junk e-mail", "junk email":
+		return 5
+	}
+	return 6
+}
+
+func cleanDisplayName(name string) string {
+	// Capitalize INBOX -> Inbox (Gmail returns it uppercase)
+	if strings.EqualFold(name, "INBOX") {
+		return "Inbox"
+	}
+
+	// Strip Gmail's [Gmail]/ prefix (also covers [Google]/ etc.)
+	cleaned := name
+	if idx := strings.Index(name, "]/"); idx >= 0 {
+		cleaned = strings.TrimSpace(name[idx+2:])
+	}
+
+	// Strip "INBOX." or "INBOX/" prefix for custom accounts
+	// (e.g. Courier/Dovecot: INBOX.Sent -> Sent, INBOX/Drafts -> Drafts)
+	upper := strings.ToUpper(cleaned)
+	if strings.HasPrefix(upper, "INBOX.") {
+		cleaned = strings.TrimSpace(cleaned[6:])
+	} else if strings.HasPrefix(upper, "INBOX/") {
+		cleaned = strings.TrimSpace(cleaned[6:])
+	}
+
+	return cleaned
+}
+
+func displayNameForDelimiter(name, delimiter string) string {
+	if delimiter == "" {
+		return name
+	}
+	return cleanDisplayName(name)
+}
+
+func hasFlag(flags []string, flag string) bool {
+	for _, f := range flags {
+		if strings.EqualFold(f, flag) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGmailSystemFolder(name string) bool {
+	// Gmail system labels live under the [Gmail]/ namespace on English
+	// accounts. The prefix varies by locale (e.g. [Google], [Gmail]),
+	// so we match the segment after "]".
+	idx := strings.Index(name, "]/")
+	if idx < 0 {
+		return false
+	}
+	rest := strings.TrimSpace(name[idx+2:])
+
+	lower := strings.ToLower(rest)
+	switch lower {
+	case "all mail", "drafts", "sent", "sent mail", "starred", "important", "spam", "trash":
+		return true
+	}
+	return strings.HasPrefix(lower, "categories/")
+}
+
+func isInboxMailbox(mb db.Mailbox) bool {
+	if strings.EqualFold(strings.TrimSpace(mb.Name), "inbox") || (mb.Delimiter != "" && strings.EqualFold(strings.TrimSpace(mb.DisplayName), "inbox")) {
+		return true
+	}
+	for _, flag := range mb.Flags {
+		if strings.EqualFold(flag, `\Inbox`) {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalColorAsColor(c lipgloss.TerminalColor) lipgloss.Color {
+	if c == nil {
+		return ""
+	}
+	return lipgloss.Color(fmt.Sprint(c))
+}
+
+func keyMatches(msg tea.KeyMsg, bindings ...key.Binding) bool {
+	for _, b := range bindings {
+		if key.Matches(msg, b) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncate(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	if maxW <= 1 {
+		return ansi.Truncate(s, maxW, "")
+	}
+	return ansi.Truncate(s, maxW, "…")
+}
+
+func (m *Model) formatTime(t time.Time) string {
+	switch m.cfg.Display.DateFormat {
+	case "absolute":
+		return t.Format("Jan 2, 2006")
+	case "none":
+		return ""
+	default:
+		return relativeTime(t)
+	}
+}
+
+func relativeTime(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	case d < 4*7*24*time.Hour:
+		return fmt.Sprintf("%dw", int(d.Hours()/(24*7)))
+	default:
+		return t.Format("Jan 2")
+	}
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func padRight(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-lipgloss.Width(s))
+}
+
+func viewLineCount(parts []string) int {
+	n := 0
+	for _, p := range parts {
+		if p == "" {
+			n++
+			continue
+		}
+		n += strings.Count(p, "\n") + 1
+	}
+	return n
+}
+
+func clampView(view string, width, height int, bg lipgloss.Color) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+
+	bgStyle := lipgloss.NewStyle().Background(bg)
+	lines := strings.Split(view, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for i, line := range lines {
+		line = ansi.Truncate(line, width, "")
+		if !strings.HasSuffix(line, ansi.ResetStyle) {
+			line += ansi.ResetStyle
+		}
+		pad := width - lipgloss.Width(line)
+		if pad > 0 {
+			line += bgStyle.Render(strings.Repeat(" ", pad))
+		}
+		lines[i] = line
+	}
+	for len(lines) < height {
+		lines = append(lines, bgStyle.Render(strings.Repeat(" ", width)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func fillViewWidth(view string, width int, bg lipgloss.Color) string {
+	if width <= 0 || view == "" {
+		return view
+	}
+	return clampView(view, width, strings.Count(view, "\n")+1, bg)
+}
+
+func collapseQuoteBlocks(body string, collapsed bool) string {
+	if !collapsed {
+		return body
+	}
+	lines := strings.Split(body, "\n")
+	var result []string
+	i := 0
+	for i < len(lines) {
+		if !isCollapsibleQuoteLine(lines[i]) {
+			result = append(result, lines[i])
+			i++
+			continue
+		}
+		start := i
+		for i < len(lines) && isCollapsibleQuoteLine(lines[i]) {
+			i++
+		}
+		bar := "│"
+		if !strings.Contains(ansi.Strip(lines[start]), "│") {
+			bar = "|"
+		}
+		// The count is of rendered (i.e. actually hidden) lines, not source lines.
+		result = append(result, fmt.Sprintf("%s  [+%d lines of quoted text — press z to expand]", bar, i-start))
+	}
+	return strings.Join(result, "\n")
+}
+
+// isCollapsibleQuoteLine reports whether a rendered line is a quote bar rather
+// than glamour table/box chrome. Both use │, but a table row or border always
+// closes with a box-drawing character while a quote line closes with prose.
+func isCollapsibleQuoteLine(line string) bool {
+	s := strings.TrimSpace(ansi.Strip(line))
+	if s == "" {
+		return false
+	}
+	if !strings.HasPrefix(s, "│") && !strings.HasPrefix(s, "|") {
+		return false
+	}
+	last, _ := utf8.DecodeLastRuneInString(s)
+	switch last {
+	case '│', '|', '┤', '┐', '┘', '╮', '╯', '─', '━', '┴', '┬', '┼':
+		return false
+	}
+	return true
+}
+
+func indentBlock(view string, pad int) string {
+	if view == "" || pad <= 0 {
+		return view
+	}
+	prefix := strings.Repeat(" ", pad)
+	lines := strings.Split(view, "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// sanitizePaste normalizes pasted text to prevent the Bubble Tea textarea from
+// choking on combining marks, bidirectional control characters, and other
+// problematic Unicode sequences.
+func sanitizePaste(s string) string {
+	// Filter out combining marks and control characters that aren't newlines/tabs.
+	var buf strings.Builder
+	for _, r := range s {
+		switch {
+		case r == '\n', r == '\r', r == '	':
+			buf.WriteRune(r)
+		case r >= 0x20 && r < 0x7f: // standard ASCII
+			buf.WriteRune(r)
+		case r >= 0xa0 && !unicode.Is(unicode.Mn, r) && !unicode.Is(unicode.Me, r): // printable non-ASCII, no combining marks
+			buf.WriteRune(r)
+		}
+	}
+	return buf.String()
+}

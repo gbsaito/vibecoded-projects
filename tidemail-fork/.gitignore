@@ -1,0 +1,31 @@
+.gocache/
+.gomodcache/
+.gotmp/
+.tmp_help_render/
+.cursor/
+.claude/
+.hermes/
+CLAUDE.md
+claude.md
+pic.png
+vendor/
+*.db
+*.db.migrated
+tide
+# Original oversized demo export; README uses optimized tide.gif. -allie
+tide.GIF
+deploy.sh
+plan.md
+status.md
+nvim.log
+greader-browse-plan.md
+kitty-graphics-plan.md
+tidemail
+# Dev tool build output; the source (cmd/kittytest/main.go) stays tracked. -allie
+cmd/kittytest/kittytest
+cmd/editortest/editortest
+# Release tarballs. Built by deploy.sh and rebuilt by CI on the tag; GitHub
+# Releases hosts them. Committing them here only bloats the repo. -allie
+dist/
+# Example plugin build output.
+examples/plugins/example/tidemail-plugin-example

@@ -1,0 +1,16 @@
+{
+  "name": "deskman",
+  "version": "0.1.0",
+  "description": "Manage .desktop launchers from the terminal",
+  "type": "module",
+  "bin": {
+    "deskman": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ink": "^6.6.0",
+    "react": "^19.2.0"
+  }
+}

@@ -1,0 +1,368 @@
+package ui
+
+import (
+	"context"
+	"time"
+
+	"golang.org/x/oauth2"
+
+	"github.com/allisonhere/tidemail/internal/autodiscover"
+	"github.com/allisonhere/tidemail/internal/config"
+	"github.com/allisonhere/tidemail/internal/db"
+	"github.com/allisonhere/tidemail/internal/filter"
+	imapClient "github.com/allisonhere/tidemail/internal/imap"
+	"github.com/allisonhere/tidemail/internal/smtp"
+	"github.com/allisonhere/tidemail/internal/update"
+)
+
+// DeviceCodeMsg carries Microsoft device-code approval details.
+type DeviceCodeMsg struct {
+	attempt         context.Context
+	VerificationURL string
+	UserCode        string
+	Err             error                      // the device-code request itself failed
+	da              *oauth2.DeviceAuthResponse // polling handle for the follow-up token cmd
+}
+
+// OAuth2DoneMsg reports the outcome of a Google or Microsoft sign-in.
+type OAuth2DoneMsg struct {
+	attempt      context.Context
+	RefreshToken string
+	Email        string
+	Err          error
+}
+
+type AccountsLoadedMsg struct {
+	ReadVersion uint64
+	Accounts    []db.Account
+	Mailboxes   []db.Mailbox
+	Err         error
+}
+
+type MessagesLoadedMsg struct {
+	ReadReloadIDs  []int64 // only affected conversations retain collapsed selection
+	ReadVersion    uint64  // read confirmations invalidate older snapshots
+	MailTagVersion uint64  // rejects searches captured before a tag edit or mapping change
+	MailboxID      int64
+	Messages       []db.Message
+	Search         bool
+	Query          string
+	Err            error
+	// Annotations holds plugin annotations for Messages, loaded in the same
+	// command so rendering never queries the database.
+	Annotations map[int64][]db.PluginAnnotation
+	Overrides   map[int64]map[string]db.ClassificationOverride
+	// NeedsYou marks the Needs You view's list.
+	NeedsYou bool
+	// Waiting marks the Waiting on Them view's list.
+	Waiting bool
+	// Snoozed marks the Snoozed view's list.
+	Snoozed bool
+}
+
+type MailboxSyncedMsg struct {
+	More        bool
+	Warning     error
+	MailboxID   int64
+	NewCount    int
+	NewMessages []db.Message // genuinely-new unread mail, for notification sender/subject
+	Err         error
+	Manual      bool
+	Passive     bool // settled-folder refresh; never drives animated sync chrome
+	// Cold is true when the mailbox had no cached mail before this sync (first
+	// setup, or a cache reset after UIDVALIDITY changed). Its "new" messages
+	// are a history page, not fresh arrivals, so plugin events skip them.
+	Cold     bool
+	SyncedAt time.Time // successful completion time, applied to in-memory freshness immediately
+	Total    time.Duration
+}
+
+// OlderMessagesLoadedMsg reports the result of paging further back into a
+// mailbox's server history. Exhausted means the server holds nothing older, so
+// the UI can stop offering to load more.
+type OlderMessagesLoadedMsg struct {
+	MailboxID int64
+	Count     int
+	Exhausted bool
+	Err       error
+}
+
+type AccountSavedMsg struct {
+	Account     db.Account
+	Mailboxes   []db.Mailbox
+	AccountCfg  config.AccountConfig
+	EditID      int64
+	Color       string
+	MailboxInfo []imapClient.MailboxInfo
+	Err         error
+}
+
+type AccountDatabaseSavedMsg struct {
+	Account     db.Account
+	Mailboxes   []db.Mailbox
+	AccountCfg  config.AccountConfig
+	PreviousCfg config.Config
+	NextCfg     config.Config
+	WasNew      bool
+	Err         error
+}
+
+// ServersDiscoveredMsg carries a DNS server lookup for the account form. Auto
+// lookups (started by leaving the Email row) only fill rows still empty.
+type ServersDiscoveredMsg struct {
+	Email  string
+	Auto   bool
+	Result autodiscover.Result
+	Err    error
+}
+
+// PasswordDialogMsg carries the result of the native password dialog opened
+// from the account form. Secret is empty unless Err is nil.
+type PasswordDialogMsg struct {
+	Secret string
+	Err    error
+}
+
+type AccountTestedMsg struct {
+	MailboxCount int
+	Err          error
+}
+
+type AccountDeletedMsg struct {
+	AccountID   int64
+	ConfigID    string
+	AccountName string
+	Err         error
+}
+
+type AccountDatabaseDeletedMsg struct {
+	AccountID   int64
+	ConfigID    string
+	AccountName string
+	PreviousCfg config.Config
+	NextCfg     config.Config
+	Err         error
+}
+
+// AccountOrderChangedMsg carries the account manager's new list order as
+// stable config IDs. Account order lives in config.toml only, so this is a
+// config-only write: no database row and no IMAP round trip.
+type AccountOrderChangedMsg struct {
+	OrderedIDs []string
+	// FocusConfigID is the account that moved, so the highlight follows it
+	// whether the write lands or is reverted.
+	FocusConfigID string
+}
+
+// AccountDefaultChangedMsg marks one account as the default sender.
+type AccountDefaultChangedMsg struct {
+	ConfigID string
+	Name     string // for the status line only
+}
+
+type MessageReadBatchEntry struct {
+	MessageID int64
+	MailboxID int64
+	WasRead   bool
+	Read      bool
+}
+
+type MessageStarredUpdatedMsg struct {
+	MessageID int64
+	MailboxID int64
+	Starred   bool
+	Err       error
+}
+
+type FolderCreatedMsg struct {
+	AccountID int64
+	MailboxID int64
+	Name      string
+	Delimiter string
+	Err       error
+}
+
+type FilterGeneratedMsg struct {
+	English string
+	Rule    filter.Rule
+	Err     error
+}
+
+type FilterFoldersPreparedMsg struct {
+	Intent    filterSaveIntent
+	Mailboxes []db.Mailbox
+	Err       error
+}
+
+type FilterRunMsg struct {
+	Matched int
+	Applied int
+	DryRun  bool
+	Err     error
+}
+
+// MessagesDeletedMsg reports the outcome of a (possibly bulk) delete.
+// Deleted lists messages removed both remotely and locally; messages whose
+// remote delete failed are left untouched (still in the DB and list) so the
+// local state never silently diverges from the server.
+type MessagesDeletedMsg struct {
+	Deleted []MessageRef
+	Failed  int
+	Err     error // first remote/local error, when Failed > 0
+}
+
+type MessageRef struct {
+	ID        int64
+	MailboxID int64
+}
+
+type ClipboardReadMsg struct {
+	Text string
+	Err  error
+}
+
+type MailboxReadUpdatedMsg struct {
+	Token              uint64
+	ReservedMailboxIDs []int64
+	MailboxIDs         []int64
+	Err                error
+}
+
+type MessageSentMsg struct {
+	Skipped    bool  // a stale command did not claim the queue entry
+	CleanupErr error // delivery succeeded, but removing the saved draft failed
+	Err        error
+	DraftID    int64  // draft to delete on success (0 = none)
+	PendingID  uint64 // pending-send entry to clear
+	// SentCopyErr reports a failure to place a copy in the server's Sent
+	// folder. The message was still delivered — this never means a failed send.
+	SentCopyErr error
+}
+
+// SendQueuedMsg is emitted by the compose overlay when the user hits send;
+// the model decides whether to dispatch immediately or hold the message for
+// the configured undo grace period.
+type SendQueuedMsg struct {
+	Account     config.AccountConfig
+	Msg         smtp.OutgoingMessage
+	ScheduledAt time.Time // zero uses the configured undo-delay send time
+	// Sign and Encrypt ask for PGP protection before the message is queued
+	// (see pgp_compose.go). They are cleared once Msg.Protected is set.
+	Sign, Encrypt bool
+}
+
+// CommitSendMsg fires when a pending send's grace period elapses.
+type CommitSendMsg struct {
+	ID uint64
+}
+
+type DraftSavedMsg struct {
+	Session  uint64
+	Revision uint64
+	DraftID  int64
+	Err      error
+}
+
+type DraftDeletedMsg struct {
+	DraftID int64
+	Err     error
+}
+
+// FolderSettledMsg fires once the sidebar cursor has rested on a folder long
+// enough to be worth fetching. Seq guards against a stale tick from a folder
+// the cursor has already moved past.
+type FolderSettledMsg struct {
+	Seq       int
+	MailboxID int64
+}
+
+type DraftsLoadedMsg struct {
+	MailboxID int64
+	Drafts    []db.Draft
+	Err       error
+}
+
+type AISummaryFetchedMsg struct {
+	MessageID int64
+	Summary   string
+	Err       error
+}
+
+// AIValidateDoneMsg is sent after settings triggers an async AI credential check.
+type AIValidateDoneMsg struct {
+	Err error
+}
+
+type UpdateCheckedMsg struct {
+	Result update.CheckResult
+	Manual bool
+	Err    error
+}
+
+type UpdateDownloadedMsg struct {
+	Asset update.DownloadedAsset
+	Err   error
+}
+
+type UpdateInstalledMsg struct {
+	Result update.InstallResult
+	Err    error
+}
+
+type UpdateProgressTickMsg struct{}
+
+type SummarySavedMsg struct {
+	Path string
+	Err  error
+}
+
+type ClipboardCopiedMsg struct {
+	Err error
+}
+
+type BrowserOpenedMsg struct {
+	URL string
+	Err error
+}
+
+type AttachmentsSavedMsg struct {
+	Path  string
+	Count int
+	Err   error
+}
+
+type StatusClearMsg struct{}
+
+type AutoSyncMsg struct {
+	AccountID int64
+}
+
+// MailboxesRefreshedMsg reports the result of an account-level folder LIST.
+// Mailboxes carries folders newly discovered server-side (additions) and
+// Removed carries the IDs of locally pruned folders that vanished server-side.
+// Err is non-nil when the LIST failed, in which case it's surfaced quietly
+// since folder refresh is a convenience, not part of mail delivery.
+type MailboxesRefreshedMsg struct {
+	AccountID int64
+	Mailboxes []db.Mailbox
+	// Updated carries already-known folders whose flags or delimiter changed
+	// server-side. Without merging these the in-memory copy keeps whatever it
+	// was first stored with, so a mailbox that only just learned it is \Sent
+	// would still look flagless until the next restart.
+	Updated []db.Mailbox
+	Removed []int64
+	Err     error
+}
+
+type AddressBookLoadedMsg struct {
+	Addresses []string
+	Err       error
+}
+
+type ErrMsg struct{ Err error }
+
+type GrammarCheckedMsg struct {
+	Request   *grammarRequest
+	Corrected string
+	Err       error
+}
